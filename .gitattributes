@@ -1,0 +1,18 @@
+# Store LF in the repository; check out native line endings per platform.
+# Without this, a Windows checkout and the Ubuntu CI runner disagree and
+# whole files show up as changed.
+* text=auto
+
+# Always LF - consumed by Linux tooling regardless of authoring platform.
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Generated: collapsed by default in GitHub diffs (still expandable - lock
+# changes are supply-chain relevant and should stay reviewable).
+uv.lock text eol=lf linguist-generated=true
+
+# Binary
+*.png binary
+*.jpg binary
+*.ico binary
