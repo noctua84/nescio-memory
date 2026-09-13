@@ -1,0 +1,52 @@
+name: ci
+
+# Enforces that uv.lock is the single source of truth for dependencies.
+#
+# `uv sync --locked` fails if uv.lock is out of date with pyproject.toml, which
+# catches the common drift case: someone adds a dependency (or edits a version
+# constraint) without re-running `uv lock`. Use `--frozen` instead only if you
+# want to install from the lock WITHOUT that staleness check.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deps:
+    name: deps (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floor and current, per requires-python = ">=3.12"
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies (fails if uv.lock is stale)
+        run: uv sync --locked --python ${{ matrix.python-version }}
+
+      - name: Import check
+        run: |
+          uv run --locked --python ${{ matrix.python-version }} python -c "
+          import fastapi, uvicorn, psycopg2, pgvector, langfuse, sentence_transformers, pydantic
+          print('all runtime dependencies import OK')
+          "
+
+      # TODO: add a test step once tests exist, e.g.
+      #   run: uv run --locked pytest
+      # Left out deliberately: pytest exits 5 ("no tests collected") on an empty
+      # suite, which would fail CI on every run until the first test lands.
