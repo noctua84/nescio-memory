@@ -4,10 +4,11 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
-    "langfuse>=4.15.2",
+    "langfuse==4.15.4",
     "pgvector>=0.5.0",
     "psycopg2-binary>=2.9.13",
     "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
     "sentence-transformers>=6.0.1",
-    "uvicorn>=0.52.4",
+    "uvicorn==0.53.0",
 ]
