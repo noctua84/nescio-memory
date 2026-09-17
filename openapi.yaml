@@ -1,0 +1,162 @@
+openapi: 3.1.0
+info:
+  title: Nescio Semantic Memory API
+  version: 0.1.0
+paths:
+  /search:
+    post:
+      summary: Search Memory
+      operationId: search_memory_search_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /ingest:
+    post:
+      summary: Ingest File
+      operationId: ingest_file_ingest_post
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/Body_ingest_file_ingest_post'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /health:
+    get:
+      summary: Health
+      operationId: health_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+components:
+  schemas:
+    Body_ingest_file_ingest_post:
+      properties:
+        repo_name:
+          type: string
+          title: Repo Name
+        file_path:
+          type: string
+          title: File Path
+        content:
+          type: string
+          title: Content
+      type: object
+      required:
+      - repo_name
+      - file_path
+      - content
+      title: Body_ingest_file_ingest_post
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    IngestResponse:
+      properties:
+        status:
+          type: string
+          title: Status
+        file_path:
+          type: string
+          title: File Path
+        chunks_ingested:
+          type: integer
+          title: Chunks Ingested
+      type: object
+      required:
+      - status
+      - file_path
+      - chunks_ingested
+      title: IngestResponse
+    SearchRequest:
+      properties:
+        query:
+          type: string
+          title: Query
+        top_k:
+          type: integer
+          title: Top K
+          default: 5
+        repo_filter:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Repo Filter
+      type: object
+      required:
+      - query
+      title: SearchRequest
+    SearchResponse:
+      properties:
+        results:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Results
+      type: object
+      required:
+      - results
+      title: SearchResponse
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError

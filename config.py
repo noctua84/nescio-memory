@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     # Ollama
     ollama_url: str = "http://localhost:11434/api/embeddings"
     ollama_model: str = "qwen3-embedding:0.6b"
+    embedding_dimension: int = 384
 
     # langfuse:
     langfuse_public_key: str = ""
@@ -16,6 +17,14 @@ class Settings(BaseSettings):
     # app
     app_name: str = "Nescio Semantic Memory API"
     log_level: str = "INFO"
+
+    # chunks
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+
+    # server
+    host: str = "localhost"
+    port: int = 8080
 
     model_config = SettingsConfigDict(
         env_file=".env",

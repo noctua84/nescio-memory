@@ -13,6 +13,7 @@ dist/
 # Environments
 .venv/
 venv/
+.env
 
 # IDE
 .idea/
