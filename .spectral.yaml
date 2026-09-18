@@ -1,0 +1,26 @@
+# Spectral ruleset for the NescioAI memory-core OpenAPI spec.
+# Docs: https://docs.stoplight.io/docs/spectral/
+extends: spectral:oas
+
+rules:
+  # ---- Errors (block CI) ----
+  # Every endpoint needs a unique operationId — required for client SDK generation
+  operation-operationId: error
+  operation-operationId-unique: error
+  # Every endpoint must declare at least one success response
+  operation-success-response: error
+  # Catch malformed examples embedded in the spec
+  oas3-valid-media-example: error
+
+  # ---- Warnings (flag but don't block) ----
+  # Public docs benefit from descriptions on every operation
+  operation-description: warn
+  # Operations should be tagged for grouping in generated docs
+  operation-tag-defined: warn
+  # Public project: the spec itself should have a description
+  info-description: warn
+
+  # ---- Disabled (too noisy for this project) ----
+  # Contact/license metadata lives in README/LICENSE, not the spec
+  info-contact: off
+  info-license: off

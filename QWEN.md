@@ -127,15 +127,18 @@ with `EMBEDDING_DIMENSION=1024`, while the code defaults to `0.6b` / `384`. Chan
 
 Three GitHub Actions workflows:
 
-- **`ci.yml`** — on push to `main` and all PRs. Runs `uv sync --locked` on Python **3.12 and 3.14**
+- **`ci.yml`** — on push to `main` and all PRs. Runs `uv sync --locked` on Python **3.12, 3.13 and 3.14**
   (floor + current), then an import check of the runtime deps. The test step is a deliberate `TODO`
   because pytest exits 5 on an empty suite. This workflow is the guard against `uv.lock` drift:
   **adding or changing a dependency without re-running `uv lock` breaks CI.**
-- **`openapi.yml`** — on push to `main` and all PRs. Regenerates the spec, validates it with
-  `openapi-spec-validator`, then fails if `git diff` shows `openapi.json`/`openapi.yaml` changed.
+- **`openapi.yml`** — on push to `main` and all PRs. Syncs the **dev** dependency group, regenerates
+  the spec, validates it with `openapi-spec-validator`, fails if `git diff` shows
+  `openapi.json`/`openapi.yaml` changed, then lints with Spectral using `.spectral.yaml`.
   **Any edit to routes, `Form(...)` fields, or Pydantic models must be followed by
-  `uv run python export_openapi.py` and committing the regenerated files.** (Currently staged/WIP —
-  see Known Gaps.)
+  `uv run python export_openapi.py` and committing the regenerated files.**
+- **Both workflows must invoke Python tools through `uv run`.** `uv sync` populates `.venv` but does
+  not activate it (setup-uv's `activate-environment` defaults to false), so a bare `python` or
+  console script resolves to the runner's own interpreter and fails on import.
 - **`release-please.yml`** — on push to `main`. Maintains a release PR from conventional commits;
   merging it tags the release. `bump-minor-pre-major: true` (0.x releases bump the minor), and an
   `extra-files` entry rewrites the project's version **inside `uv.lock`** via jsonpath.
@@ -158,6 +161,9 @@ Keep messages lowercase and imperative.
 - **Dependencies:** edit `pyproject.toml`, then run `uv lock`; commit `pyproject.toml` **and**
   `uv.lock` together. Never hand-edit `uv.lock`. It is marked `linguist-generated=true` so GitHub
   collapses it in diffs, but lock changes are supply-chain relevant and should still be reviewed.
+- **Dev-only tooling** goes in `[dependency-groups] dev` (currently `openapi-spec-validator`), not
+  in `[project] dependencies` — it must not ship to runtime. Note that `uv sync` installs the `dev`
+  group by default, so `ci.yml` picks it up even though only `openapi.yml` asks for it explicitly.
 - **Line endings:** `.gitattributes` stores LF and checks out native endings. `*.sh`, `*.yml`,
   `*.yaml`, and `uv.lock` are forced to LF because Linux tooling consumes them. Without this,
   Windows checkouts and the Ubuntu CI runner disagree and whole files appear modified. Do not
@@ -189,25 +195,21 @@ update both places.
 2. **`httpx` is imported but not declared.** `main.py` depends on it directly; it is only present
    transitively (via `langfuse` and `huggingface-hub`). Adding it to `pyproject.toml` is the safe fix.
 3. **`sentence-transformers` is declared but never imported.** Embeddings come from Ollama over
-   HTTP. It is a heavy dependency (pulls in torch) and is currently also one of the things keeping
-   `httpx` in the lockfile — removing it affects gap #2.
+   HTTP. It is a heavy dependency (pulls in torch), is currently pinned to `==6.1.0`, and is also
+   one of the things keeping `httpx` in the lockfile — removing it affects gap #2.
 4. **Chunking settings are inert.** `chunk_text()` hardcodes `chunk_size=1000, overlap=200`;
    `settings.chunk_size` / `chunk_overlap` are never passed in, so `CHUNK_SIZE` / `CHUNK_OVERLAP`
    env vars have no effect. The sliding-window loop also emits a final short chunk and skips chunks
    under 50 characters, so `chunks_ingested` can be lower than the chunk count.
-5. **`openapi.yml` references a `requirements.txt` that does not exist** and installs with `pip` on
-   Python 3.13, unlike `ci.yml` (uv on 3.12/3.14). The workflow is currently staged but
-   uncommitted (`git status` shows `AM .github/workflows/openapi.yml`) — it will fail at the install
-   step until it uses `uv sync --locked` or a real requirements file.
-6. **Langfuse keys are not wired.** `@observe` relies on the SDK picking up `LANGFUSE_*` from the
+5. **Langfuse keys are not wired.** `@observe` relies on the SDK picking up `LANGFUSE_*` from the
    process environment; `settings.langfuse_*` are never passed to the SDK, and pydantic-settings
    does **not** export `.env` values into `os.environ`. Tracing from a `.env`-only setup will not
    attach.
-7. **No resilience or pooling.** A new `psycopg2` connection is opened per request and closed
+6. **No resilience or pooling.** A new `psycopg2` connection is opened per request and closed
    manually (no context managers, no `try/finally`), `HTTPException` is imported but unused, and
    there is no error handling around DB or Ollama failures — any error surfaces as a bare 500.
    `/ingest` also calls Ollama once **per chunk**, serially.
-8. **`settings.host` / `port` / `log_level` are unused**; the server must be started with an
+7. **`settings.host` / `port` / `log_level` are unused**; the server must be started with an
    explicit `uvicorn` command line.
 
 ### Repo hygiene

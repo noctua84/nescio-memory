@@ -1,0 +1,76 @@
+name: OpenAPI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: openapi-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  openapi-checks:
+    name: Generate, Validate, Lint & Drift-Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # setup-uv handles both uv and the Python interpreter, with caching
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # --locked fails if uv.lock is stale, matching your existing lock-check philosophy
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      # Generate the spec from the actual code.
+      # Dummy env vars satisfy Settings() without a real DB —
+      # app.openapi() only reads routes + Pydantic models.
+      # `uv run` is required: uv sync populates .venv but does not activate it,
+      # so a bare `python` would resolve to the setup-python interpreter.
+      - name: Generate OpenAPI spec from code
+        env:
+          DATABASE_URL: postgresql://dummy:dummy@localhost:5432/dummy
+          OLLAMA_URL: http://localhost:11434/api/embeddings
+        run: uv run --locked python export_openapi.py
+
+      # 1. Structural validation — is this a valid OpenAPI document?
+      - name: Validate OpenAPI schema
+        run: uv run --locked openapi-spec-validator openapi.json
+
+      # 2. Drift detection — does the committed spec match the code?
+      - name: Check for spec drift
+        run: |
+          if git diff --exit-code openapi.json openapi.yaml; then
+            echo "✅ OpenAPI spec is up to date with the code."
+          else
+            echo "::error::OpenAPI spec is out of date!"
+            echo "Run 'uv run python export_openapi.py' locally and commit the result."
+            git diff openapi.json openapi.yaml
+            exit 1
+          fi
+
+      # 3. Spectral linting — is this a *good* spec by our conventions?
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install Spectral
+        run: npm install -g @stoplight/spectral-cli
+
+      - name: Lint OpenAPI spec with Spectral
+        run: spectral lint openapi.json --ruleset .spectral.yaml
