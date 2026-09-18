@@ -1,6 +1,12 @@
 [project]
 name = "nescio-memory"
 version = "0.1.0"
+description = "Semantic memory API: chunk, embed and retrieve knowledge using PostgreSQL and pgvector."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Markus Moeller", email = "markus.moeller@outlook.de" },
+]
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
@@ -14,3 +20,7 @@ dependencies = [
     "sentence-transformers>=6.0.1",
     "uvicorn==0.53.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/noctua84/nescio-memory"
+Issues = "https://github.com/noctua84/nescio-memory/issues"
