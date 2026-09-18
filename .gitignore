@@ -19,6 +19,10 @@ venv/
 .idea/
 .vscode/
 
+# AI agent tooling - machine-local settings only.
+# QWEN.md at the repo root stays tracked: it is shared project context.
+.qwen/settings.json
+
 # OS
 .DS_Store
 Thumbs.db
