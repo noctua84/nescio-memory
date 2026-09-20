@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     host: str = "localhost"
     port: int = 8080
 
+    # env_file is resolved against the working directory, not this file's
+    # location, so it stays ".env" even though this module lives in app/.
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

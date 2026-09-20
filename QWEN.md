@@ -104,7 +104,7 @@ learnings (
 
 ## Configuration
 
-All settings live in `config.py` and are read from `.env` (`extra="ignore"`, so unknown keys are
+All settings live in `app/config.py` and are read from `.env` (`extra="ignore"`, so unknown keys are
 tolerated). The `settings` object is instantiated **at import time**.
 
 | Setting               | Default                                      | Used by                     |
@@ -119,7 +119,7 @@ tolerated). The `settings` object is instantiated **at import time**.
 | `chunk_size` / `chunk_overlap` | `1000` / `200`                       | *not read in code* — `chunk_text()` uses its own hardcoded defaults |
 | `host` / `port`       | `localhost` / `8080`                          | *not read in code* — no `uvicorn.run()` block exists |
 
-Note the `.env.example` / `config.py` mismatch: the template ships `OLLAMA_MODEL=qwen3-embedding:4b`
+Note the `.env.example` / `app/config.py` mismatch: the template ships `OLLAMA_MODEL=qwen3-embedding:4b`
 with `EMBEDDING_DIMENSION=1024`, while the code defaults to `0.6b` / `384`. Changing the model
 **requires** recreating the `embedding` column at the matching dimension.
 
@@ -173,7 +173,7 @@ Keep messages lowercase and imperative.
 - **Code style:** type hints on public helpers and Pydantic models, `X | None` union syntax,
   parameterized SQL via `%s` placeholders (no string interpolation of user input). The module uses
   `""" ... """` string literals as section banners (`Helper functions`, `Models`, `Endpoints`) —
-  follow that when adding sections to `main.py`.
+  follow that when adding sections to `app/main.py`.
 - **Tests:** none exist yet. `ci.yml` has a placeholder showing the intended command
   (`uv run --locked pytest`). If you add the first test, also enable that CI step.
 - **Docs:** `README.md` is the user-facing contract (setup, schema SQL, API examples, limitations);
@@ -192,7 +192,7 @@ update both places.
 1. **`repo_filter` never matches.** `/search` filters on `metadata->>'repo_name'`, but `/ingest`
    writes `repo_name` only as a **table column** and stores just `file_name`, `relative_path`,
    `chunk_index` in `metadata`. Filtering by repo silently returns zero rows.
-2. **`httpx` is imported but not declared.** `main.py` depends on it directly; it is only present
+2. **`httpx` is imported but not declared.** `app/main.py` depends on it directly; it is only present
    transitively (via `langfuse` and `huggingface-hub`). Adding it to `pyproject.toml` is the safe fix.
 3. **`sentence-transformers` is declared but never imported.** Embeddings come from Ollama over
    HTTP. It is a heavy dependency (pulls in torch), is currently pinned to `==6.1.0`, and is also

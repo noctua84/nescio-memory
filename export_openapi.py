@@ -1,6 +1,6 @@
 import json
 import yaml
-from main import app
+from app.main import app
 
 def export():
     spec = app.openapi()

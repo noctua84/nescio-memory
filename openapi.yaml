@@ -1,12 +1,16 @@
 openapi: 3.1.0
 info:
   title: Nescio Semantic Memory API
+  description: NescioAI semantic memory core.
   version: 0.1.0
 paths:
-  /search:
+  /api/v1/search:
     post:
-      summary: Search Memory
-      operationId: search_memory_search_post
+      tags:
+      - Search
+      summary: Semantic Memory Search
+      description: Queries pgvector using a natural language prompt.
+      operationId: search_memory_api_v1_search_post
       requestBody:
         content:
           application/json:
@@ -26,15 +30,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-  /ingest:
+  /api/v1/ingest:
     post:
-      summary: Ingest File
-      operationId: ingest_file_ingest_post
+      tags:
+      - Ingest
+      summary: Ingest Markdown File
+      description: Chunks content, embeds via Ollama, and upserts into pgvector.
+      operationId: ingest_file_api_v1_ingest_post
       requestBody:
         content:
           application/x-www-form-urlencoded:
             schema:
-              $ref: '#/components/schemas/Body_ingest_file_ingest_post'
+              $ref: '#/components/schemas/Body_ingest_file_api_v1_ingest_post'
         required: true
       responses:
         '200':
@@ -51,6 +58,8 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
   /health:
     get:
+      tags:
+      - Ops
       summary: Health
       operationId: health_health_get
       responses:
@@ -61,23 +70,26 @@ paths:
               schema: {}
 components:
   schemas:
-    Body_ingest_file_ingest_post:
+    Body_ingest_file_api_v1_ingest_post:
       properties:
         repo_name:
           type: string
           title: Repo Name
+          description: Repository this file belongs to.
         file_path:
           type: string
           title: File Path
+          description: Relative path of the file.
         content:
           type: string
           title: Content
+          description: Raw markdown content to vectorize.
       type: object
       required:
       - repo_name
       - file_path
       - content
-      title: Body_ingest_file_ingest_post
+      title: Body_ingest_file_api_v1_ingest_post
     HTTPValidationError:
       properties:
         detail:
@@ -92,32 +104,46 @@ components:
         status:
           type: string
           title: Status
-        file_path:
+          description: Operation status.
+          examples:
+          - success
+        file:
           type: string
-          title: File Path
-        chunks_ingested:
+          title: File
+          description: Path of the processed file.
+        ingested:
           type: integer
-          title: Chunks Ingested
+          title: Ingested
+          description: Number of chunks stored.
       type: object
       required:
       - status
-      - file_path
-      - chunks_ingested
+      - file
+      - ingested
       title: IngestResponse
     SearchRequest:
       properties:
         query:
           type: string
           title: Query
+          description: The natural language search query.
+          examples:
+          - How do we handle API authentication across repos?
         top_k:
           type: integer
+          maximum: 50.0
+          minimum: 1.0
           title: Top K
+          description: Max chunks to return.
           default: 5
         repo_filter:
           anyOf:
           - type: string
           - type: 'null'
           title: Repo Filter
+          description: Optional filter by repository name.
+          examples:
+          - repo_a
       type: object
       required:
       - query
@@ -126,14 +152,34 @@ components:
       properties:
         results:
           items:
-            additionalProperties: true
-            type: object
+            $ref: '#/components/schemas/SearchResult'
           type: array
           title: Results
       type: object
       required:
       - results
       title: SearchResponse
+    SearchResult:
+      properties:
+        content:
+          type: string
+          title: Content
+          description: The retrieved markdown chunk.
+        metadata:
+          additionalProperties: true
+          type: object
+          title: Metadata
+          description: File path, repo name, chunk index.
+        similarity:
+          type: number
+          title: Similarity
+          description: Cosine similarity score (0-1).
+      type: object
+      required:
+      - content
+      - metadata
+      - similarity
+      title: SearchResult
     ValidationError:
       properties:
         loc:
