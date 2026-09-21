@@ -1,8 +1,17 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # Database
     database_url: str
+
+    # Embeddings backend
+    # "ollama" posts to an Ollama server over HTTP; "local" runs
+    # sentence-transformers in-process and needs the local-embeddings extra.
+    embedding_backend: Literal["ollama", "local"] = "ollama"
+    # 384 dimensions, matching the default embedding_dimension below.
+    local_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 
     # Ollama
     ollama_url: str = "http://localhost:11434/api/embeddings"

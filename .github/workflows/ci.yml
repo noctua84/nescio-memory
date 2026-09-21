@@ -42,9 +42,15 @@ jobs:
       - name: Import check
         run: |
           uv run --locked --python ${{ matrix.python-version }} python -c "
-          import fastapi, uvicorn, psycopg2, pgvector, langfuse, sentence_transformers, pydantic
+          import fastapi, uvicorn, psycopg2, pgvector, langfuse, httpx, pydantic, pydantic_settings
           print('all runtime dependencies import OK')
           "
+
+      # The local-embeddings extra is opt-in, so no other CI step exercises it.
+      # --dry-run resolves it against the lockfile without downloading torch,
+      # which is enough to catch a constraint that has rotted.
+      - name: Verify the local-embeddings extra resolves
+        run: uv sync --locked --extra local-embeddings --dry-run --python ${{ matrix.python-version }}
 
       # TODO: add a test step once tests exist, e.g.
       #   run: uv run --locked pytest

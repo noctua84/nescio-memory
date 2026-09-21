@@ -32,7 +32,10 @@ project or document says, `/api/v1/search` it back when you need context.
 ```
 
 Embeddings are produced by an external [Ollama](https://ollama.com) server, so the API process
-stays small and the model can run wherever you have capacity. Both endpoints are traced with
+stays small and the model can run wherever you have capacity — on Kubernetes that is typically a
+separate Ollama pod behind a Service. An optional in-process backend using
+[sentence-transformers](https://sbert.net) is available for deployments that cannot run a second
+service; see [Embedding backends](#embedding-backends). Both endpoints are traced with
 [Langfuse](https://langfuse.com) when `LANGFUSE_*` are exported into the **process environment** —
 values that only live in `.env` are not picked up, see
 [Current limitations](#current-limitations).
@@ -42,7 +45,8 @@ values that only live in `.env` are not picked up, see
 - **Python 3.12+**
 - **[uv](https://docs.astral.sh/uv/)** — manages the virtualenv and the lockfile
 - **PostgreSQL 16+** with the `pgvector` extension
-- **Ollama** running an embedding model (e.g. `qwen3-embedding`)
+- **Ollama** running an embedding model (e.g. `qwen3-embedding`) — unless you use the optional
+  in-process backend instead
 
 ## Quick start
 
@@ -50,6 +54,13 @@ values that only live in `.env` are not picked up, see
 
 ```bash
 uv sync --locked
+```
+
+Only if you want the in-process embedding backend instead of Ollama, add the optional extra —
+this pulls in torch, roughly 530 MB of wheels on Linux:
+
+```bash
+uv sync --locked --extra local-embeddings
 ```
 
 ### 2. Create the database schema
@@ -179,6 +190,8 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | Variable              | Default                                    | Description                                          |
 | --------------------- | ------------------------------------------ | ---------------------------------------------------- |
 | `DATABASE_URL`        | *required*                                 | PostgreSQL connection string                         |
+| `EMBEDDING_BACKEND`   | `ollama`                                    | `ollama` (HTTP) or `local` (in-process); any other value fails at startup |
+| `LOCAL_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2`  | model for the `local` backend only — see [Embedding backends](#embedding-backends) |
 | `OLLAMA_URL`          | `http://localhost:11434/api/embeddings`     | embedding endpoint (local or remote)                 |
 | `OLLAMA_MODEL`        | `qwen3-embedding:0.6b`                      | embedding model name                                 |
 | `EMBEDDING_DIMENSION` | `384`                                       | must match the model **and** the `vector(N)` column  |
@@ -191,7 +204,26 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `CHUNK_OVERLAP`       | `200`                                      | overlap between chunks — must stay **below** `CHUNK_SIZE` |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
 
-### Embedding models
+### Embedding backends
+
+|                  | `ollama` (default)                    | `local`                                        |
+| ---------------- | ------------------------------------- | ---------------------------------------------- |
+| Runs             | in a separate Ollama process or pod   | in-process, via sentence-transformers          |
+| Install          | nothing extra                         | `uv sync --extra local-embeddings` (adds torch) |
+| Model weights    | managed by Ollama                     | fetched from Hugging Face Hub on first use     |
+| Scales           | independently of the API              | with the API process — needs CPU/GPU and RAM there |
+| Best for         | clusters that already run Ollama      | single-process or offline deployments          |
+
+Select the backend with `EMBEDDING_BACKEND`. The `local` backend loads its model once and caches
+it for the lifetime of the process. Selecting `local` without installing the extra fails on the
+first embedding call with an error naming the install command — it does **not** silently fall back
+to Ollama.
+
+The default `LOCAL_EMBEDDING_MODEL` (`all-MiniLM-L6-v2`) is 384-dimensional, the same width as the
+default `qwen3-embedding:0.6b`, so either backend works against a `vector(384)` column. Choosing a
+model of a different width means recreating the column and re-ingesting.
+
+### Ollama models
 
 | Model                   | Dimensions | Rough cost          |
 | ----------------------- | ---------- | ------------------- |
@@ -206,18 +238,21 @@ everything — vectors of different dimensions are not comparable.
 
 ```bash
 uv sync --locked                      # install / refresh the environment
+uv sync --locked --extra local-embeddings  # only if using the in-process backend
 uv lock                               # after changing dependencies in pyproject.toml
 uv run python export_openapi.py       # regenerate openapi.json + openapi.yaml
 uv run uvicorn app.main:app --reload  # dev server (from the repository root)
 ```
 
-Two things are enforced by CI:
+Three things are enforced by CI:
 
 - **`uv.lock` must stay in sync with `pyproject.toml`.** If you add or change a dependency, run
   `uv lock` and commit both files.
 - **The committed OpenAPI spec must match the code.** If you touch a route, a `Form(...)` field, or
   a Pydantic model, run `export_openapi.py` and commit the regenerated `openapi.json` and
   `openapi.yaml`.
+- **The `local-embeddings` extra must still resolve.** A `--dry-run` sync verifies it against the
+  lockfile on every run without downloading torch, so the opt-in backend cannot rot unnoticed.
 
 Releases are automated by [release-please](https://github.com/googleapis/release-please) from
 Conventional Commits (`feat:`, `fix:`, `chore:`, …). Merging the release PR it maintains bumps the

@@ -18,8 +18,15 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "python-multipart>=0.0.32",
     "pyyaml>=6.0.3",
-    "sentence-transformers==6.1.0",
     "uvicorn==0.53.0",
+]
+
+[project.optional-dependencies]
+# In-process embeddings via sentence-transformers instead of the Ollama HTTP
+# backend. Opt-in because it pulls torch (~530 MB of wheels on Linux):
+#   uv sync --extra local-embeddings
+local-embeddings = [
+    "sentence-transformers==6.1.0",
 ]
 
 [dependency-groups]

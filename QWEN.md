@@ -15,9 +15,13 @@ pgvector database. It exposes two operations:
 
 `GET /health` sits at the root, outside the version prefix.
 
-Embeddings are **not** computed in-process. They are requested over HTTP from an
+By default embeddings are **not** computed in-process: they are requested over HTTP from an
 [Ollama](https://ollama.com) `/api/embeddings` endpoint (default model `qwen3-embedding:0.6b`,
-384 dims). Langfuse `@observe` decorators are applied to both handlers for tracing.
+384 dims). The intended deployment is a **Kubernetes cluster that already runs an Ollama pod**, so
+`OLLAMA_URL` points at an in-cluster Service — that is why HTTP is the default and why torch is not
+part of the base install. An optional in-process backend sits behind `EMBEDDING_BACKEND=local` and
+the `local-embeddings` extra. Langfuse `@observe` decorators are applied to both handlers for
+tracing.
 
 Stack: Python ≥ 3.12 · FastAPI · Pydantic v2 / pydantic-settings · psycopg2 + pgvector · httpx ·
 Langfuse · uvicorn. Dependency management and the virtualenv are owned by **uv** (`uv.lock` is
@@ -44,7 +48,7 @@ app/api/v1/router.py        Aggregates the ingest and search routers under the /
 app/api/v1/ingest.py        POST /api/v1/ingest — chunk, embed, delete-then-upsert
 app/api/v1/search.py        POST /api/v1/search — embed query, cosine nearest-neighbour select
 app/core/db.py              get_db_connection() — plain psycopg2 connect, one per call
-app/core/embeddings.py      get_embedding() — httpx POST to the Ollama /api/embeddings endpoint
+app/core/embeddings.py      get_embedding() — Ollama over httpx, or in-process sentence-transformers
 app/core/chunking.py        chunk_text() — sliding window; reads settings.chunk_size/overlap
 app/schemas/search.py       SearchRequest, SearchResult, SearchResponse
 app/schemas/ingest.py       IngestResponse
@@ -55,6 +59,7 @@ openapi.json / openapi.yaml Committed API contract; drift-checked in CI
 README.md                   Primary user-facing docs: setup, SQL schema, API examples, limitations
 LICENSE                     MIT
 pyproject.toml              Metadata + runtime deps + [dependency-groups] dev
+                            + [project.optional-dependencies] local-embeddings
                             No [build-system] — a virtual uv project, not a published wheel
 uv.lock                     Locked dependency graph — committed on purpose, never hand-edited
 .env.example                Documented configuration template
@@ -135,7 +140,9 @@ tolerated). The `settings` object is instantiated **at import time**.
 | Setting               | Default                                      | Used by                     |
 | --------------------- | -------------------------------------------- | --------------------------- |
 | `database_url`        | *(required)*                                 | `get_db_connection()`       |
-| `ollama_url`          | `http://localhost:11434/api/embeddings`       | `get_embedding()`           |
+| `embedding_backend`   | `ollama`                                     | `get_embedding()` — `Literal["ollama", "local"]`, so a typo fails at startup |
+| `local_embedding_model` | `sentence-transformers/all-MiniLM-L6-v2`   | `get_embedding()`, only when the backend is `local` |
+| `ollama_url`          | `http://localhost:11434/api/embeddings`       | `get_embedding()`, `ollama` backend |
 | `ollama_model`        | `qwen3-embedding:0.6b`                        | `get_embedding()`, `/health` |
 | `embedding_dimension` | `384`                                        | *not read in code* — must match the DB column |
 | `langfuse_public_key` / `_secret_key` / `_host` | empty / `https://cloud.langfuse.com` | *not read in code* — see Known Gaps |
@@ -153,9 +160,11 @@ with `EMBEDDING_DIMENSION=1024`, while the code defaults to `0.6b` / `384`. Chan
 Three GitHub Actions workflows:
 
 - **`ci.yml`** — on push to `main` and all PRs. Runs `uv sync --locked` on Python **3.12, 3.13 and 3.14**
-  (floor + current), then an import check of the runtime deps. The test step is a deliberate `TODO`
-  because pytest exits 5 on an empty suite. This workflow is the guard against `uv.lock` drift:
-  **adding or changing a dependency without re-running `uv lock` breaks CI.**
+  (floor + current), then an import check of the runtime deps, then
+  `uv sync --locked --extra local-embeddings --dry-run` so the opt-in extra stays resolvable without
+  anyone paying for a torch download. The test step is a deliberate `TODO` because pytest exits 5 on
+  an empty suite. This workflow is the guard against `uv.lock` drift: **adding or changing a
+  dependency without re-running `uv lock` breaks CI.**
 - **`openapi.yml`** — on push to `main` and all PRs. Syncs the **dev** dependency group, regenerates
   the spec, validates it with `openapi-spec-validator`, fails if `git diff` shows
   `openapi.json`/`openapi.yaml` changed, then lints with Spectral using `.spectral.yaml`.
@@ -189,6 +198,11 @@ Keep messages lowercase and imperative.
 - **Dev-only tooling** goes in `[dependency-groups] dev` (currently `openapi-spec-validator`), not
   in `[project] dependencies` — it must not ship to runtime. Note that `uv sync` installs the `dev`
   group by default, so `ci.yml` picks it up even though only `openapi.yml` asks for it explicitly.
+- **Heavy opt-in runtime features** go in `[project.optional-dependencies]` (currently
+  `local-embeddings` → `sentence-transformers`), never in `[project] dependencies`. Import them
+  lazily inside the function that needs them so the base install stays small, and fail with an error
+  that names the install command rather than falling back silently. Keep the extra resolvable in CI
+  with `uv sync --extra <name> --dry-run`, which costs nothing next to actually installing it.
 - **Line endings:** `.gitattributes` stores LF and checks out native endings. `*.sh`, `*.yml`,
   `*.yaml`, and `uv.lock` are forced to LF because Linux tooling consumes them. Without this,
   Windows checkouts and the Ubuntu CI runner disagree and whole files appear modified. Do not
@@ -232,9 +246,12 @@ update both places.
    `ModuleNotFoundError` at import time instead of degrading. Supporting an older floor needs
    `tomli>=2.0; python_version < "3.11"` plus a guarded import. This is the only version-sensitive
    import in the codebase — `importlib.metadata`, also used here, has been stdlib since 3.8.
-3. **`sentence-transformers` is declared but never imported.** Embeddings come from Ollama over
-   HTTP. It is a heavy dependency (pulls in torch), pinned to `==6.1.0`. `httpx` is now declared in
-   its own right, so removing this no longer endangers the embeddings client.
+3. **The `local` embeddings backend has never run against the real library.**
+   `sentence-transformers` now lives in the `local-embeddings` optional extra and `get_embedding()`
+   branches on `settings.embedding_backend`, but that branch has only been exercised with a stubbed
+   `SentenceTransformer`. Nothing in CI installs the extra — deliberately, since torch is ~530 MB of
+   Linux wheels — so a change to the real `.encode()` signature or its return dtype would go
+   unnoticed until someone opts in. Verify against the real library before relying on it.
 4. **Langfuse keys are not wired.** `@observe` relies on the SDK picking up `LANGFUSE_*` from the
    process environment; `settings.langfuse_*` are never passed to the SDK, and pydantic-settings
    does **not** export `.env` values into `os.environ`. Tracing from a `.env`-only setup will not
