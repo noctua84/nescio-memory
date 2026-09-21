@@ -224,20 +224,14 @@ update both places.
    Behavioural note: the sliding window emits a trailing short chunk, and it is `ingest.py` — not
    `chunk_text()` — that drops chunks under 50 characters, so `ingested` can be lower than
    the number of chunks produced.
-2. **`importlib>=1.0.4` installs nothing.** Its own METADATA describes it as a "Backport of
-   `importlib.import_module()` from Python 2.7", for use "with a version of Python prior to 2.7 or
-   in 3.0", classifiers stop at Python 3.0, and it states there will be no further maintenance. It
-   has nothing to do with `importlib.metadata`. Verified in `.venv`: only
-   `importlib-1.0.4.dist-info` is present, `top_level.txt` is empty and the RECORD lists no `.py`
-   files, so it contributes zero importable code — and it declares no `Requires-Python`, so it
-   constrains nothing either. `app/helper.py`'s `from importlib.metadata import ...` is stdlib
-   since Python 3.8, so this entry can simply be deleted and re-locked. (The similarly named
-   `importlib_metadata`, with an underscore, is the genuine backport of the metadata API — also
-   unnecessary on ≥ 3.12.)
-   The only version-sensitive import in the codebase is `tomllib` in `app/helper.py`, stdlib since
-   3.11 and therefore inside the `>=3.12` floor. Its comment mentions a `tomli` fallback that is
-   **not** implemented — `import tomllib` is unconditional at module scope — so lowering
-   `requires-python` below 3.11 would fail at import time, not degrade gracefully.
+2. **`app/helper.py`'s advertised `tomli` fallback does not exist.** `import tomllib` is
+   unconditional at module scope, and `tomllib` is stdlib only since Python **3.11** — inside the
+   project's `>=3.12` floor, so it works today on every supported and CI-tested version. But the
+   comment above the read claims "built-in tomllib (Python 3.11+) or fallback to tomli" and no such
+   fallback is implemented, so lowering `requires-python` below 3.11 would fail with
+   `ModuleNotFoundError` at import time instead of degrading. Supporting an older floor needs
+   `tomli>=2.0; python_version < "3.11"` plus a guarded import. This is the only version-sensitive
+   import in the codebase — `importlib.metadata`, also used here, has been stdlib since 3.8.
 3. **`sentence-transformers` is declared but never imported.** Embeddings come from Ollama over
    HTTP. It is a heavy dependency (pulls in torch), pinned to `==6.1.0`. `httpx` is now declared in
    its own right, so removing this no longer endangers the embeddings client.
