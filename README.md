@@ -166,7 +166,7 @@ curl -X POST http://localhost:8000/api/v1/search \
 | ------------- | ---------------- | ------- | -------------------------------------- |
 | `query`       | string           | —       | text to search for (required)          |
 | `top_k`       | int              | `5`     | maximum number of results; must be between 1 and 50, otherwise `422` |
-| `repo_filter` | string \| `null` | `null`  | restrict to one `repo_name` — **see [limitations](#current-limitations)** |
+| `repo_filter` | string \| `null` | `null`  | restrict results to one `repo_name`    |
 
 Each result carries `content` (the matched chunk), `metadata` (`file_name`, `relative_path`,
 `chunk_index`) and `similarity`.
@@ -227,9 +227,6 @@ version and publishes a GitHub Release — do not edit versions by hand.
 
 This is a PoC. Known rough edges, roughly in order of how much they matter:
 
-- **`repo_filter` does not work.** `/api/v1/search` filters on `metadata->>'repo_name'`, but
-  `/api/v1/ingest` writes `repo_name` as a table column and does not include it in `metadata`, so
-  filtered searches return nothing.
 - **No schema management.** The `learnings` table has to be created by hand; there are no
   migrations and no bootstrap script.
 - **Chunking config is not validated.** Setting `CHUNK_OVERLAP` at or above `CHUNK_SIZE` makes the

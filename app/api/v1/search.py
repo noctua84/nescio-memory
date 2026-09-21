@@ -25,7 +25,7 @@ def search_memory(request: SearchRequest):
     params: list = [query_embedding]
 
     if request.repo_filter:
-        sql += " WHERE metadata->>'repo_name' = %s"
+        sql += " WHERE repo_name = %s"
         params.append(request.repo_filter)
 
     sql += " ORDER BY embedding <=> %s LIMIT %s"

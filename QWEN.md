@@ -217,35 +217,39 @@ them as context so you don't build on a false assumption, and don't fix them unp
 user-facing subset is published in the README under "Current limitations", so if you *do* fix one,
 update both places.
 
-1. **`repo_filter` never matches.** `/api/v1/search` filters on `metadata->>'repo_name'`, but
-   `/api/v1/ingest` writes `repo_name` only as a **table column** and stores just `file_name`,
-   `relative_path`, `chunk_index` in `metadata`. Filtering by repo silently returns zero rows.
-2. **`chunk_text()` can loop forever.** `step = size - overlap` and the loop advances `start` by
+1. **`chunk_text()` can loop forever.** `step = size - overlap` and the loop advances `start` by
    `step`, so if `CHUNK_OVERLAP >= CHUNK_SIZE` then `step <= 0`, `start` never advances, and the
    function appends chunks until the process dies. Nothing validates that relationship. The `or`
    fallbacks (`chunk_size or settings.chunk_size`) also treat an explicit `0` as "unset".
    Behavioural note: the sliding window emits a trailing short chunk, and it is `ingest.py` — not
    `chunk_text()` — that drops chunks under 50 characters, so `ingested` can be lower than
    the number of chunks produced.
-3. **`importlib>=1.0.4` installs nothing.** It is a 2016 PyPI backport of the *`importlib` module
-   itself* for Python 2.6/3.1 and has nothing to do with `importlib.metadata`. Verified in
-   `.venv`: only `importlib-1.0.4.dist-info` is present, its `top_level.txt` is empty and its
-   RECORD lists no `.py` files, so it contributes zero importable code. `app/helper.py`'s
-   `from importlib.metadata import ...` is stdlib since Python 3.8 and needs no dependency at all,
-   so this entry can simply be deleted and re-locked. (The similarly named `importlib_metadata`,
-   with an underscore, is the genuine backport of the metadata API — also unnecessary on ≥ 3.12.)
-4. **`sentence-transformers` is declared but never imported.** Embeddings come from Ollama over
+2. **`importlib>=1.0.4` installs nothing.** Its own METADATA describes it as a "Backport of
+   `importlib.import_module()` from Python 2.7", for use "with a version of Python prior to 2.7 or
+   in 3.0", classifiers stop at Python 3.0, and it states there will be no further maintenance. It
+   has nothing to do with `importlib.metadata`. Verified in `.venv`: only
+   `importlib-1.0.4.dist-info` is present, `top_level.txt` is empty and the RECORD lists no `.py`
+   files, so it contributes zero importable code — and it declares no `Requires-Python`, so it
+   constrains nothing either. `app/helper.py`'s `from importlib.metadata import ...` is stdlib
+   since Python 3.8, so this entry can simply be deleted and re-locked. (The similarly named
+   `importlib_metadata`, with an underscore, is the genuine backport of the metadata API — also
+   unnecessary on ≥ 3.12.)
+   The only version-sensitive import in the codebase is `tomllib` in `app/helper.py`, stdlib since
+   3.11 and therefore inside the `>=3.12` floor. Its comment mentions a `tomli` fallback that is
+   **not** implemented — `import tomllib` is unconditional at module scope — so lowering
+   `requires-python` below 3.11 would fail at import time, not degrade gracefully.
+3. **`sentence-transformers` is declared but never imported.** Embeddings come from Ollama over
    HTTP. It is a heavy dependency (pulls in torch), pinned to `==6.1.0`. `httpx` is now declared in
    its own right, so removing this no longer endangers the embeddings client.
-5. **Langfuse keys are not wired.** `@observe` relies on the SDK picking up `LANGFUSE_*` from the
+4. **Langfuse keys are not wired.** `@observe` relies on the SDK picking up `LANGFUSE_*` from the
    process environment; `settings.langfuse_*` are never passed to the SDK, and pydantic-settings
    does **not** export `.env` values into `os.environ`. Tracing from a `.env`-only setup will not
    attach.
-6. **No pooling and no error handling.** Connections *are* closed properly now (`try/finally` plus
+5. **No pooling and no error handling.** Connections *are* closed properly now (`try/finally` plus
    a cursor context manager), but a fresh `psycopg2` connection is still opened per request with
    no pool, and nothing catches DB or Ollama failures — any error surfaces as a bare 500.
    `/api/v1/ingest` calls Ollama once **per chunk**, serially, inside an open transaction.
-7. **`settings.host` / `port` / `log_level` / `embedding_dimension` are unused.** The server must
+6. **`settings.host` / `port` / `log_level` / `embedding_dimension` are unused.** The server must
    be started with an explicit `uvicorn` command line, and `EMBEDDING_DIMENSION` is documentation
    only — it is never checked against the actual `vector(N)` column, so a mismatch surfaces as a
    database error at insert time rather than at startup.
