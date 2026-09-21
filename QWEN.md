@@ -7,10 +7,13 @@ Instructional context for AI agents working in this repository.
 **nescio-memory** is a small FastAPI service that provides *semantic memory* over a PostgreSQL +
 pgvector database. It exposes two operations:
 
-- **`POST /ingest`** — accepts a file's text content (form-encoded), splits it into overlapping
-  character chunks, embeds each chunk, and upserts them into the `learnings` table (deleting that
-  file's previous chunks first, so re-ingesting is idempotent).
-- **`POST /search`** — embeds a query and returns the `top_k` nearest chunks by cosine similarity.
+- **`POST /api/v1/ingest`** — accepts a file's text content (form-encoded), splits it into
+  overlapping character chunks, embeds each chunk, and upserts them into the `learnings` table
+  (deleting that file's previous chunks first, so re-ingesting is idempotent).
+- **`POST /api/v1/search`** — embeds a query and returns the `top_k` nearest chunks by cosine
+  similarity.
+
+`GET /health` sits at the root, outside the version prefix.
 
 Embeddings are **not** computed in-process. They are requested over HTTP from an
 [Ollama](https://ollama.com) `/api/embeddings` endpoint (default model `qwen3-embedding:0.6b`,
@@ -20,8 +23,11 @@ Stack: Python ≥ 3.12 · FastAPI · Pydantic v2 / pydantic-settings · psycopg2
 Langfuse · uvicorn. Dependency management and the virtualenv are owned by **uv** (`uv.lock` is
 committed and is the single source of truth).
 
-The project is intentionally a **flat, single-module layout** — no `src/`, no packages, no
-migrations, no tests yet.
+The code lives in a single importable **`app/` package** at the repository root (no `src/`), split
+by concern into `api/v1`, `core` and `schemas`. There are no migrations and no tests yet. The
+package directories currently rely on **implicit namespace packages** — there are no `__init__.py`
+files — which works because uvicorn is launched from the repository root, but makes `app` a rather
+generic name to be sharing `sys.path` under.
 
 > **This is a proof of concept and is expected to change significantly.** The API surface, storage
 > schema, and chunking strategy are all in flux. Treat the gaps listed at the end of this document
@@ -31,14 +37,25 @@ migrations, no tests yet.
 ## Repository Layout
 
 ```
-main.py                     FastAPI app: helpers, Pydantic models, /search /ingest /health
-config.py                   pydantic-settings Settings class; module-level `settings` singleton
+app/main.py                 create_app() factory + module-level `app`; owns GET /health
+app/config.py               pydantic-settings Settings class; module-level `settings` singleton
+app/helper.py               get_app_version() — importlib.metadata, else read pyproject.toml
+app/api/v1/router.py        Aggregates the ingest and search routers under the /api/v1 prefix
+app/api/v1/ingest.py        POST /api/v1/ingest — chunk, embed, delete-then-upsert
+app/api/v1/search.py        POST /api/v1/search — embed query, cosine nearest-neighbour select
+app/core/db.py              get_db_connection() — plain psycopg2 connect, one per call
+app/core/embeddings.py      get_embedding() — httpx POST to the Ollama /api/embeddings endpoint
+app/core/chunking.py        chunk_text() — sliding window; reads settings.chunk_size/overlap
+app/schemas/search.py       SearchRequest, SearchResult, SearchResponse
+app/schemas/ingest.py       IngestResponse
+app/schemas/pagination.py   PaginationResponse — unused by design, see Known Gaps
 export_openapi.py           Regenerates openapi.json + openapi.yaml from the live app
 openapi.json / openapi.yaml Committed API contract; drift-checked in CI
+.spectral.yaml              Spectral ruleset used by the OpenAPI lint step
 README.md                   Primary user-facing docs: setup, SQL schema, API examples, limitations
 LICENSE                     MIT
-pyproject.toml              Metadata (description, readme, license, authors, urls) + dependencies
-                            No [build-system] — this is a virtual uv project, not a published wheel
+pyproject.toml              Metadata + runtime deps + [dependency-groups] dev
+                            No [build-system] — a virtual uv project, not a published wheel
 uv.lock                     Locked dependency graph — committed on purpose, never hand-edited
 .env.example                Documented configuration template
 release-please-config.json  Release automation config
@@ -59,8 +76,8 @@ uv sync --locked
 # Copy and fill in configuration — REQUIRED, see note below
 cp .env.example .env
 
-# Run the dev server
-uv run uvicorn main:app --reload --port 8000
+# Run the dev server — MUST be launched from the repository root
+uv run uvicorn app.main:app --reload --port 8000
 
 # Regenerate the OpenAPI spec after ANY route/model change (CI enforces this)
 uv run python export_openapi.py
@@ -69,11 +86,17 @@ uv run python export_openapi.py
 curl http://localhost:8000/health
 ```
 
-**Critical gotcha:** `Settings.database_url` has **no default**, so importing `config` (and
-therefore `main`) raises a `ValidationError` unless `DATABASE_URL` is present in `.env` or the
+**Critical gotcha:** `Settings.database_url` has **no default**, so importing `app.config` (and
+therefore `app.main`) raises a `ValidationError` unless `DATABASE_URL` is present in `.env` or the
 process environment. `export_openapi.py` needs it too — the OpenAPI workflow works around this by
 injecting dummy `DATABASE_URL` / `OLLAMA_URL` env vars, because `app.openapi()` only reads route
 definitions and never touches the DB. Use the same trick for any offline spec/docs generation.
+
+**Everything is CWD-relative.** `SettingsConfigDict(env_file=".env")` resolves against the *working
+directory*, not against `app/config.py` — so moving a module must not "adjust" that path to
+`"../.env"`. That mistake points outside the repository, makes `.env` silently unread, and surfaces
+as the `database_url` `ValidationError` above rather than as a missing-file error. The same applies
+to importing `app` at all: launch uvicorn, pytest and `export_openapi.py` from the repository root.
 
 ### Required external services
 
@@ -91,16 +114,18 @@ relies on is:
 
 ```sql
 learnings (
-  repo_name  text,          -- written as a column by /ingest
-  file_path  text,          -- written as a column by /ingest
+  repo_name  text,          -- written as a column by /api/v1/ingest
+  file_path  text,          -- written as a column by /api/v1/ingest
   content    text,          -- one chunk
   metadata   json/jsonb,    -- {"file_name", "relative_path", "chunk_index"}
   embedding  vector(N)      -- N == EMBEDDING_DIMENSION
 )
 ```
 
-`/search` orders by `embedding <=> %s` (cosine distance) and reports `1 - distance` as
-`similarity`.
+`/api/v1/search` orders by `embedding <=> %s` (cosine distance) and reports `1 - distance` as
+`similarity`. Rows come back from a **plain psycopg2 cursor**, i.e. as tuples in `SELECT` order
+(`content`, `metadata`, `similarity`), not as dicts — `search.py` unpacks them positionally into
+`SearchResult`. There is no `RealDictCursor`.
 
 ## Configuration
 
@@ -116,7 +141,7 @@ tolerated). The `settings` object is instantiated **at import time**.
 | `langfuse_public_key` / `_secret_key` / `_host` | empty / `https://cloud.langfuse.com` | *not read in code* — see Known Gaps |
 | `app_name`            | `Nescio Semantic Memory API`                  | `FastAPI(title=...)`        |
 | `log_level`           | `INFO`                                       | *not read in code*          |
-| `chunk_size` / `chunk_overlap` | `1000` / `200`                       | *not read in code* — `chunk_text()` uses its own hardcoded defaults |
+| `chunk_size` / `chunk_overlap` | `1000` / `200`                       | `chunk_text()` in `app/core/chunking.py` |
 | `host` / `port`       | `localhost` / `8080`                          | *not read in code* — no `uvicorn.run()` block exists |
 
 Note the `.env.example` / `app/config.py` mismatch: the template ships `OLLAMA_MODEL=qwen3-embedding:4b`
@@ -171,9 +196,12 @@ Keep messages lowercase and imperative.
 - **Secrets:** `.env` is gitignored; `.env.example` is the documented template. Never commit real
   keys.
 - **Code style:** type hints on public helpers and Pydantic models, `X | None` union syntax,
-  parameterized SQL via `%s` placeholders (no string interpolation of user input). The module uses
-  `""" ... """` string literals as section banners (`Helper functions`, `Models`, `Endpoints`) —
-  follow that when adding sections to `app/main.py`.
+  parameterized SQL via `%s` placeholders (no string interpolation of user input). One concern per
+  module: endpoints in `app/api/v1/`, infrastructure in `app/core/`, request/response models in
+  `app/schemas/`. Handlers are decorated with `@observe(name="...")` for Langfuse tracing, and
+  endpoints declare `summary=`/`description=` plus `tags=[...]` so the generated spec passes the
+  Spectral lint step. The old `""" ... """` section banners are gone — they belonged to the
+  single-file layout.
 - **Tests:** none exist yet. `ci.yml` has a placeholder showing the intended command
   (`uv run --locked pytest`). If you add the first test, also enable that CI step.
 - **Docs:** `README.md` is the user-facing contract (setup, schema SQL, API examples, limitations);
@@ -189,28 +217,45 @@ them as context so you don't build on a false assumption, and don't fix them unp
 user-facing subset is published in the README under "Current limitations", so if you *do* fix one,
 update both places.
 
-1. **`repo_filter` never matches.** `/search` filters on `metadata->>'repo_name'`, but `/ingest`
-   writes `repo_name` only as a **table column** and stores just `file_name`, `relative_path`,
-   `chunk_index` in `metadata`. Filtering by repo silently returns zero rows.
-2. **`httpx` is imported but not declared.** `app/main.py` depends on it directly; it is only present
-   transitively (via `langfuse` and `huggingface-hub`). Adding it to `pyproject.toml` is the safe fix.
-3. **`sentence-transformers` is declared but never imported.** Embeddings come from Ollama over
-   HTTP. It is a heavy dependency (pulls in torch), is currently pinned to `==6.1.0`, and is also
-   one of the things keeping `httpx` in the lockfile — removing it affects gap #2.
-4. **Chunking settings are inert.** `chunk_text()` hardcodes `chunk_size=1000, overlap=200`;
-   `settings.chunk_size` / `chunk_overlap` are never passed in, so `CHUNK_SIZE` / `CHUNK_OVERLAP`
-   env vars have no effect. The sliding-window loop also emits a final short chunk and skips chunks
-   under 50 characters, so `chunks_ingested` can be lower than the chunk count.
+1. **`repo_filter` never matches.** `/api/v1/search` filters on `metadata->>'repo_name'`, but
+   `/api/v1/ingest` writes `repo_name` only as a **table column** and stores just `file_name`,
+   `relative_path`, `chunk_index` in `metadata`. Filtering by repo silently returns zero rows.
+2. **`chunk_text()` can loop forever.** `step = size - overlap` and the loop advances `start` by
+   `step`, so if `CHUNK_OVERLAP >= CHUNK_SIZE` then `step <= 0`, `start` never advances, and the
+   function appends chunks until the process dies. Nothing validates that relationship. The `or`
+   fallbacks (`chunk_size or settings.chunk_size`) also treat an explicit `0` as "unset".
+   Behavioural note: the sliding window emits a trailing short chunk, and it is `ingest.py` — not
+   `chunk_text()` — that drops chunks under 50 characters, so `ingested` can be lower than
+   the number of chunks produced.
+3. **`importlib>=1.0.4` installs nothing.** It is a 2016 PyPI backport of the *`importlib` module
+   itself* for Python 2.6/3.1 and has nothing to do with `importlib.metadata`. Verified in
+   `.venv`: only `importlib-1.0.4.dist-info` is present, its `top_level.txt` is empty and its
+   RECORD lists no `.py` files, so it contributes zero importable code. `app/helper.py`'s
+   `from importlib.metadata import ...` is stdlib since Python 3.8 and needs no dependency at all,
+   so this entry can simply be deleted and re-locked. (The similarly named `importlib_metadata`,
+   with an underscore, is the genuine backport of the metadata API — also unnecessary on ≥ 3.12.)
+4. **`sentence-transformers` is declared but never imported.** Embeddings come from Ollama over
+   HTTP. It is a heavy dependency (pulls in torch), pinned to `==6.1.0`. `httpx` is now declared in
+   its own right, so removing this no longer endangers the embeddings client.
 5. **Langfuse keys are not wired.** `@observe` relies on the SDK picking up `LANGFUSE_*` from the
    process environment; `settings.langfuse_*` are never passed to the SDK, and pydantic-settings
    does **not** export `.env` values into `os.environ`. Tracing from a `.env`-only setup will not
    attach.
-6. **No resilience or pooling.** A new `psycopg2` connection is opened per request and closed
-   manually (no context managers, no `try/finally`), `HTTPException` is imported but unused, and
-   there is no error handling around DB or Ollama failures — any error surfaces as a bare 500.
-   `/ingest` also calls Ollama once **per chunk**, serially.
-7. **`settings.host` / `port` / `log_level` are unused**; the server must be started with an
-   explicit `uvicorn` command line.
+6. **No pooling and no error handling.** Connections *are* closed properly now (`try/finally` plus
+   a cursor context manager), but a fresh `psycopg2` connection is still opened per request with
+   no pool, and nothing catches DB or Ollama failures — any error surfaces as a bare 500.
+   `/api/v1/ingest` calls Ollama once **per chunk**, serially, inside an open transaction.
+7. **`settings.host` / `port` / `log_level` / `embedding_dimension` are unused.** The server must
+   be started with an explicit `uvicorn` command line, and `EMBEDDING_DIMENSION` is documentation
+   only — it is never checked against the actual `vector(N)` column, so a mismatch surfaces as a
+   database error at insert time rather than at startup.
+
+**Not a gap:** `app/schemas/pagination.py` (`PaginationResponse`) has no importers and looks like
+dead code, but it is deliberate scaffolding for paged retrieval — the planned `ai-os/nescio-ai`
+learning loop is expected to consume bounded result sets rather than one large batch. Do **not**
+remove it during cleanup or simplification passes. Its camelCase aliases (`totalCount`,
+`pageSize`) differ from `IngestResponse`'s short-form aliases (`file`, `ingested`) and from
+`SearchResult`, which has none; reconcile that deliberately when pagination is wired in.
 
 ### Repo hygiene
 
