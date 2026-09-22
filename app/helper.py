@@ -19,7 +19,7 @@ def get_app_version() -> str:
         if not pyproject_path.exists():
             return "unknown"
 
-        # Use built-in tomllib (Python 3.11+) or fallback to tomli
+        # tomllib is stdlib since 3.11, inside this project's >=3.12 floor.
         with open(pyproject_path, "rb") as f:
             data = tomllib.load(f)
 
