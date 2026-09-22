@@ -173,11 +173,18 @@ Three GitHub Actions workflows:
   `openapi.json`/`openapi.yaml` changed, then lints with Spectral using `.spectral.yaml`.
   **Any edit to routes, `Form(...)` fields, or Pydantic models must be followed by
   `uv run python export_openapi.py` and committing the regenerated files.**
+  Both spec files are also release-please `extra-files`, and its updaters re-serialize the whole
+  document rather than patching one line — so `export_openapi.py` deliberately reproduces their
+  formatting via an indented-sequence YAML dumper and by writing integral floats as ints. **Do not
+  simplify either away**: the drift check then fails on every release commit, which is how v0.2.1's
+  release PR was caught.
 - **Both workflows must invoke Python tools through `uv run`.** `uv sync` populates `.venv` but does
   not activate it (setup-uv's `activate-environment` defaults to false), so a bare `python` or
   console script resolves to the runner's own interpreter and fails on import.
 - **`release-please.yml`** — on push to `main`. Maintains a release PR from conventional commits;
-  merging it tags the release. `bump-minor-pre-major: true` (0.x releases bump the minor), and three
+  merging it tags the release. `bump-minor-pre-major: true` means that in 0.x a breaking or feature
+  change bumps the **minor** instead of the major — a plain `fix:` still bumps the patch, which is
+  why the chunk_text fix produced 0.2.1 rather than 0.3.0. Three
   `extra-files` entries rewrite the version via jsonpath: **inside `uv.lock`** (toml), and at
   `$.info.version` in **`openapi.json`** (json) and **`openapi.yaml`** (yaml). Keep the two spec
   files in that list — `get_app_version()` feeds `info.version`, so a release that bumps

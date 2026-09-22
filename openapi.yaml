@@ -7,7 +7,7 @@ paths:
   /api/v1/search:
     post:
       tags:
-      - Search
+        - Search
       summary: Semantic Memory Search
       description: Queries pgvector using a natural language prompt.
       operationId: search_memory_api_v1_search_post
@@ -33,7 +33,7 @@ paths:
   /api/v1/ingest:
     post:
       tags:
-      - Ingest
+        - Ingest
       summary: Ingest Markdown File
       description: Chunks content, embeds via Ollama, and upserts into pgvector.
       operationId: ingest_file_api_v1_ingest_post
@@ -59,7 +59,7 @@ paths:
   /health:
     get:
       tags:
-      - Ops
+        - Ops
       summary: Health
       operationId: health_health_get
       responses:
@@ -86,9 +86,9 @@ components:
           description: Raw markdown content to vectorize.
       type: object
       required:
-      - repo_name
-      - file_path
-      - content
+        - repo_name
+        - file_path
+        - content
       title: Body_ingest_file_api_v1_ingest_post
     HTTPValidationError:
       properties:
@@ -106,7 +106,7 @@ components:
           title: Status
           description: Operation status.
           examples:
-          - success
+            - success
         file:
           type: string
           title: File
@@ -117,9 +117,9 @@ components:
           description: Number of chunks stored.
       type: object
       required:
-      - status
-      - file
-      - ingested
+        - status
+        - file
+        - ingested
       title: IngestResponse
     SearchRequest:
       properties:
@@ -128,25 +128,25 @@ components:
           title: Query
           description: The natural language search query.
           examples:
-          - How do we handle API authentication across repos?
+            - How do we handle API authentication across repos?
         top_k:
           type: integer
-          maximum: 50.0
-          minimum: 1.0
+          maximum: 50
+          minimum: 1
           title: Top K
           description: Max chunks to return.
           default: 5
         repo_filter:
           anyOf:
-          - type: string
-          - type: 'null'
+            - type: string
+            - type: 'null'
           title: Repo Filter
           description: Optional filter by repository name.
           examples:
-          - repo_a
+            - repo_a
       type: object
       required:
-      - query
+        - query
       title: SearchRequest
     SearchResponse:
       properties:
@@ -157,7 +157,7 @@ components:
           title: Results
       type: object
       required:
-      - results
+        - results
       title: SearchResponse
     SearchResult:
       properties:
@@ -176,17 +176,17 @@ components:
           description: Cosine similarity score (0-1).
       type: object
       required:
-      - content
-      - metadata
-      - similarity
+        - content
+        - metadata
+        - similarity
       title: SearchResult
     ValidationError:
       properties:
         loc:
           items:
             anyOf:
-            - type: string
-            - type: integer
+              - type: string
+              - type: integer
           type: array
           title: Location
         msg:
@@ -202,7 +202,7 @@ components:
           title: Context
       type: object
       required:
-      - loc
-      - msg
-      - type
+        - loc
+        - msg
+        - type
       title: ValidationError

@@ -192,8 +192,8 @@
           },
           "top_k": {
             "type": "integer",
-            "maximum": 50.0,
-            "minimum": 1.0,
+            "maximum": 50,
+            "minimum": 1,
             "title": "Top K",
             "description": "Max chunks to return.",
             "default": 5
