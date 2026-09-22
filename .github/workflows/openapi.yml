@@ -19,16 +19,18 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
-      # setup-uv handles both uv and the Python interpreter, with caching
+      # setup-uv handles both uv and the Python interpreter, with caching.
+      # It stopped publishing moving major tags in v8, so this is pinned to an
+      # exact version — `@v10` does not resolve and would fail the job.
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
 
@@ -65,7 +67,7 @@ jobs:
 
       # 3. Spectral linting — is this a *good* spec by our conventions?
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
 

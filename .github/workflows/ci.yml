@@ -29,10 +29,12 @@ jobs:
         # Floor and current, per requires-python = ">=3.12"
         python-version: ["3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
+      # setup-uv stopped publishing moving major tags in v8, so this is pinned to
+      # an exact version — `@v10` does not resolve and would fail the job.
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
 
