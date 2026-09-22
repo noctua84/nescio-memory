@@ -1,5 +1,6 @@
 from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -42,6 +43,18 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    # Failing here rather than only in chunk_text() means a bad .env crash-loops
+    # the pod at startup instead of returning a 500 on every ingest request.
+    @model_validator(mode="after")
+    def _chunk_window_must_advance(self) -> "Settings":
+        if not 0 <= self.chunk_overlap < self.chunk_size:
+            raise ValueError(
+                "CHUNK_OVERLAP must satisfy 0 <= CHUNK_OVERLAP < CHUNK_SIZE, got "
+                f"CHUNK_SIZE={self.chunk_size}, CHUNK_OVERLAP={self.chunk_overlap}; "
+                "otherwise chunk_text's sliding window never advances"
+            )
+        return self
 
 
 settings = Settings()

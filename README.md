@@ -202,7 +202,7 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `APP_NAME`            | `Nescio Semantic Memory API`                | title shown in the OpenAPI docs                      |
 | `LOG_LEVEL`           | `INFO`                                      | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL` |
 | `CHUNK_SIZE`          | `1000`                                      | characters per chunk                                 |
-| `CHUNK_OVERLAP`       | `200`                                      | overlap between chunks — must stay **below** `CHUNK_SIZE` |
+| `CHUNK_OVERLAP`       | `200`                                      | overlap between chunks — must satisfy `0 <= CHUNK_OVERLAP < CHUNK_SIZE`, otherwise the app refuses to start |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
 
 ### Embedding backends
@@ -265,8 +265,6 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
 
 - **No schema management.** The `learnings` table has to be created by hand; there are no
   migrations and no bootstrap script.
-- **Chunking config is not validated.** Setting `CHUNK_OVERLAP` at or above `CHUNK_SIZE` makes the
-  sliding-window step zero or negative, so ingestion loops forever instead of failing fast.
 - **`EMBEDDING_DIMENSION` is never checked.** It is documentation only; a mismatch with the actual
   `vector(N)` column surfaces as a database error on insert rather than at startup.
 - **Langfuse keys in `.env` are ignored.** `@observe` relies on the SDK reading `LANGFUSE_*` from

@@ -241,13 +241,17 @@ them as context so you don't build on a false assumption, and don't fix them unp
 user-facing subset is published in the README under "Current limitations", so if you *do* fix one,
 update both places.
 
-1. **`chunk_text()` can loop forever.** `step = size - overlap` and the loop advances `start` by
-   `step`, so if `CHUNK_OVERLAP >= CHUNK_SIZE` then `step <= 0`, `start` never advances, and the
-   function appends chunks until the process dies. Nothing validates that relationship. The `or`
-   fallbacks (`chunk_size or settings.chunk_size`) also treat an explicit `0` as "unset".
-   Behavioural note: the sliding window emits a trailing short chunk, and it is `ingest.py` — not
-   `chunk_text()` — that drops chunks under 50 characters, so `ingested` can be lower than
-   the number of chunks produced.
+1. **`chunk_text()`'s `or` fallbacks treat an explicit `0` as "unset".** `size = chunk_size or
+   settings.chunk_size` means `chunk_text(text, chunk_size=0)` silently uses the configured size
+   instead of erroring, and `overlap=0` — a legitimate "no overlap" request — silently falls back to
+   `settings.chunk_overlap`. Switch to `is None` checks if that ever matters; the only current
+   caller (`ingest.py`) passes neither argument.
+   The non-termination hazard is **fixed**: `chunk_text()` raises `ValueError` unless
+   `0 <= overlap < size`, and `Settings` enforces the same relationship in a `model_validator`, so a
+   bad `.env` crash-loops the pod at startup instead of 500-ing every ingest request.
+   Behavioural note: the sliding window emits a trailing short chunk (`"abcdefghij"` at size 10 /
+   overlap 3 gives `['abcdefghij', 'hij']`), and it is `ingest.py` — not `chunk_text()` — that drops
+   chunks under 50 characters, so `ingested` can be lower than the number of chunks produced.
 2. **`app/helper.py`'s advertised `tomli` fallback does not exist.** `import tomllib` is
    unconditional at module scope, and `tomllib` is stdlib only since Python **3.11** — inside the
    project's `>=3.12` floor, so it works today on every supported and CI-tested version. But the
