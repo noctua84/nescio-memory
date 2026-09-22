@@ -18,19 +18,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Actions are pinned to commit SHAs rather than tags, so a retagged or
+      # compromised release cannot redirect a workflow. Dependabot's
+      # github-actions ecosystem updates the SHA and the version comment together.
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.13"
 
-      # setup-uv handles both uv and the Python interpreter, with caching.
-      # It stopped publishing moving major tags in v8, so this is pinned to an
-      # exact version — `@v10` does not resolve and would fail the job.
+      # setup-uv handles uv itself plus dependency caching.
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.2.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           enable-cache: true
 
@@ -67,7 +68,7 @@ jobs:
 
       # 3. Spectral linting — is this a *good* spec by our conventions?
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: "24"
 

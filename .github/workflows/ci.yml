@@ -29,12 +29,13 @@ jobs:
         # Floor and current, per requires-python = ">=3.12"
         python-version: ["3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v7
+      # Actions are pinned to commit SHAs rather than tags, so a retagged or
+      # compromised release cannot redirect a workflow. Dependabot's
+      # github-actions ecosystem updates the SHA and the version comment together.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      # setup-uv stopped publishing moving major tags in v8, so this is pinned to
-      # an exact version — `@v10` does not resolve and would fail the job.
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.2.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           enable-cache: true
 

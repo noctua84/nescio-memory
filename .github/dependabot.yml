@@ -1,0 +1,45 @@
+version: 2
+
+updates:
+  # Python dependencies. The `uv` ecosystem updates pyproject.toml and uv.lock
+  # together, which is what keeps `uv sync --locked` in ci.yml green - a
+  # pyproject-only bump would fail that check.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:17"
+    commit-message:
+      # Conventional Commits, matching this repo's style. Neither `build` nor
+      # `ci` triggers a release-please version bump, so dependency updates do
+      # not cut releases on their own.
+      prefix: build
+      include: scope
+    labels:
+      - dependencies
+    open-pull-requests-limit: 10
+    groups:
+      # Batch minor and patch bumps into a single PR. Major updates stay
+      # individual so each one gets read on its own.
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Workflow actions. These are pinned to commit SHAs rather than tags, which
+  # Dependabot handles correctly: it updates the SHA and the trailing version
+  # comment together. Without this ecosystem the pins would silently rot.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:17"
+    commit-message:
+      prefix: ci
+      include: scope
+    labels:
+      - dependencies
+    # Only five actions are in use, and each is a distinct trust decision.
+    open-pull-requests-limit: 5

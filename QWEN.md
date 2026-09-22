@@ -67,8 +67,9 @@ pyproject.toml              Metadata + runtime deps + [dependency-groups] dev
 uv.lock                     Locked dependency graph — committed on purpose, never hand-edited
 .env.example                Documented configuration template
 release-please-config.json  Release automation config
-.release-please-manifest.json  Current released version ("0.1.0")
+.release-please-manifest.json  Current released version ("0.2.1")
 .github/workflows/          ci.yml, openapi.yml, release-please.yml
+.github/dependabot.yml      Weekly update PRs for the uv and github-actions ecosystems
 .gitattributes              Line-ending normalization (LF for .sh/.yml/.yaml/uv.lock)
 ```
 
@@ -195,6 +196,11 @@ Three GitHub Actions workflows:
   the release PR is authored by `github-actions`, whose `pull_request` runs GitHub holds in
   `action_required`, so `ci.yml` and `openapi.yml` would never execute on it and every release would
   merge unvalidated.
+- **`.github/dependabot.yml`** — weekly update PRs for two ecosystems: `uv`, which bumps
+  `pyproject.toml` and `uv.lock` together so `uv sync --locked` stays green, and `github-actions`.
+  Commit prefixes are `build` and `ci`, neither of which triggers a release-please bump, so
+  dependency updates never cut a release on their own. Minor and patch Python bumps are grouped
+  into one PR; majors stay individual so each gets read.
 
 **Commit style** (from `git log`): Conventional Commits with a bracketed area tag after the colon —
 
@@ -226,6 +232,12 @@ Keep messages lowercase and imperative.
   delete or weaken these rules.
 - **Secrets:** `.env` is gitignored; `.env.example` is the documented template. Never commit real
   keys.
+- **Workflow actions are pinned to commit SHAs**, not tags, with the release version in a trailing
+  comment (`actions/checkout@<40-hex>  # v7.0.1`). A moved or compromised tag then cannot redirect a
+  workflow, and the `github-actions` Dependabot ecosystem updates the SHA and that comment together,
+  so the pins do not rot. Do not shorten a pin back to a tag: `astral-sh/setup-uv` stopped
+  publishing moving major tags in v8, so `@v10` does not even resolve. The pin on
+  `release-please-action` matters most — it is the one action handed a write-scoped PAT.
 - **Code style:** type hints on public helpers and Pydantic models, `X | None` union syntax,
   parameterized SQL via `%s` placeholders (no string interpolation of user input). One concern per
   module: endpoints in `app/api/v1/`, infrastructure in `app/core/`, request/response models in
@@ -259,14 +271,13 @@ update both places.
    Behavioural note: the sliding window emits a trailing short chunk (`"abcdefghij"` at size 10 /
    overlap 3 gives `['abcdefghij', 'hij']`), and it is `ingest.py` — not `chunk_text()` — that drops
    chunks under 50 characters, so `ingested` can be lower than the number of chunks produced.
-2. **`app/helper.py`'s advertised `tomli` fallback does not exist.** `import tomllib` is
-   unconditional at module scope, and `tomllib` is stdlib only since Python **3.11** — inside the
-   project's `>=3.12` floor, so it works today on every supported and CI-tested version. But the
-   comment above the read claims "built-in tomllib (Python 3.11+) or fallback to tomli" and no such
-   fallback is implemented, so lowering `requires-python` below 3.11 would fail with
-   `ModuleNotFoundError` at import time instead of degrading. Supporting an older floor needs
-   `tomli>=2.0; python_version < "3.11"` plus a guarded import. This is the only version-sensitive
-   import in the codebase — `importlib.metadata`, also used here, has been stdlib since 3.8.
+2. **`app/helper.py` holds the only version-sensitive import.** `tomllib` is stdlib only since
+   Python **3.11** and is imported unconditionally at module scope, so lowering `requires-python`
+   below 3.11 would fail with `ModuleNotFoundError` at import time — *outside* the function's own
+   `except Exception` guard, which cannot catch it. Supporting an older floor needs
+   `tomli>=2.0; python_version < "3.11"` plus a guarded import. Inside the current `>=3.12` floor
+   this is a non-issue, and the comment there now says so accurately. (`importlib.metadata`, also
+   used in that module, has been stdlib since 3.8.)
 3. **The `local` embeddings backend has never run against the real library.**
    `sentence-transformers` now lives in the `local-embeddings` optional extra and `get_embedding()`
    branches on `settings.embedding_backend`, but that branch has only been exercised with a stubbed
