@@ -13,7 +13,10 @@ pgvector database. It exposes two operations:
 - **`POST /api/v1/search`** — embeds a query and returns the `top_k` nearest chunks by cosine
   similarity.
 
-`GET /health` sits at the root, outside the version prefix.
+`GET /health` sits at the root, outside the version prefix, and reports the active embedding
+backend and model. It is a pure liveness probe — it never contacts PostgreSQL or Ollama, so an
+unhealthy dependency cannot get a pod restarted. Do not add dependency checks to it; a readiness
+concern belongs in a separate endpoint.
 
 By default embeddings are **not** computed in-process: they are requested over HTTP from an
 [Ollama](https://ollama.com) `/api/embeddings` endpoint (default model `qwen3-embedding:0.6b`,

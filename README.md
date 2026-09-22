@@ -111,11 +111,12 @@ lives in [`openapi.json`](openapi.json) / [`openapi.yaml`](openapi.yaml).
 
 ### `GET /health`
 
-Liveness probe; reports which embedding model is configured.
+Liveness probe. Reports the active embedding backend and model, and deliberately does **not**
+contact PostgreSQL or Ollama — so an unhealthy dependency cannot make Kubernetes restart the pod.
 
 ```bash
 curl http://localhost:8000/health
-# {"status":"ok","ollama_model":"qwen3-embedding:4b"}
+# {"status":"ok","embedding_backend":"ollama","embedding_model":"qwen3-embedding:0.6b"}
 ```
 
 ### `POST /api/v1/ingest`

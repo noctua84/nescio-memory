@@ -17,7 +17,18 @@ def create_app() -> FastAPI:
 
     @app.get("/health", tags=["Ops"])
     def health():
-        return {"status": "ok", "ollama_model": settings.ollama_model}
+        # Liveness only — deliberately does not contact Ollama or the database,
+        # so an unhealthy dependency cannot get the pod restarted.
+        model = (
+            settings.ollama_model
+            if settings.embedding_backend == "ollama"
+            else settings.local_embedding_model
+        )
+        return {
+            "status": "ok",
+            "embedding_backend": settings.embedding_backend,
+            "embedding_model": model,
+        }
 
     return app
 
