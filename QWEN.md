@@ -177,10 +177,17 @@ Three GitHub Actions workflows:
   not activate it (setup-uv's `activate-environment` defaults to false), so a bare `python` or
   console script resolves to the runner's own interpreter and fails on import.
 - **`release-please.yml`** — on push to `main`. Maintains a release PR from conventional commits;
-  merging it tags the release. `bump-minor-pre-major: true` (0.x releases bump the minor), and an
-  `extra-files` entry rewrites the project's version **inside `uv.lock`** via jsonpath.
-  `.release-please-manifest.json` and `pyproject.toml` versions must stay in sync. Requires the
-  repo setting *Allow GitHub Actions to create and approve pull requests*.
+  merging it tags the release. `bump-minor-pre-major: true` (0.x releases bump the minor), and three
+  `extra-files` entries rewrite the version via jsonpath: **inside `uv.lock`** (toml), and at
+  `$.info.version` in **`openapi.json`** (json) and **`openapi.yaml`** (yaml). Keep the two spec
+  files in that list — `get_app_version()` feeds `info.version`, so a release that bumps
+  `pyproject.toml` without also rewriting the specs fails the OpenAPI drift check on the release
+  commit itself, which is exactly what happened for v0.2.0.
+  `.release-please-manifest.json` and `pyproject.toml` versions must stay in sync. It runs under a
+  fine-grained PAT (`secrets.RELEASE_PLEASE_TOKEN`) rather than `GITHUB_TOKEN` — with the bot token
+  the release PR is authored by `github-actions`, whose `pull_request` runs GitHub holds in
+  `action_required`, so `ci.yml` and `openapi.yml` would never execute on it and every release would
+  merge unvalidated.
 
 **Commit style** (from `git log`): Conventional Commits with a bracketed area tag after the colon —
 

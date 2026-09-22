@@ -5,9 +5,19 @@ name: release-please
 # updates CHANGELOG.md. Merging that release PR tags the commit and publishes a
 # GitHub Release.
 #
-# Prerequisite (one-time, repo setting): Settings → Actions → General → Workflow
-# permissions → enable "Allow GitHub Actions to create and approve pull requests",
-# otherwise release-please cannot open its release PR.
+# This uses a personal access token rather than GITHUB_TOKEN on purpose. Under
+# GITHUB_TOKEN the release PR is authored by the github-actions bot, and GitHub
+# holds that author's pull_request workflow runs in "action_required" until a
+# maintainer approves them — so ci.yml and openapi.yml never actually ran on the
+# release PR, and every release merged unvalidated. A PAT belonging to an account
+# with write access makes the PR author a trusted contributor, so those runs start
+# on their own.
+#
+# Prerequisite (one-time): repository secret RELEASE_PLEASE_TOKEN holding a
+# fine-grained PAT scoped to this repository with Contents and Pull requests both
+# set to Read and write. The "Allow GitHub Actions to create and approve pull
+# requests" setting is no longer needed, since the PAT rather than GITHUB_TOKEN
+# creates the PR.
 
 on:
   push:
@@ -23,6 +33,6 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
