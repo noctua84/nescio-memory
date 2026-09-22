@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/noctua84/nescio-memory/compare/v0.2.0...v0.2.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* [impl] stop chunk_text from looping forever on a bad window config ([ba72898](https://github.com/noctua84/nescio-memory/commit/ba72898afbfd8d037b6021a476ddae5afc907796))
+
 ## [0.2.0](https://github.com/noctua84/nescio-memory/compare/v0.1.0...v0.2.0) (2026-09-22)
 
 
