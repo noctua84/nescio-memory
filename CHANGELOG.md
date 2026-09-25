@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/noctua84/nescio-memory/compare/v0.2.1...v0.3.0) (2026-09-25)
+
+
+### Features
+
+* [impl] database setup with sqlalchemy ([b552fb6](https://github.com/noctua84/nescio-memory/commit/b552fb6d4ca37e15b3a1d7acbe77aee354cd1a4b))
+
 ## [0.2.1](https://github.com/noctua84/nescio-memory/compare/v0.2.0...v0.2.1) (2026-09-22)
 
 
