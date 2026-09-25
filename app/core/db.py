@@ -1,10 +1,18 @@
-import psycopg2
-from pgvector.psycopg2 import register_vector
+from collections.abc import Generator
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
 
 from app.config import settings
 
 
-def get_db_connection():
-    conn = psycopg2.connect(settings.database_url)
-    register_vector(conn)
-    return conn
+engine = create_engine(settings.database_url, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def get_db() -> Generator[Session, None, None]:
+    """Yields an SQLAlchemy session for database operations."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

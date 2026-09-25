@@ -1,8 +1,10 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from langfuse import observe
+from sqlalchemy.orm import Session
 
-from app.core.db import get_db_connection
+from app.core.db import get_db
 from app.core.embeddings import get_embedding
+from app.repositories import LearningRepository
 from app.schemas.search import SearchResponse, SearchRequest, SearchResult
 
 router = APIRouter()
@@ -15,33 +17,15 @@ router = APIRouter()
     description="Queries pgvector using a natural language prompt.",
 )
 @observe(name="semantic-search")
-def search_memory(request: SearchRequest):
+def search_memory(request: SearchRequest, db: Session = Depends(get_db)):
     query_embedding = get_embedding(request.query)
 
-    sql = """
-        SELECT content, metadata, 1 - (embedding <=> %s) AS similarity
-        FROM learnings
-    """
-    params: list = [query_embedding]
+    repo = LearningRepository(db)
+    rows = repo.search(query_embedding, request.top_k, request.repo_filter)
 
-    if request.repo_filter:
-        sql += " WHERE repo_name = %s"
-        params.append(request.repo_filter)
-
-    sql += " ORDER BY embedding <=> %s LIMIT %s"
-    params.extend([query_embedding, request.top_k])
-
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
+    # Map ORM objects -> DTOs. Never expose `Learning` directly.
     results = [
-        SearchResult(content=content, metadata=metadata, similarity=similarity)
-        for content, metadata, similarity in rows
+        SearchResult(content=l.content, metadata=l.metadata_, similarity=sim)
+        for l, sim in rows
     ]
-
     return SearchResponse(results=results)
