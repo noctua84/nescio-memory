@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Form
+from fastapi import APIRouter, Depends, Form, HTTPException
 from langfuse import observe
 from sqlalchemy.orm import Session
 
@@ -15,6 +15,17 @@ from app.schemas.ingest import IngestResponse
 
 router = APIRouter()
 
+MAX_CONTENT_CHARS = 500_000   # ~500 KB per file
+MIN_CONTENT_CHARS = 50
+
+
+def _validate_file_path(file_path: str) -> None:
+    """Reject absolute paths and traversal — file_path is stored/reflected."""
+    if file_path.startswith("/") or ".." in Path(file_path).parts:
+        raise HTTPException(
+            status_code=400,
+            detail="file_path must be a relative path without '..'",
+        )
 
 @router.post(
     "/ingest",
@@ -30,6 +41,7 @@ def ingest_file(
     db: Session = Depends(get_db),
     client: ApiKey = Depends(get_current_client)
 ):
+    _validate_file_path(file_path)
     repo = LearningRepository(db, client_name=client.client_name)
     repo.delete_by_file(repo_name, file_path)
 
