@@ -45,7 +45,12 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
       }
     },
     "/api/v1/ingest": {
@@ -87,7 +92,12 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
       }
     },
     "/health": {
@@ -302,6 +312,13 @@
           "type"
         ],
         "title": "ValidationError"
+      }
+    },
+    "securitySchemes": {
+      "APIKeyHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key"
       }
     }
   }

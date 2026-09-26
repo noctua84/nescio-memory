@@ -30,6 +30,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - APIKeyHeader: []
   /api/v1/ingest:
     post:
       tags:
@@ -56,6 +58,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+      security:
+        - APIKeyHeader: []
   /health:
     get:
       tags:
@@ -206,3 +210,8 @@ components:
         - msg
         - type
       title: ValidationError
+  securitySchemes:
+    APIKeyHeader:
+      type: apiKey
+      in: header
+      name: X-API-Key
