@@ -20,7 +20,7 @@ class Learning(Base):
 
     # `metadata` is reserved on DeclarativeBase, so the Python attribute must be named differently
     meta: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False)
-    embedding: Mapped[dict] = mapped_column(Vector(settings.embedding_dimension), nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dimension), nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now(), onupdate=datetime.now())
