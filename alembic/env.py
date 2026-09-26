@@ -53,13 +53,27 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _run_migrations(connection) -> None:
+    context.configure(connection=connection, target_metadata=target_metadata)
+    with context.begin_transaction():
+        context.run_migrations()
+
+
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode.
 
     In this scenario we need to create an Engine
     and associate a connection with the context.
 
+    A caller may instead pass a live Connection via Config.attributes; the test
+    harness uses this to migrate a container whose URL is only known at
+    runtime, since the module-scope sqlalchemy.url above cannot express it.
     """
+    supplied = config.attributes.get("connection", None)
+    if supplied is not None:
+        _run_migrations(supplied)
+        return
+
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
@@ -67,12 +81,7 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        context.configure(
-            connection=connection, target_metadata=target_metadata
-        )
-
-        with context.begin_transaction():
-            context.run_migrations()
+        _run_migrations(connection)
 
 
 if context.is_offline_mode():
