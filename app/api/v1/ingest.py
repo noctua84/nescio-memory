@@ -7,8 +7,10 @@ from sqlalchemy.orm import Session
 from app.core.chunking import chunk_text
 from app.core.db import get_db
 from app.core.embeddings import get_embedding
+from app.core.security import get_current_client
+from app.models import ApiKey
 from app.models.learning import Learning
-from app.repositories import LearningRepository
+from app.repositories.learning import LearningRepository
 from app.schemas.ingest import IngestResponse
 
 router = APIRouter()
@@ -26,8 +28,9 @@ def ingest_file(
     file_path: str = Form(..., description="Relative path of the file."),
     content: str = Form(..., description="Raw markdown content to vectorize."),
     db: Session = Depends(get_db),
+    client: ApiKey = Depends(get_current_client)
 ):
-    repo = LearningRepository(db)
+    repo = LearningRepository(db, client_name=client.client_name)
     repo.delete_by_file(repo_name, file_path)
 
     ingested = 0

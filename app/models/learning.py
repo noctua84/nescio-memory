@@ -15,6 +15,7 @@ class Learning(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     repo_name: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    client_name: Mapped[str] = mapped_column(Text, nullable=False, index=True)
     file_path: Mapped[str] = mapped_column(Text, nullable=False, index=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
