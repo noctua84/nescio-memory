@@ -25,6 +25,25 @@ os.environ.setdefault(
     "postgresql+psycopg2://placeholder:placeholder@localhost:1/placeholder",
 )
 
+# app/api/v1/ingest.py and app/api/v1/search.py are wrapped in Langfuse's
+# @observe(...) decorator, which reads its configuration directly from the
+# process environment (nothing in app/ or tests/ feeds it settings.langfuse_*
+# explicitly). Confirmed from the installed langfuse==4.15.4 source
+# (langfuse/_client/environment_variables.py and
+# langfuse/_client/client.py:363-366): the client computes
+# `self._tracing_enabled = tracing_enabled and
+# os.environ.get("LANGFUSE_TRACING_ENABLED", "true").lower() != "false"`,
+# and when that is False its OTel tracer is replaced with a NoOpTracer, so
+# @observe never attempts to export a span over the network.
+#
+# This is assigned unconditionally, NOT via setdefault: the whole point is to
+# guarantee tracing is off during tests no matter what the outer shell/CI
+# environment has exported (e.g. a developer with real
+# LANGFUSE_TRACING_ENABLED=true or Langfuse credentials already in their
+# environment). A setdefault here would let exactly that ambient state win
+# and defeat the fix.
+os.environ["LANGFUSE_TRACING_ENABLED"] = "false"
+
 import pytest  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
