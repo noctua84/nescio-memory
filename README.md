@@ -8,8 +8,7 @@ Designed as the long-term memory layer for agents and coding assistants: `/api/v
 project or document says, `/api/v1/search` it back when you need context.
 
 > **Status: proof of concept.** The API surface, storage schema, and chunking strategy are all
-> expected to change significantly. There are no migrations and no tests yet — see
-> [Current limitations](#current-limitations).
+> expected to change significantly — see [Current limitations](#current-limitations).
 
 ## How it works
 
@@ -45,6 +44,7 @@ values that only live in `.env` are not picked up, see
 - **Python 3.12+**
 - **[uv](https://docs.astral.sh/uv/)** — manages the virtualenv and the lockfile
 - **PostgreSQL 16+** with the `pgvector` extension
+- **Docker** — only to run the test suite, which starts a real PostgreSQL + pgvector container
 - **Ollama** running an embedding model (e.g. `qwen3-embedding`) — unless you use the optional
   in-process backend instead
 
@@ -63,29 +63,7 @@ this pulls in torch, roughly 530 MB of wheels on Linux:
 uv sync --locked --extra local-embeddings
 ```
 
-### 2. Create the database schema
-
-There are no migration files yet, so create the table manually. Replace `1024` with the dimension
-of your chosen embedding model (see the table in [Configuration](#configuration)):
-
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE learnings (
-    id         bigserial PRIMARY KEY,
-    repo_name  text        NOT NULL,
-    file_path  text        NOT NULL,
-    content    text        NOT NULL,
-    metadata   jsonb       NOT NULL DEFAULT '{}'::jsonb,
-    embedding  vector(1024) NOT NULL
-);
-
--- Optional, but strongly recommended once the table grows:
-CREATE INDEX ON learnings USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX ON learnings (repo_name, file_path);
-```
-
-### 3. Configure
+### 2. Configure
 
 ```bash
 cp .env.example .env
@@ -93,9 +71,42 @@ cp .env.example .env
 
 Then edit `.env`. The only **required** value is `DATABASE_URL` — the app fails to start without
 it. Make sure `OLLAMA_MODEL` and `EMBEDDING_DIMENSION` agree with each other *and* with the
-`vector(N)` column you created above.
+embedding model you choose.
 
-### 4. Run
+### 3. Create the database schema
+
+Alembic owns the schema. From the repository root, with `DATABASE_URL` already set (see step 2):
+
+```bash
+uv run alembic upgrade head
+```
+
+This creates the `vector` extension, the `learnings` and `api_keys` tables, and every index,
+including the HNSW index used for similarity search. Do not create tables by hand — the models and
+the migrations are checked against each other, and a hand-built schema will be missing columns the
+application requires.
+
+### 4. Create an API key
+
+Every `/api/v1` route requires an API key. Mint one per client:
+
+```bash
+uv run python scripts/create_api_key.py my-client
+```
+
+```
+client_name : my-client
+api_key     : nm_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+⚠️  Store this now — it cannot be retrieved again.
+```
+
+Only a SHA-256 hash of the key is stored, so the plaintext cannot be recovered — mint a new key if
+you lose it. Omit the argument and the client is named `default`.
+
+The `client_name` is not just a label: every ingested row is tagged with it, and each client sees
+only its own data. See [Authentication](#authentication).
+
+### 5. Run
 
 ```bash
 uv run uvicorn app.main:app --reload --port 8000
@@ -119,16 +130,57 @@ curl http://localhost:8000/health
 # {"status":"ok","embedding_backend":"ollama","embedding_model":"qwen3-embedding:0.6b"}
 ```
 
+### Authentication
+
+Every route under `/api/v1` requires an `X-API-Key` header. `GET /health` does not, so a liveness
+probe needs no credentials.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/search \
+  -H "X-API-Key: nm_your_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "...", "top_k": 3}'
+```
+
+| Condition                  | Response                                            |
+| -------------------------- | --------------------------------------------------- |
+| header absent              | `401 {"detail":"Missing API key"}`                   |
+| key unknown or revoked     | `401 {"detail":"Invalid or revoked API key"}`        |
+
+Keys are rows in `api_keys`, not configuration — there is no `API_KEY` environment variable. Only a
+SHA-256 hash and a short display prefix are stored, so a database leak yields nothing usable. A
+fast hash is deliberate: the keys are 32 bytes of `secrets.token_urlsafe` entropy, so there is no
+dictionary to stretch against and a per-request KDF would only add latency.
+
+Revoke a key by setting `revoked_at` on its row rather than deleting it, which keeps the audit
+trail:
+
+```sql
+UPDATE api_keys SET revoked_at = now() WHERE key_prefix = 'nm_xxxxxxxxxxx';
+```
+
+#### Per-client isolation
+
+The key does more than authenticate. Every row written through it is tagged with its `client_name`,
+and that tag scopes every read and delete:
+
+- Search returns only the calling client's rows.
+- Re-ingesting a file deletes only that client's previous chunks for it.
+- Two clients can hold the same `repo_name` and `file_path` without seeing or overwriting each
+  other's copy.
+
 ### `POST /api/v1/ingest`
 
 Stores a file's content. Accepts `application/x-www-form-urlencoded` (or `multipart/form-data`)
 with three fields: `repo_name`, `file_path`, `content`.
 
-Existing chunks for the same `(repo_name, file_path)` pair are deleted first, so re-ingesting an
-updated file is safe and idempotent. Chunks shorter than 50 characters are dropped.
+Existing chunks for the same `(client_name, repo_name, file_path)` triple are deleted first, so
+re-ingesting an updated file is safe and idempotent — and scoped to the calling client, so it never
+touches another client's copy of the same path. Chunks shorter than 50 characters are dropped.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/ingest \
+  -H "X-API-Key: nm_your_key_here" \
   -F "repo_name=nescio-memory" \
   -F "file_path=docs/architecture.md" \
   -F "content=Embeddings are produced by an external Ollama server..."
@@ -154,6 +206,7 @@ Returns the `top_k` most similar chunks, scored as cosine similarity (`1.0` = id
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/search \
+  -H "X-API-Key: nm_your_key_here" \
   -H "Content-Type: application/json" \
   -d '{"query": "where do embeddings come from?", "top_k": 3}'
 ```
@@ -243,10 +296,14 @@ uv sync --locked --extra local-embeddings  # only if using the in-process backen
 uv lock                               # after changing dependencies in pyproject.toml
 uv run python export_openapi.py       # regenerate openapi.json + openapi.yaml
 uv run uvicorn app.main:app --reload  # dev server (from the repository root)
+uv run pytest                          # integration suite (needs Docker)
+uv run alembic upgrade head            # apply migrations
 ```
 
-Three things are enforced by CI:
+Four things are enforced by CI:
 
+- **The test suite must pass.** `uv run pytest` runs 30 integration tests against a real PostgreSQL
+  + pgvector container on every push and pull request.
 - **`uv.lock` must stay in sync with `pyproject.toml`.** If you add or change a dependency, run
   `uv lock` and commit both files.
 - **The committed OpenAPI spec must match the code.** If you touch a route, a `Form(...)` field, or
@@ -263,8 +320,6 @@ version and publishes a GitHub Release — do not edit versions by hand.
 
 This is a PoC. Known rough edges, roughly in order of how much they matter:
 
-- **No schema management.** The `learnings` table has to be created by hand; there are no
-  migrations and no bootstrap script.
 - **`EMBEDDING_DIMENSION` is never checked.** It is documentation only; a mismatch with the actual
   `vector(N)` column surfaces as a database error on insert rather than at startup.
 - **Langfuse keys in `.env` are ignored.** `@observe` relies on the SDK reading `LANGFUSE_*` from
@@ -274,8 +329,9 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
   meaningful HTTP error, and connections are not pooled — one is opened per request.
 - **Ingestion is serial and chatty.** One blocking Ollama call per chunk, with no batching and no
   retry/backoff.
-- **No authentication.** The API is meant to run on a trusted network or behind a proxy.
-- **No tests.** `ci.yml` currently only verifies dependency installation and imports.
+- **No index on `(client_name, repo_name, file_path)` as a unit.** Each column is indexed
+  separately, so the delete-on-re-ingest path relies on PostgreSQL combining them rather than a
+  single composite index.
 
 Contributions addressing any of the above are welcome.
 
