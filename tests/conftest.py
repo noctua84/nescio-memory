@@ -32,6 +32,14 @@ from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 from testcontainers.community.postgres import PostgresContainer  # noqa: E402
 
+from fastapi.testclient import TestClient  # noqa: E402
+
+from app.api.v1 import ingest as ingest_module  # noqa: E402
+from app.api.v1 import search as search_module  # noqa: E402
+from app.core.db import get_db  # noqa: E402
+from app.main import app  # noqa: E402
+from tests.fakes import fake_embedding  # noqa: E402
+
 # testcontainers.postgres is a deprecation shim as of 4.15.0; the import above
 # is the live path.
 
@@ -100,3 +108,27 @@ def db_session(connection):
     session = Session(bind=connection, join_transaction_mode="create_savepoint")
     yield session
     session.close()
+
+
+@pytest.fixture
+def client(db_session, monkeypatch):
+    """A TestClient wired to the test transaction, with embeddings faked.
+
+    The patch targets matter. ingest.py and search.py each did
+    `from app.core.embeddings import get_embedding`, which binds the name into
+    their own module namespace -- patching app.core.embeddings.get_embedding
+    would have no effect on what the endpoints actually call, and the tests
+    would quietly make real HTTP requests and hang.
+    """
+    monkeypatch.setattr(ingest_module, "get_embedding", fake_embedding)
+    monkeypatch.setattr(search_module, "get_embedding", fake_embedding)
+
+    # get_current_client resolves through Depends(get_db) too, so overriding
+    # get_db means a factory-created ApiKey row is immediately visible to
+    # authentication -- no separate seeding path, nothing committed to clean up.
+    app.dependency_overrides[get_db] = lambda: db_session
+    yield TestClient(app)
+    # Clearing matters: a leftover override leaks this test's closed session
+    # into the next one, which then fails somewhere that points at the wrong
+    # test.
+    app.dependency_overrides.clear()
