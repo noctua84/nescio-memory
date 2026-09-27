@@ -27,7 +27,7 @@ def search_memory(request: SearchRequest, db: Session = Depends(get_db), client:
 
     # Map ORM objects -> DTOs. Never expose `Learning` directly.
     results = [
-        SearchResult(content=l.content, metadata=l.metadata_, similarity=sim)
+        SearchResult(content=l.content, metadata=l.meta, similarity=sim)
         for l, sim in rows
     ]
     return SearchResponse(results=results)
