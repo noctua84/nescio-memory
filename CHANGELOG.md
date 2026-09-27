@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.3.0](https://github.com/noctua84/nescio-memory/compare/v0.2.1...v0.3.0) (2026-09-27)
+
+
+### Features
+
+* [impl] authenticate requests with hashed API keys ([93eb5db](https://github.com/noctua84/nescio-memory/commit/93eb5db4f3d69d7222b7979425fee1e55b718636))
+* [impl] database setup with sqlalchemy ([b552fb6](https://github.com/noctua84/nescio-memory/commit/b552fb6d4ca37e15b3a1d7acbe77aee354cd1a4b))
+* [impl] scope learnings to the authenticated client ([4694970](https://github.com/noctua84/nescio-memory/commit/4694970e437c501a46ebb42418183a3bf07c355a))
+* [impl] switch the embedding column to 384 dimensions ([f0bcb10](https://github.com/noctua84/nescio-memory/commit/f0bcb10ca16573351335c5e379099c1d2631a37f))
+
+
+### Bug Fixes
+
+* [fix] reject absolute and traversing file_path values on ingest ([69ac42e](https://github.com/noctua84/nescio-memory/commit/69ac42efafbc9a3637dcde395023fde3d5be9e32))
+* [fix] type the embedding column as list[float], not dict ([752b4d8](https://github.com/noctua84/nescio-memory/commit/752b4d8eefc0f6fa4958ba3e7584456bc7577c57))
+
+
+### Documentation
+
+* [docs] add the design spec for the test harness ([0d8703f](https://github.com/noctua84/nescio-memory/commit/0d8703fbbfdf9e208063073d152a12b711ddee40))
+* [docs] add the test infrastructure implementation plan ([64c2d5d](https://github.com/noctua84/nescio-memory/commit/64c2d5db2eed08b1462c7854867938c5862051f6))
+
 ## [0.2.1](https://github.com/noctua84/nescio-memory/compare/v0.2.0...v0.2.1) (2026-09-22)
 
 
