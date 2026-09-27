@@ -19,7 +19,11 @@ from pathlib import Path
 # the module-level engine in app/core/db.py is constructed but never used once
 # get_db is overridden -- but if something ever does use it, we want an
 # immediate connection failure rather than a silent write to a real database.
-# setdefault so a developer's own DATABASE_URL is left alone.
+# setdefault, but note the placeholder wins locally too: a developer's
+# DATABASE_URL normally lives in .env, and pydantic-settings gives os.environ
+# priority over .env. That is the better outcome -- local and CI runs behave
+# identically and the suite never touches a real database -- but it is not
+# "leaving the developer's value alone".
 os.environ.setdefault(
     "DATABASE_URL",
     "postgresql+psycopg2://placeholder:placeholder@localhost:1/placeholder",
@@ -116,9 +120,17 @@ def connection(engine):
 def db_session(connection):
     """A Session joined to the outer transaction.
 
-    join_transaction_mode="create_savepoint" is the load-bearing argument: the
-    application calls session.commit() itself, and this mode turns that into a
-    savepoint release so the outer transaction survives to be rolled back.
+    join_transaction_mode="create_savepoint" is explicit for clarity rather than
+    for effect: SQLAlchemy 2.0's default, "conditional_savepoint", resolves to
+    exactly this when the bound connection already has a transaction open and
+    the dialect supports SAVEPOINT, which is this fixture's situation. Removing
+    the argument does not change behaviour here, and no test pins it -- do not
+    read its presence as evidence that a regression in it would be caught.
+
+    What the suite does guard is the genuinely wrong setting: with
+    join_transaction_mode="control_fully", 17 tests fail, including
+    test_an_application_level_commit_does_not_escape_the_transaction, because
+    the application's own commit() then ends the outer transaction.
 
     Do not add a SessionEvents.after_transaction_end listener to restart the
     savepoint. That is the SQLAlchemy 1.x form of this recipe; the 2.0 docs

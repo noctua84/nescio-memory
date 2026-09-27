@@ -10,10 +10,6 @@ from app.api.v1 import search as search_module
 from tests.factories import make_api_key, make_learning
 from tests.fakes import unit_vector
 
-# pytest, search_module and unit_vector are unused until Task 8 appends the
-# ranking tests to this file. They are declared here so that task does not have
-# to reopen the import block. Do not remove them as "unused".
-
 
 def test_search_returns_a_stored_chunk(client, db_session):
     key = make_api_key(db_session, "acme")
