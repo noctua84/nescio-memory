@@ -296,8 +296,8 @@ uv sync --locked --extra local-embeddings  # only if using the in-process backen
 uv lock                               # after changing dependencies in pyproject.toml
 uv run python export_openapi.py       # regenerate openapi.json + openapi.yaml
 uv run uvicorn app.main:app --reload  # dev server (from the repository root)
-uv run pytest                          # integration suite (needs Docker)
-uv run alembic upgrade head            # apply migrations
+uv run pytest                         # integration suite (needs Docker)
+uv run alembic upgrade head           # apply migrations
 ```
 
 Four things are enforced by CI:
@@ -326,7 +326,7 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
   the process environment, and pydantic-settings does not export `.env` values into it. Export the
   keys in your shell or service manager, or tracing silently stays off.
 - **No error handling.** A database or Ollama failure surfaces as an unhandled `500` rather than a
-  meaningful HTTP error, and connections are not pooled — one is opened per request.
+  meaningful HTTP error.
 - **Ingestion is serial and chatty.** One blocking Ollama call per chunk, with no batching and no
   retry/backoff.
 - **No index on `(client_name, repo_name, file_path)` as a unit.** Each column is indexed
