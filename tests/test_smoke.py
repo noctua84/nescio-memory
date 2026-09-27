@@ -2,7 +2,9 @@
 
 If these fail, nothing else in the suite can be trusted.
 """
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
+
+from app.models.learning import Learning
 
 
 def test_migrations_created_every_table(engine):
@@ -41,3 +43,52 @@ def test_the_hnsw_index_exists(engine):
             text("SELECT indexname FROM pg_indexes WHERE tablename = 'learnings'")
         ).scalars().all()
     assert "learnings_embedding_idx" in indexes
+
+
+def _probe_row(client_name: str) -> Learning:
+    return Learning(
+        client_name=client_name,
+        repo_name="repo_a",
+        file_path="probe.md",
+        content="written by an isolation probe",
+        meta={"chunk_index": 0},
+        embedding=[0.0] * 384,
+    )
+
+
+def test_a_row_written_in_a_test_is_visible_within_that_test(db_session):
+    db_session.add(_probe_row("visibility_probe"))
+    db_session.flush()
+    found = db_session.scalars(
+        select(Learning).where(Learning.client_name == "visibility_probe")
+    ).all()
+    assert len(found) == 1
+
+
+def test_an_application_level_commit_does_not_escape_the_transaction(
+    db_session, engine
+):
+    """The ingest endpoint calls db.commit() itself.
+
+    Under join_transaction_mode="create_savepoint" that releases a savepoint
+    instead of committing the outer transaction. Proven here by reading through
+    a second, independent connection while the test transaction is still open:
+    the row must be visible to this test own session and invisible to everyone
+    else.
+
+    Deliberately self-contained rather than split across two ordered tests. It
+    cannot pass vacuously: the first assertion fails if the row was never
+    written, so the second is only ever reached with a real row in play.
+    """
+    db_session.add(_probe_row("commit_probe"))
+    db_session.commit()
+
+    assert db_session.scalars(
+        select(Learning).where(Learning.client_name == "commit_probe")
+    ).all(), "the row is not visible to the session that wrote it"
+
+    with engine.connect() as observer:
+        escaped = observer.execute(
+            select(Learning.id).where(Learning.client_name == "commit_probe")
+        ).all()
+    assert escaped == [], "a committed row escaped the test transaction"

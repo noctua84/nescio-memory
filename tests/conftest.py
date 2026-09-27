@@ -29,6 +29,7 @@ import pytest  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
 from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
 from testcontainers.community.postgres import PostgresContainer  # noqa: E402
 
 # testcontainers.postgres is a deprecation shim as of 4.15.0; the import above
@@ -68,3 +69,34 @@ def engine(pg_container):
     # Dispose before the container stops, so no pooled connection outlives the
     # database it points at.
     test_engine.dispose()
+
+
+@pytest.fixture
+def connection(engine):
+    """A connection with a real outer transaction that is always rolled back.
+
+    This is what keeps tests from leaking into each other without paying to
+    recreate the database per test.
+    """
+    conn = engine.connect()
+    transaction = conn.begin()
+    yield conn
+    transaction.rollback()
+    conn.close()
+
+
+@pytest.fixture
+def db_session(connection):
+    """A Session joined to the outer transaction.
+
+    join_transaction_mode="create_savepoint" is the load-bearing argument: the
+    application calls session.commit() itself, and this mode turns that into a
+    savepoint release so the outer transaction survives to be rolled back.
+
+    Do not add a SessionEvents.after_transaction_end listener to restart the
+    savepoint. That is the SQLAlchemy 1.x form of this recipe; the 2.0 docs
+    state it is no longer required.
+    """
+    session = Session(bind=connection, join_transaction_mode="create_savepoint")
+    yield session
+    session.close()
