@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Text, DateTime
+from sqlalchemy import Text, DateTime, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,5 +23,12 @@ class Learning(Base):
     meta: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dimension), nullable=False)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now(), onupdate=datetime.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )

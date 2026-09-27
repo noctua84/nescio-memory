@@ -20,7 +20,7 @@ Every task's requirements implicitly include this section.
 - Import `PostgresContainer` from **`testcontainers.community.postgres`**, never `testcontainers.postgres` (a deprecation shim as of 4.15.0). Never use the separate `testcontainers-postgres` distribution.
 - Container image: `pgvector/pgvector:pg17`, referenced through one module-level constant.
 - Every dependency change is followed by `uv lock`, because `ci.yml` fails the build on a stale lockfile.
-- Never add `ruff`, `mypy`, or any other checker. Never modify `app/models/learning.py`'s `created_at`/`updated_at` defaults. Never wire up `MAX_CONTENT_CHARS`/`MIN_CONTENT_CHARS`. These are explicit non-goals.
+- Never add `ruff`, `mypy`, or any other checker. Never wire up `MAX_CONTENT_CHARS`/`MIN_CONTENT_CHARS`. These remain explicit non-goals. The `created_at`/`updated_at` columns were promoted into scope on 2026-09-27 as **Task 2.5** and are out of scope for every other task.
 - No mocking of the database, the session, or the repository. The boundary under test is enforced by SQL; a mock would only assert we called our own methods.
 - Commit prefixes follow this repo's convention: `[chore]` for tooling, `[test]` for tests, `[fix]` for bug fixes, `[impl]` for production code.
 - `tests/` must never be added to by a task whose deliverable is production code, and production files must never be edited by a task whose deliverable is tests. Task 5 is the single exception and is scoped to one word.
@@ -350,6 +350,126 @@ git commit -m "test: [test] run the suite against a migrated pgvector container"
 
 ---
 
+### Task 2.5: Give `learnings` its timestamp columns
+
+Added during execution on 2026-09-27, after Task 3 returned BLOCKED. Supersedes
+the plan's original exclusion of the timestamp defaults.
+
+**Why this task exists:** `app/models/learning.py` declares `created_at` and
+`updated_at` as `nullable=False`, so SQLAlchemy emits both in every INSERT. No
+migration creates them — `0001` builds `learnings` without them and nothing since
+adds them. Every insert therefore fails with
+`psycopg2.errors.UndefinedColumn: column "created_at" of relation "learnings" does
+not exist`, confirmed empirically against the migrated container. The write path
+has never worked. This blocks Tasks 3 through 8, all of which insert rows.
+
+The same change fixes two further defects in the declaration, because leaving them
+would ship columns that exist but hold wrong values:
+
+- `default=datetime.now()` is evaluated once when the module is imported, so every
+  row written by a given process would receive an identical, wrong timestamp. A
+  `server_default` makes the database generate it per row.
+- The columns were naive `DateTime` while `api_keys` already uses
+  `DateTime(timezone=True)`. They should agree.
+
+**Files:**
+- Create: `alembic/versions/<generated>_add_timestamps_to_learnings.py`
+- Modify: `app/models/learning.py`
+
+**Interfaces:**
+- Consumes: the migration chain at head `474ac4ba2147`.
+- Produces: a `learnings` table that accepts inserts, unblocking every later task.
+
+- [ ] **Step 1: Generate the migration stub**
+
+Let Alembic assign the revision id and wire `down_revision` to the current head:
+
+```bash
+uv run alembic revision -m "add timestamps to learnings"
+```
+
+- [ ] **Step 2: Fill in the migration**
+
+```python
+def upgrade() -> None:
+    # server_default lets existing rows receive a value and NOT NULL be enforced
+    # in a single step, and puts timestamp generation in the database rather than
+    # in a Python expression evaluated once at import time.
+    op.add_column(
+        "learnings",
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+    )
+    op.add_column(
+        "learnings",
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+    )
+
+
+def downgrade() -> None:
+    op.drop_column("learnings", "updated_at")
+    op.drop_column("learnings", "created_at")
+```
+
+- [ ] **Step 3: Make the model agree with the schema**
+
+In `app/models/learning.py`, add `func` to the existing `sqlalchemy` import and
+replace the two timestamp columns:
+
+```python
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+```
+
+Change nothing else in the file.
+
+- [ ] **Step 4: Verify the write path now works**
+
+```bash
+uv run pytest -v
+```
+
+Expected: 6 passed — the four smoke tests from Task 2, plus the two isolation
+tests already present in the working tree from the blocked Task 3 attempt, which
+were failing on exactly this bug.
+
+- [ ] **Step 5: Verify the CLI migration path**
+
+```bash
+uv run alembic current
+```
+
+Expected: prints the new revision as head, confirming the migration applies
+outside the test harness too.
+
+- [ ] **Step 6: Commit the production change only**
+
+The working tree also holds uncommitted test work from the blocked Task 3 attempt.
+Do not commit it — Task 3 owns those files.
+
+```bash
+git add app/models/learning.py alembic/versions/*_add_timestamps_to_learnings.py
+git commit -m "fix: [fix] create the learnings timestamp columns the model requires"
+```
+
+---
+
 ### Task 3: Per-test transaction isolation
 
 **Files:**
@@ -376,61 +496,53 @@ from app.models.learning import Learning
 Do not append imports at the bottom of the file. Then append the tests:
 
 ```python
-def test_a_row_written_in_one_test_is_visible_within_that_test(db_session):
-    db_session.add(
-        Learning(
-            client_name="isolation_probe",
-            repo_name="repo_a",
-            file_path="probe.md",
-            content="written by the first isolation test",
-            meta={"chunk_index": 0},
-            embedding=[0.0] * 384,
-        )
+def _probe_row(client_name: str) -> Learning:
+    return Learning(
+        client_name=client_name,
+        repo_name="repo_a",
+        file_path="probe.md",
+        content="written by an isolation probe",
+        meta={"chunk_index": 0},
+        embedding=[0.0] * 384,
     )
+
+
+def test_a_row_written_in_a_test_is_visible_within_that_test(db_session):
+    db_session.add(_probe_row("visibility_probe"))
     db_session.flush()
     found = db_session.scalars(
-        select(Learning).where(Learning.client_name == "isolation_probe")
+        select(Learning).where(Learning.client_name == "visibility_probe")
     ).all()
     assert len(found) == 1
 
 
-def test_that_row_is_gone_in_the_next_test(db_session):
-    # Depends on the test above having run first, which pytest guarantees for
-    # tests in file order. If this ever fails, teardown stopped rolling back
-    # and every downstream test is suspect.
-    found = db_session.scalars(
-        select(Learning).where(Learning.client_name == "isolation_probe")
-    ).all()
-    assert found == []
+def test_an_application_level_commit_does_not_escape_the_transaction(
+    db_session, engine
+):
+    """The ingest endpoint calls db.commit() itself.
 
+    Under join_transaction_mode="create_savepoint" that releases a savepoint
+    instead of committing the outer transaction. Proven here by reading through
+    a second, independent connection while the test transaction is still open:
+    the row must be visible to this test own session and invisible to everyone
+    else.
 
-def test_an_application_level_commit_is_still_rolled_back(db_session):
-    # The ingest endpoint calls db.commit() itself. Under
-    # join_transaction_mode="create_savepoint" that releases a savepoint rather
-    # than committing the outer transaction, so this row must not survive.
-    db_session.add(
-        Learning(
-            client_name="commit_probe",
-            repo_name="repo_a",
-            file_path="probe.md",
-            content="committed inside a test, must not survive it",
-            meta={"chunk_index": 0},
-            embedding=[0.0] * 384,
-        )
-    )
+    Deliberately self-contained rather than split across two ordered tests. It
+    cannot pass vacuously: the first assertion fails if the row was never
+    written, so the second is only ever reached with a real row in play.
+    """
+    db_session.add(_probe_row("commit_probe"))
     db_session.commit()
+
     assert db_session.scalars(
         select(Learning).where(Learning.client_name == "commit_probe")
-    ).all()
+    ).all(), "the row is not visible to the session that wrote it"
 
-
-def test_the_committed_row_did_not_survive(engine):
-    # Checked through a separate connection, outside the test transaction.
-    with engine.connect() as connection:
-        rows = connection.execute(
+    with engine.connect() as observer:
+        escaped = observer.execute(
             select(Learning.id).where(Learning.client_name == "commit_probe")
         ).all()
-    assert rows == []
+    assert escaped == [], "a committed row escaped the test transaction"
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -441,7 +553,7 @@ Run:
 uv run pytest tests/test_smoke.py -v
 ```
 
-Expected: the four new tests FAIL with `fixture 'db_session' not found`. The four from Task 2 still pass.
+Expected: both new tests FAIL with `fixture 'db_session' not found`. The four from Task 2 still pass.
 
 - [ ] **Step 3: Add the isolation fixtures**
 
@@ -489,7 +601,7 @@ Run:
 uv run pytest tests/test_smoke.py -v
 ```
 
-Expected: 8 passed.
+Expected: 6 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1043,6 +1155,32 @@ def test_the_same_path_coexists_under_two_clients(client, db_session):
     assert sorted(set(owners)) == ["acme", "globex"]
 
 
+def test_the_client_filter_is_what_excludes_the_row(client, db_session):
+    """Two requests differing only in the key presented; one sees the row.
+
+    This is the teeth of the isolation suite. Because the requests are
+    otherwise identical, a passing pair cannot be explained by anything except
+    the client_name filter, so no mutation of production code is needed to show
+    that the filter is load-bearing.
+    """
+    make_learning(db_session, "acme", content="the contested row")
+    acme_key = make_api_key(db_session, "acme")
+    globex_key = make_api_key(db_session, "globex")
+    payload = {"query": "the contested row", "top_k": 50}
+
+    owner_view = client.post(
+        "/api/v1/search", json=payload, headers={"X-API-Key": acme_key}
+    )
+    other_view = client.post(
+        "/api/v1/search", json=payload, headers={"X-API-Key": globex_key}
+    )
+
+    assert [r["content"] for r in owner_view.json()["results"]] == [
+        "the contested row"
+    ]
+    assert other_view.json()["results"] == []
+
+
 def test_ingest_stamps_the_authenticated_clients_name(client, db_session):
     # LearningRepository.add stamps client_name; the endpoint never passes it.
     key = make_api_key(db_session, "acme")
@@ -1074,8 +1212,16 @@ uv run pytest tests/test_isolation.py -v
 Expected: all pass on the first run, because the production code is already
 correct — Task 5's fix was the last thing in the way.
 
-A test that has never failed has not been shown to test anything. To prove
-these are not passing vacuously, temporarily delete the `Learning.client_name == self.client_name` line from `search()` in `app/repositories/learning.py`, re-run, and check that `test_search_does_not_return_another_clients_learnings` and `test_a_client_sees_only_its_own_rows_when_both_exist` both FAIL. Then restore the line and confirm they pass again. Do not commit the temporary deletion.
+A test that has never failed has not been shown to test anything, so the suite
+carries its own proof: `test_the_client_filter_is_what_excludes_the_row` issues
+two requests differing **only** in which key is presented, and asserts one sees
+the row while the other does not. Two otherwise-identical requests diverging
+can only be explained by the `client_name` filter doing work.
+
+Confirm that test is present and passing. Do **not** edit
+`app/repositories/learning.py` to demonstrate the point: this is a test task,
+production code is out of scope per the Global Constraints, and a mutation left
+unrestored would ship a cross-tenant data leak.
 
 - [ ] **Step 3: Verify the whole suite still passes**
 
@@ -1085,7 +1231,8 @@ Run:
 uv run pytest -v
 ```
 
-Expected: everything passes, and `git diff app/` is empty — the mutation from Step 2 must be fully restored.
+Expected: everything passes, and `git diff app/` is empty — this task must not
+have touched production code at all.
 
 - [ ] **Step 4: Commit**
 

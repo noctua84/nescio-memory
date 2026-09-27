@@ -36,8 +36,13 @@ only that we called the methods we wrote, not that the database honours them.
 These are deliberately excluded and belong in separate changes:
 
 - `ruff` / `mypy` configuration.
-- The `Learning.created_at` / `updated_at` `default=datetime.now()` bug (evaluated
-  once at import, so every row receives the process start time).
+- ~~The `Learning.created_at` / `updated_at` `default=datetime.now()` bug.~~
+  **Superseded during execution — see Task 2.5 in the implementation plan.**
+  Execution found a larger problem behind it: no migration had ever created
+  those columns, so every INSERT into `learnings` failed with `UndefinedColumn`
+  and the write path had never worked against a migrated database. Fixing it was
+  mandatory rather than optional, and was authorised. The columns now use a
+  server-side default and are timezone-aware, consistent with `api_keys`.
 - README documentation of the new authentication flow.
 - Wiring up the unused `MAX_CONTENT_CHARS` / `MIN_CONTENT_CHARS` constants.
 

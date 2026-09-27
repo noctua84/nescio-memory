@@ -55,7 +55,29 @@ jobs:
       - name: Verify the local-embeddings extra resolves
         run: uv sync --locked --extra local-embeddings --dry-run --python ${{ matrix.python-version }}
 
-      # TODO: add a test step once tests exist, e.g.
-      #   run: uv run --locked pytest
-      # Left out deliberately: pytest exits 5 ("no tests collected") on an empty
-      # suite, which would fail CI on every run until the first test lands.
+  tests:
+    name: tests (py3.12)
+    runs-on: ubuntu-latest
+    # Tests run against a real PostgreSQL + pgvector container that
+    # testcontainers starts and stops itself, so there is no `services:` block
+    # and no Docker setup step -- the Docker daemon is pre-installed on hosted
+    # Ubuntu runners. This job must stay on ubuntu-latest: macOS and Windows
+    # hosted runners cannot run Linux containers.
+    #
+    # Single Python version by design. The floor is where version-specific
+    # breakage shows up, and the deps job above already proves 3.12, 3.13 and
+    # 3.14 all resolve and import. Three legs here would mean three container
+    # pulls per push for no additional signal.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies (fails if uv.lock is stale)
+        run: uv sync --locked --python 3.12
+
+      - name: Run tests
+        run: uv run --locked --python 3.12 pytest
