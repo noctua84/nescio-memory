@@ -20,7 +20,7 @@ Every task's requirements implicitly include this section.
 - Import `PostgresContainer` from **`testcontainers.community.postgres`**, never `testcontainers.postgres` (a deprecation shim as of 4.15.0). Never use the separate `testcontainers-postgres` distribution.
 - Container image: `pgvector/pgvector:pg17`, referenced through one module-level constant.
 - Every dependency change is followed by `uv lock`, because `ci.yml` fails the build on a stale lockfile.
-- Never add `ruff`, `mypy`, or any other checker. Never modify `app/models/learning.py`'s `created_at`/`updated_at` defaults. Never wire up `MAX_CONTENT_CHARS`/`MIN_CONTENT_CHARS`. These are explicit non-goals.
+- Never add `ruff`, `mypy`, or any other checker. Never wire up `MAX_CONTENT_CHARS`/`MIN_CONTENT_CHARS`. These remain explicit non-goals. The `created_at`/`updated_at` columns were promoted into scope on 2026-09-27 as **Task 2.5** and are out of scope for every other task.
 - No mocking of the database, the session, or the repository. The boundary under test is enforced by SQL; a mock would only assert we called our own methods.
 - Commit prefixes follow this repo's convention: `[chore]` for tooling, `[test]` for tests, `[fix]` for bug fixes, `[impl]` for production code.
 - `tests/` must never be added to by a task whose deliverable is production code, and production files must never be edited by a task whose deliverable is tests. Task 5 is the single exception and is scoped to one word.
@@ -346,6 +346,126 @@ Expected: prints `474ac4ba2147 (head)` without error. This exercises the unchang
 ```bash
 git add alembic/env.py tests/conftest.py tests/test_smoke.py
 git commit -m "test: [test] run the suite against a migrated pgvector container"
+```
+
+---
+
+### Task 2.5: Give `learnings` its timestamp columns
+
+Added during execution on 2026-09-27, after Task 3 returned BLOCKED. Supersedes
+the plan's original exclusion of the timestamp defaults.
+
+**Why this task exists:** `app/models/learning.py` declares `created_at` and
+`updated_at` as `nullable=False`, so SQLAlchemy emits both in every INSERT. No
+migration creates them — `0001` builds `learnings` without them and nothing since
+adds them. Every insert therefore fails with
+`psycopg2.errors.UndefinedColumn: column "created_at" of relation "learnings" does
+not exist`, confirmed empirically against the migrated container. The write path
+has never worked. This blocks Tasks 3 through 8, all of which insert rows.
+
+The same change fixes two further defects in the declaration, because leaving them
+would ship columns that exist but hold wrong values:
+
+- `default=datetime.now()` is evaluated once when the module is imported, so every
+  row written by a given process would receive an identical, wrong timestamp. A
+  `server_default` makes the database generate it per row.
+- The columns were naive `DateTime` while `api_keys` already uses
+  `DateTime(timezone=True)`. They should agree.
+
+**Files:**
+- Create: `alembic/versions/<generated>_add_timestamps_to_learnings.py`
+- Modify: `app/models/learning.py`
+
+**Interfaces:**
+- Consumes: the migration chain at head `474ac4ba2147`.
+- Produces: a `learnings` table that accepts inserts, unblocking every later task.
+
+- [ ] **Step 1: Generate the migration stub**
+
+Let Alembic assign the revision id and wire `down_revision` to the current head:
+
+```bash
+uv run alembic revision -m "add timestamps to learnings"
+```
+
+- [ ] **Step 2: Fill in the migration**
+
+```python
+def upgrade() -> None:
+    # server_default lets existing rows receive a value and NOT NULL be enforced
+    # in a single step, and puts timestamp generation in the database rather than
+    # in a Python expression evaluated once at import time.
+    op.add_column(
+        "learnings",
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+    )
+    op.add_column(
+        "learnings",
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+    )
+
+
+def downgrade() -> None:
+    op.drop_column("learnings", "updated_at")
+    op.drop_column("learnings", "created_at")
+```
+
+- [ ] **Step 3: Make the model agree with the schema**
+
+In `app/models/learning.py`, add `func` to the existing `sqlalchemy` import and
+replace the two timestamp columns:
+
+```python
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+```
+
+Change nothing else in the file.
+
+- [ ] **Step 4: Verify the write path now works**
+
+```bash
+uv run pytest -v
+```
+
+Expected: 6 passed — the four smoke tests from Task 2, plus the two isolation
+tests already present in the working tree from the blocked Task 3 attempt, which
+were failing on exactly this bug.
+
+- [ ] **Step 5: Verify the CLI migration path**
+
+```bash
+uv run alembic current
+```
+
+Expected: prints the new revision as head, confirming the migration applies
+outside the test harness too.
+
+- [ ] **Step 6: Commit the production change only**
+
+The working tree also holds uncommitted test work from the blocked Task 3 attempt.
+Do not commit it — Task 3 owns those files.
+
+```bash
+git add app/models/learning.py alembic/versions/*_add_timestamps_to_learnings.py
+git commit -m "fix: [fix] create the learnings timestamp columns the model requires"
 ```
 
 ---
