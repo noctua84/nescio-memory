@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.1](https://github.com/noctua84/nescio-memory/compare/v0.3.0...v0.3.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* [fix] create the learnings.file_path index the model declares ([4c8968d](https://github.com/noctua84/nescio-memory/commit/4c8968ddd0655f9fdf6648cd25e1a0f47bab6c00))
+
+
+### Documentation
+
+* document the API key auth flow and bring the README back in line with the code ([#8](https://github.com/noctua84/nescio-memory/issues/8)) ([d36522a](https://github.com/noctua84/nescio-memory/commit/d36522a3eaabd3460c62846e3500bb4bc2a753d4))
+
 ## [0.3.0](https://github.com/noctua84/nescio-memory/compare/v0.2.1...v0.3.0) (2026-09-27)
 
 
