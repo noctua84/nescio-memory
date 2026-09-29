@@ -147,8 +147,8 @@ a failed request at roughly 30s rather than 30s multiplied by chunk count.
 
 ## Items 2-7
 
-Specified only to the depth each needs. Item 2 carries one unresolved tension,
-called out below, that its implementation must settle; the rest are mechanical.
+Specified only to the depth each needs. Item 2 carries one design decision,
+recorded below; the rest are mechanical.
 
 ### Item 2 — Validate `EMBEDDING_DIMENSION` at startup
 
@@ -160,14 +160,36 @@ Validate at startup that the configured dimension matches the `learnings.embeddi
 column, and fail to start if it does not. Startup is when an operator is
 watching, so this converts a silent runtime failure into a loud deployment one.
 
-**Unresolved tension this item must settle.** Reading the column means querying
-the database during startup, which couples boot to database availability. Today
-the application starts fine without a database, because `create_engine()` does
-not connect — and `/health` deliberately avoids contacting dependencies so that
-an unhealthy one cannot cause a restart loop. Failing to boot on an unreachable
-database contradicts that stance. The item must choose between validating
-against the live column and accepting the coupling, or validating only what can
-be checked without I/O, and record which and why.
+**Decision: validate against the live column, accepting the coupling.**
+
+Reading the column means querying the database during startup, so the
+application will no longer start when the database is unreachable. Today it
+starts fine without one, because `create_engine()` does not connect. This is a
+deliberate departure, taken with the following consequences understood.
+
+Why it is worth the coupling: the failure being prevented is not loud. A
+dimension mismatch is rejected by pgvector at insert time, so today the service
+starts cleanly, passes its liveness probe, serves `/health` happily, and then
+fails at the first ingest — potentially long after the deploy that caused it.
+Checking at startup moves that from a first-request failure to a deployment
+failure, which is where a configuration error belongs.
+
+An unreachable database, by contrast, is already loud and self-correcting: the
+process exits, the orchestrator restarts it, and it comes up when the database
+does. That is an ordinary crash-restart loop rather than a silent fault.
+
+Consequences this item must handle explicitly:
+
+- **Database unreachable at boot** — the process must fail with a message naming
+  the database as the cause, not an opaque traceback.
+- **`learnings` table absent** — a database that exists but has never been
+  migrated cannot be validated. This must fail with a message telling the
+  operator to run `alembic upgrade head`, since that is the actual remedy.
+- **`/health` is unaffected.** It keeps its liveness-only contract and still
+  contacts nothing. The coupling is at startup only; a database that goes away
+  *after* boot must not turn a liveness probe into a restart.
+- The check is read-only and runs once. It must not hold a connection open
+  beyond the check itself.
 
 ### Item 3 — Enforce `MAX_CONTENT_CHARS`
 
