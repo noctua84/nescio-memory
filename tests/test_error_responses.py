@@ -4,7 +4,9 @@ These go through the real routes, so they verify the wiring in create_app() as
 well as the mapping itself.
 """
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
 from app.api.v1 import ingest as ingest_module
 from app.api.v1 import search as search_module
@@ -16,7 +18,8 @@ from app.core.errors import (
     EmbeddingBackendMisconfigured,
 )
 from app.main import app
-from tests.factories import make_api_key
+from app.models.learning import Learning
+from tests.factories import make_api_key, make_learning
 
 LONG_ENOUGH = (
     "This content comfortably exceeds the fifty character minimum that the "
@@ -28,6 +31,7 @@ INGEST_PAYLOAD = {
     "content": LONG_ENOUGH,
 }
 SEARCH_PAYLOAD = {"query": "anything", "top_k": 5}
+ORIGINAL_CONTENT = "the original content, which must survive a failed re-ingest"
 
 
 def _raise(exception):
@@ -181,3 +185,76 @@ def test_health_is_unaffected(client):
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_a_failure_partway_through_a_file_leaves_earlier_rows_intact(
+    connection, monkeypatch
+):
+    """Ingest must be all-or-nothing.
+
+    delete_by_file() runs before the first insert, so a failure midway could
+    otherwise leave the caller's previous chunks deleted and the new ones absent.
+
+    This test deliberately does NOT use the `client` fixture. That fixture
+    overrides get_db with `lambda: db_session`, a plain function with no teardown,
+    so the `finally: db.close()` that performs the rollback in production never
+    runs and the rollback cannot be observed. The override below is generator
+    shaped, like the real get_db.
+    """
+    from fastapi.testclient import TestClient
+
+    # Setup lives in its own session and is committed, so releasing the endpoint's
+    # savepoint later cannot take the setup row with it.
+    setup = Session(bind=connection, join_transaction_mode="create_savepoint")
+    key = make_api_key(setup, "acme")
+    make_learning(
+        setup,
+        "acme",
+        repo_name="repo_a",
+        file_path="docs/note.md",
+        content=ORIGINAL_CONTENT,
+    )
+    setup.commit()
+
+    calls = {"n": 0}
+
+    def fail_on_the_second_chunk(text):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise EmbeddingBackendError("backend died mid-file")
+        return [0.0] * 384
+
+    monkeypatch.setattr(ingest_module, "get_embedding", fail_on_the_second_chunk)
+
+    def production_shaped_get_db():
+        request_session = Session(
+            bind=connection, join_transaction_mode="create_savepoint"
+        )
+        try:
+            yield request_session
+        finally:
+            # The line under test. Without it nothing rolls back.
+            request_session.close()
+
+    app.dependency_overrides[get_db] = production_shaped_get_db
+    try:
+        # 2000 characters is 3 chunks at chunk_size 1000 with overlap 200, so the
+        # failure lands after at least one successful embedding.
+        response = TestClient(app).post(
+            "/api/v1/ingest",
+            data={**INGEST_PAYLOAD, "content": "x" * 2000},
+            headers={"X-API-Key": key},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert calls["n"] == 2, "expected the second chunk to be the one that failed"
+
+    check = Session(bind=connection, join_transaction_mode="create_savepoint")
+    surviving = check.scalars(
+        select(Learning).where(Learning.client_name == "acme")
+    ).all()
+    assert len(surviving) == 1
+    assert surviving[0].content == ORIGINAL_CONTENT
+    assert check.scalar(select(func.count()).select_from(Learning)) == 1
