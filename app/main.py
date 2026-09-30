@@ -2,6 +2,7 @@ from fastapi import FastAPI
 
 from app.api.v1.router import api_router
 from app.config import settings
+from app.core.errors import register_exception_handlers
 from app.helper import get_app_version
 
 __version__ = get_app_version()
@@ -12,6 +13,8 @@ def create_app() -> FastAPI:
         description="NescioAI semantic memory core.",
         version=__version__,
     )
+
+    register_exception_handlers(app)
 
     app.include_router(api_router, prefix="/api/v1")
 
