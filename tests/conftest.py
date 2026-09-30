@@ -111,22 +111,26 @@ def connection(engine):
     """
     conn = engine.connect()
     transaction = conn.begin()
-    # Force exact search for the duration of this transaction.
+    # Force exact search for the duration of this transaction, so vector-ordering
+    # assertions are deterministic.
     #
-    # learnings is never ANALYZEd in tests, so the planner has no statistics and
-    # picks between the HNSW index and an exact scan unpredictably. When it picks
-    # HNSW, a search can return zero of the rows a test just inserted -- they are
-    # uncommitted, inside this transaction's savepoint, which an approximate index
-    # does not handle the way a sequential or bitmap scan does. That made
-    # vector-ordering assertions fail on roughly four runs in five.
+    # pgvector's HNSW index is approximate and post-filtered: it yields a bounded
+    # candidate window (~391 tuples at the default ef_search=40) and the
+    # WHERE client_name = ... predicate is applied afterwards, as `Filter:` rather
+    # than `Index Cond:`. When earlier tests' rolled-back inserts leave enough
+    # index entries to crowd out that window, a test's own live rows never
+    # surface and the search returns nothing. That made ranking assertions fail
+    # on roughly four runs in five while passing in isolation.
     #
     # The ranking tests use hand-built orthogonal vectors precisely so cosine
     # distances are exact, which an approximate index cannot promise, so forcing
-    # the exact path is what those tests already intend. Bitmap scans stay
-    # enabled, so the composite index is still exercised.
+    # the exact path is what they already intend. Bitmap scans stay enabled, so
+    # the composite index is still exercised.
     #
-    # This does not change production behaviour: rows there are committed before
-    # any search runs.
+    # This does NOT mean production is unaffected. The same post-filter starvation
+    # occurs there on committed rows whenever a client holds a small fraction of
+    # the table -- see the open issue on HNSW recall. Disabling the index here
+    # makes the tests honest; it does not fix that.
     conn.execute(text("SET LOCAL enable_indexscan = off"))
     yield conn
     transaction.rollback()

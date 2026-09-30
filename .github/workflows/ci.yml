@@ -73,6 +73,10 @@ jobs:
     # breakage shows up, and the deps job above already proves 3.12, 3.13 and
     # 3.14 all resolve and import. Three legs here would mean three container
     # pulls per push for no additional signal.
+    env:
+      # secrets is not available in a step-level `if:`, so surface it here and
+      # gate on env instead. Without this the guard silently does nothing.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -84,7 +88,7 @@ jobs:
       # The step is skipped when the secret is absent, so forks without it still
       # run the suite -- they simply keep the anonymous rate limit.
       - name: Docker Hub login
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        if: env.DOCKERHUB_USERNAME != ''
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
