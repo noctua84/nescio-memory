@@ -1,17 +1,31 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
 from app.api.v1.router import api_router
 from app.config import settings
+from app.core.db import engine
 from app.core.errors import register_exception_handlers
+from app.core.schema_checks import verify_embedding_dimension
 from app.helper import get_app_version
 
 __version__ = get_app_version()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # Startup only. Deliberately not in create_app(): tests import this module
+    # before any database exists, and a query there would fail collection.
+    verify_embedding_dimension(engine)
+    yield
+
 
 def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         description="NescioAI semantic memory core.",
         version=__version__,
+        lifespan=lifespan,
     )
 
     register_exception_handlers(app)
