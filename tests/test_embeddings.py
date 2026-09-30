@@ -109,8 +109,9 @@ def test_bad_response_is_a_subclass_so_one_handler_covers_both(monkeypatch):
 
 
 def test_a_successful_call_still_returns_the_vector(monkeypatch):
-    _install(monkeypatch, lambda: _response({"embedding": [0.1, 0.2, 0.3]}))
-    assert get_embedding("anything") == [0.1, 0.2, 0.3]
+    vector = [0.01] * 384
+    _install(monkeypatch, lambda: _response({"embedding": vector}))
+    assert get_embedding("anything") == vector
 
 
 def test_a_malformed_ollama_url_is_reported_as_misconfiguration(monkeypatch):
@@ -148,3 +149,29 @@ def test_a_missing_local_extra_stays_a_misconfiguration(monkeypatch):
     # downgrade this permanent fault to a transient 503.
     with pytest.raises(EmbeddingBackendMisconfigured):
         get_embedding("anything")
+
+
+@pytest.mark.parametrize(
+    "bad_value, why",
+    [
+        ([], "empty"),
+        ([0.1] * 768, "wrong dimension"),
+        ("notavector", "a string"),
+        (None, "null"),
+        ([None] * 384, "a list of nulls"),
+        ({"a": 1}, "an object"),
+        ([True] * 384, "booleans"),
+    ],
+)
+def test_an_unusable_embedding_value_is_rejected(monkeypatch, bad_value, why):
+    # The key is present in every case, so the key-existence check passes and
+    # only the shape check can catch these.
+    _install(monkeypatch, lambda: _response({"embedding": bad_value}))
+    with pytest.raises(EmbeddingBackendBadResponse):
+        get_embedding(f"a response carrying {why}")
+
+
+def test_a_correctly_shaped_embedding_still_passes(monkeypatch):
+    vector = [0.01] * 384
+    _install(monkeypatch, lambda: _response({"embedding": vector}))
+    assert get_embedding("anything") == vector

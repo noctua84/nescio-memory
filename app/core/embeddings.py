@@ -14,6 +14,33 @@ _local_model = None
 OLLAMA_TIMEOUT_SECONDS = 30.0
 
 
+def _validated(vector: object) -> list[float]:
+    """Reject anything that is not a usable embedding.
+
+    The `embedding` key being present says nothing about its value. Without this,
+    a wrongly sized or wrongly typed vector reaches pgvector and fails as an
+    opaque 500 -- and a null one produced runnable SQL that returned a row, which
+    is worse than an error because it is silently wrong.
+    """
+    expected = settings.embedding_dimension
+    if not isinstance(vector, list):
+        raise EmbeddingBackendBadResponse(
+            f"embedding was {type(vector).__name__}, expected a list"
+        )
+    if len(vector) != expected:
+        raise EmbeddingBackendBadResponse(
+            f"embedding had {len(vector)} dimensions, expected {expected}"
+        )
+    for component in vector:
+        # bool is a subclass of int, so check it out explicitly rather than
+        # letting True sail through as 1.0.
+        if isinstance(component, bool) or not isinstance(component, (int, float)):
+            raise EmbeddingBackendBadResponse(
+                f"embedding contained a {type(component).__name__}, expected numbers"
+            )
+    return vector
+
+
 def _get_local_model():
     global _local_model
     if _local_model is None:
@@ -35,7 +62,7 @@ def _get_local_model():
 def get_embedding(text: str) -> list[float]:
     if settings.embedding_backend == "local":
         try:
-            return _get_local_model().encode(text).tolist()
+            vector = _get_local_model().encode(text).tolist()
         except EmbeddingBackendError:
             # _get_local_model raises EmbeddingBackendMisconfigured for a missing
             # extra. That is a subclass, so re-raise it unchanged rather than
@@ -48,6 +75,7 @@ def get_embedding(text: str) -> list[float]:
             raise EmbeddingBackendError(
                 f"Local embedding backend failed: {exc}"
             ) from exc
+        return _validated(vector)
 
     payload = {"model": settings.ollama_model, "prompt": text}
     try:
@@ -68,10 +96,11 @@ def get_embedding(text: str) -> list[float]:
         raise EmbeddingBackendError(f"Ollama request failed: {exc}") from exc
 
     try:
-        return response.json()["embedding"]
+        vector = response.json()["embedding"]
     except (ValueError, KeyError, TypeError) as exc:
         # ValueError covers a non-JSON body (JSONDecodeError subclasses it);
         # KeyError and TypeError cover JSON that is not the shape we expect.
         raise EmbeddingBackendBadResponse(
             f"Ollama response was not a usable embedding: {exc}"
         ) from exc
+    return _validated(vector)
