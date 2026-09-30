@@ -647,49 +647,81 @@ git commit -m "fix: [fix] return 503 with Retry-After when a dependency is down"
 
 ### Task 3: Pin ingest atomicity on partial failure
 
+**Corrected 2026-09-30 during execution.** The original version of this task
+specified the test through the shared `client` fixture. That cannot work, and the
+first attempt returned BLOCKED reporting a production data-loss bug that does not
+exist. See "Why the shared fixture cannot express this" below.
+
 **Files:**
 - Modify: `tests/test_error_responses.py`
 
 **Interfaces:**
-- Consumes: everything from Tasks 1 and 2, plus `tests.factories.make_learning` and `tests.fakes.fake_embedding`.
+- Consumes: the `connection` fixture from `tests/conftest.py`, `app.core.db.get_db`,
+  `tests.factories.make_api_key` and `make_learning`, `app.core.errors.EmbeddingBackendError`.
 - Produces: nothing other tasks depend on.
 
-**Why this task exists:** ingest already rolls back correctly when a chunk fails partway through a file — `get_db` closes the session without committing, so the `delete_by_file` and any inserts are discarded together, and a caller never sees a file half-replaced. That is the right behaviour but it is an accident of how the dependency is written, asserted by nothing. A future refactor that commits per chunk, or moves the delete outside the transaction, would break it silently.
+**Why this task exists:** `/api/v1/ingest` calls `repo.delete_by_file(...)` before
+writing any new chunk. If an embedding fails partway through a multi-chunk file
+and the transaction were committed anyway, the caller would be left with their old
+chunks deleted and the new ones absent — data loss caused by a transient outage,
+which is far worse than a failed request. Production is safe today because
+`get_db` is a generator whose `finally: db.close()` discards the uncommitted work,
+but nothing asserts it.
 
-- [ ] **Step 1: Write the failing test**
+### Why the shared fixture cannot express this
 
-First extend the import block at the **top** of `tests/test_error_responses.py`
-so `make_learning` is available alongside `make_api_key`:
+`tests/conftest.py` overrides the dependency with `app.dependency_overrides[get_db]
+= lambda: db_session` — a plain function. Production's `get_db` is a generator, and
+its `finally: db.close()` is the mechanism that performs the rollback. A plain
+lambda has no teardown, so in a test using the `client` fixture the session is
+never closed, nothing is rolled back, and a query afterwards sees the endpoint's
+uncommitted work still sitting in the session the test shares with the app.
+
+A test written that way does not fail because production is broken. It fails
+because the harness never runs the code under test. This was verified by executing
+the identical scenario against an override that does close the session: the
+original row survives and the failed ingest rolls back completely.
+
+This task therefore builds its own client with a production-shaped override. Do not
+"simplify" it back onto the `client` fixture.
+
+- [ ] **Step 1: Write the test**
+
+Add `make_learning` to the existing `from tests.factories import make_api_key` line
+at the top of `tests/test_error_responses.py`, and add these imports to the same
+block: `from sqlalchemy.orm import Session`, `from sqlalchemy import func, select`,
+`from app.models.learning import Learning`. Then append:
 
 ```python
-from tests.factories import make_api_key, make_learning
-```
+ORIGINAL_CONTENT = "the original content, which must survive a failed re-ingest"
 
-Do not add imports inside the test function. Then append:
 
-```python
 def test_a_failure_partway_through_a_file_leaves_earlier_rows_intact(
-    client, db_session, monkeypatch
+    connection, monkeypatch
 ):
     """Ingest must be all-or-nothing.
 
     delete_by_file() runs before the first insert, so a failure midway could
-    otherwise leave the caller's previous chunks deleted and the new ones absent
-    -- data loss from a transient outage.
+    otherwise leave the caller's previous chunks deleted and the new ones absent.
+
+    This test deliberately does NOT use the `client` fixture. That fixture
+    overrides get_db with `lambda: db_session`, a plain function with no teardown,
+    so the `finally: db.close()` that performs the rollback in production never
+    runs and the rollback cannot be observed. The override below is generator
+    shaped, like the real get_db.
     """
-    from sqlalchemy import func, select
-
-    from app.models.learning import Learning
-
-    key = make_api_key(db_session, "acme")
+    # Setup lives in its own session and is committed, so releasing the endpoint's
+    # savepoint later cannot take the setup row with it.
+    setup = Session(bind=connection, join_transaction_mode="create_savepoint")
+    key = make_api_key(setup, "acme")
     make_learning(
-        db_session,
+        setup,
         "acme",
         repo_name="repo_a",
         file_path="docs/note.md",
-        content="the original content, which must survive a failed re-ingest",
+        content=ORIGINAL_CONTENT,
     )
-    db_session.flush()
+    setup.commit()
 
     calls = {"n": 0}
 
@@ -701,53 +733,68 @@ def test_a_failure_partway_through_a_file_leaves_earlier_rows_intact(
 
     monkeypatch.setattr(ingest_module, "get_embedding", fail_on_the_second_chunk)
 
-    # 2000 characters is 3 chunks at chunk_size 1000 with overlap 200, so the
-    # failure lands after at least one successful embedding.
-    response = client.post(
-        "/api/v1/ingest",
-        data={**INGEST_PAYLOAD, "content": "x" * 2000},
-        headers={"X-API-Key": key},
-    )
+    def production_shaped_get_db():
+        request_session = Session(
+            bind=connection, join_transaction_mode="create_savepoint"
+        )
+        try:
+            yield request_session
+        finally:
+            # The line under test. Without it nothing rolls back.
+            request_session.close()
+
+    app.dependency_overrides[get_db] = production_shaped_get_db
+    try:
+        # 2000 characters is 3 chunks at chunk_size 1000 with overlap 200, so the
+        # failure lands after at least one successful embedding.
+        response = TestClient(app).post(
+            "/api/v1/ingest",
+            data={**INGEST_PAYLOAD, "content": "x" * 2000},
+            headers={"X-API-Key": key},
+        )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 503
     assert calls["n"] == 2, "expected the second chunk to be the one that failed"
 
-    db_session.expire_all()
-    surviving = db_session.scalars(
+    check = Session(bind=connection, join_transaction_mode="create_savepoint")
+    surviving = check.scalars(
         select(Learning).where(Learning.client_name == "acme")
     ).all()
     assert len(surviving) == 1
-    assert surviving[0].content.startswith("the original content")
-    assert db_session.scalar(select(func.count()).select_from(Learning)) == 1
+    assert surviving[0].content == ORIGINAL_CONTENT
+    assert check.scalar(select(func.count()).select_from(Learning)) == 1
 ```
 
 - [ ] **Step 2: Run the test**
-
-Run:
 
 ```bash
 uv run pytest tests/test_error_responses.py::test_a_failure_partway_through_a_file_leaves_earlier_rows_intact -v
 ```
 
-Expected: **PASS** on the first run. The behaviour already exists; this test pins it rather than introducing it.
-
-If it **fails**, that is a real finding, not a test bug: it would mean the rollback is not happening and a transient Ollama outage can destroy a client's existing chunks. Stop and report it rather than adjusting the test.
+Expected: **PASS** on the first run. The behaviour already exists; this test pins
+it. If it fails, stop and report — do not adjust the assertions to match.
 
 - [ ] **Step 3: Prove the test has teeth**
 
-A test that has never failed has not been shown to test anything. Temporarily add `db_session.commit()` immediately after the `repo.delete_by_file(...)` call in `app/api/v1/ingest.py`, re-run the test, and confirm it now **fails** — the delete is committed, so the original row is gone.
+A test that has never failed has not been shown to test anything.
 
-Then **revert that edit** and confirm the test passes again. Verify with `git diff app/` that nothing remains. Do not commit the temporary change.
+Temporarily delete the `finally: request_session.close()` block from the override
+**inside the test**, re-run, and confirm it now fails: with no teardown, nothing
+rolls back and the original row is gone. Then restore it and confirm it passes.
+
+This mutation is entirely within the test file. Unlike the earlier draft of this
+task, **no production code is touched at any point** — an unreverted edit here
+cannot ship a defect.
 
 - [ ] **Step 4: Run the whole suite**
-
-Run:
 
 ```bash
 uv run pytest -q
 ```
 
-Expected: 45 passed, and `git diff app/` empty.
+Expected: 48 passed, and `git diff app/` empty.
 
 - [ ] **Step 5: Commit**
 
