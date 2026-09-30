@@ -27,6 +27,18 @@ def _validate_file_path(file_path: str) -> None:
             detail="file_path must be a relative path without '..'",
         )
 
+
+def _validate_content_size(content: str) -> None:
+    """Reject content above the cap before anything is deleted or embedded."""
+    if len(content) > MAX_CONTENT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"content is too large: {len(content)} characters exceeds the "
+                f"{MAX_CONTENT_CHARS} limit"
+            ),
+        )
+
 @router.post(
     "/ingest",
     response_model=IngestResponse,
@@ -42,12 +54,13 @@ def ingest_file(
     client: ApiKey = Depends(get_current_client)
 ):
     _validate_file_path(file_path)
+    _validate_content_size(content)
     repo = LearningRepository(db, client_name=client.client_name)
     repo.delete_by_file(repo_name, file_path)
 
     ingested = 0
     for i, chunk in enumerate(chunk_text(content)):
-        if len(chunk.strip()) < 50:
+        if len(chunk.strip()) < MIN_CONTENT_CHARS:
             continue
 
         repo.add(

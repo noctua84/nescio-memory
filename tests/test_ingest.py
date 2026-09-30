@@ -127,3 +127,46 @@ def test_validation_runs_before_any_deletion(client, db_session):
 
     db_session.expire_all()
     assert db_session.scalar(select(func.count()).select_from(Learning)) == 1
+
+
+def test_content_over_the_cap_is_rejected(client, db_session):
+    from app.api.v1.ingest import MAX_CONTENT_CHARS
+
+    key = make_api_key(db_session, "acme")
+
+    response = _ingest(client, key, content="x" * (MAX_CONTENT_CHARS + 1))
+
+    assert response.status_code == 400
+    assert "too large" in response.json()["detail"]
+    db_session.expire_all()
+    assert db_session.scalar(select(func.count()).select_from(Learning)) == 0
+
+
+def test_content_exactly_at_the_cap_is_accepted(client, db_session):
+    # Boundary: the cap is inclusive, so exactly MAX_CONTENT_CHARS must pass.
+    from app.api.v1.ingest import MAX_CONTENT_CHARS
+
+    key = make_api_key(db_session, "acme")
+
+    response = _ingest(client, key, content="x" * MAX_CONTENT_CHARS)
+
+    assert response.status_code == 200
+    assert response.json()["ingested"] > 0
+
+
+def test_the_cap_is_checked_before_any_deletion(client, db_session):
+    # Oversized content must not destroy what is already stored.
+    key = make_api_key(db_session, "acme")
+    _ingest(client, key, file_path="docs/note.md")
+
+    from app.api.v1.ingest import MAX_CONTENT_CHARS
+
+    _ingest(
+        client,
+        key,
+        file_path="docs/note.md",
+        content="x" * (MAX_CONTENT_CHARS + 1),
+    )
+
+    db_session.expire_all()
+    assert db_session.scalar(select(func.count()).select_from(Learning)) == 1
