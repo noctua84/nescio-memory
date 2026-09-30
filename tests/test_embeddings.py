@@ -9,7 +9,11 @@ import pytest
 
 from app.core import embeddings as embeddings_module
 from app.core.embeddings import get_embedding
-from app.core.errors import EmbeddingBackendBadResponse, EmbeddingBackendError
+from app.core.errors import (
+    EmbeddingBackendBadResponse,
+    EmbeddingBackendError,
+    EmbeddingBackendMisconfigured,
+)
 
 
 class _StubClient:
@@ -48,8 +52,12 @@ def test_connection_failure_raises_embedding_backend_error(monkeypatch):
         raise httpx.ConnectError("connection refused")
 
     _install(monkeypatch, refuse)
-    with pytest.raises(EmbeddingBackendError):
+    with pytest.raises(EmbeddingBackendError) as excinfo:
         get_embedding("anything")
+    # Exact type, not isinstance: pytest.raises matches subclasses, so asserting
+    # the base class alone would not catch a regression that raised
+    # EmbeddingBackendBadResponse for a connection failure.
+    assert type(excinfo.value) is EmbeddingBackendError
 
 
 def test_timeout_raises_embedding_backend_error(monkeypatch):
@@ -57,14 +65,22 @@ def test_timeout_raises_embedding_backend_error(monkeypatch):
         raise httpx.ReadTimeout("too slow")
 
     _install(monkeypatch, time_out)
-    with pytest.raises(EmbeddingBackendError):
+    with pytest.raises(EmbeddingBackendError) as excinfo:
         get_embedding("anything")
+    # Exact type, not isinstance: pytest.raises matches subclasses, so asserting
+    # the base class alone would not catch a regression that raised
+    # EmbeddingBackendBadResponse for a timeout.
+    assert type(excinfo.value) is EmbeddingBackendError
 
 
 def test_non_2xx_raises_embedding_backend_error(monkeypatch):
     _install(monkeypatch, lambda: _response({"error": "boom"}, status_code=500))
-    with pytest.raises(EmbeddingBackendError):
+    with pytest.raises(EmbeddingBackendError) as excinfo:
         get_embedding("anything")
+    # Exact type, not isinstance: pytest.raises matches subclasses, so asserting
+    # the base class alone would not catch a regression that raised
+    # EmbeddingBackendBadResponse for a non-2xx response.
+    assert type(excinfo.value) is EmbeddingBackendError
 
 
 def test_missing_embedding_key_raises_bad_response(monkeypatch):
@@ -95,3 +111,40 @@ def test_bad_response_is_a_subclass_so_one_handler_covers_both(monkeypatch):
 def test_a_successful_call_still_returns_the_vector(monkeypatch):
     _install(monkeypatch, lambda: _response({"embedding": [0.1, 0.2, 0.3]}))
     assert get_embedding("anything") == [0.1, 0.2, 0.3]
+
+
+def test_a_malformed_ollama_url_is_reported_as_misconfiguration(monkeypatch):
+    def invalid_url():
+        raise httpx.InvalidURL("no scheme supplied")
+
+    _install(monkeypatch, invalid_url)
+    with pytest.raises(EmbeddingBackendMisconfigured):
+        get_embedding("anything")
+
+
+def test_a_local_backend_runtime_failure_is_treated_as_transient(monkeypatch):
+    class _OutOfMemory:
+        def encode(self, text):
+            raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(embeddings_module.settings, "embedding_backend", "local")
+    monkeypatch.setattr(embeddings_module, "_get_local_model", lambda: _OutOfMemory())
+
+    with pytest.raises(EmbeddingBackendError) as excinfo:
+        get_embedding("anything")
+    # Transient, not misconfiguration: a later attempt may succeed, so this must
+    # map to 503 rather than 500.
+    assert type(excinfo.value) is EmbeddingBackendError
+
+
+def test_a_missing_local_extra_stays_a_misconfiguration(monkeypatch):
+    def missing_extra():
+        raise EmbeddingBackendMisconfigured("local-embeddings extra not installed")
+
+    monkeypatch.setattr(embeddings_module.settings, "embedding_backend", "local")
+    monkeypatch.setattr(embeddings_module, "_get_local_model", missing_extra)
+
+    # Guards the re-raise clause: without it, the broad `except Exception` would
+    # downgrade this permanent fault to a transient 503.
+    with pytest.raises(EmbeddingBackendMisconfigured):
+        get_embedding("anything")

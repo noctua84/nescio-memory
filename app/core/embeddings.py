@@ -34,13 +34,33 @@ def _get_local_model():
 
 def get_embedding(text: str) -> list[float]:
     if settings.embedding_backend == "local":
-        return _get_local_model().encode(text).tolist()
+        try:
+            return _get_local_model().encode(text).tolist()
+        except EmbeddingBackendError:
+            # _get_local_model raises EmbeddingBackendMisconfigured for a missing
+            # extra. That is a subclass, so re-raise it unchanged rather than
+            # reclassifying a permanent fault as a transient one.
+            raise
+        except Exception as exc:
+            # Everything else here is a runtime fault in the in-process model --
+            # memory pressure, a bad model name, a failed download. Treated as
+            # transient: unlike a missing extra, a later attempt may succeed.
+            raise EmbeddingBackendError(
+                f"Local embedding backend failed: {exc}"
+            ) from exc
 
     payload = {"model": settings.ollama_model, "prompt": text}
     try:
         with httpx.Client(timeout=OLLAMA_TIMEOUT_SECONDS) as client:
             response = client.post(settings.ollama_url, json=payload)
             response.raise_for_status()
+    except httpx.InvalidURL as exc:
+        # InvalidURL inherits from Exception rather than httpx.HTTPError, so the
+        # clause below does not catch it. A malformed URL is a deployment
+        # mistake, not a transient condition, so it must not promise a retry.
+        raise EmbeddingBackendMisconfigured(
+            f"OLLAMA_URL is not a valid URL: {settings.ollama_url!r}"
+        ) from exc
     except httpx.HTTPError as exc:
         # httpx.HTTPError is the base of RequestError (connection, timeout) and
         # HTTPStatusError, so every transport failure is caught here and the
