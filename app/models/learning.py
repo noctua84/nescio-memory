@@ -25,6 +25,16 @@ class Learning(Base):
             "repo_name",
             "file_path",
         ),
+        # Declared so the model matches the schema migration 0001 creates. It is
+        # not created from here -- the migration owns it -- but declaring it keeps
+        # autogenerate from reporting it as removable, which would otherwise have
+        # to be tolerated by an allowlist entry.
+        Index(
+            "learnings_embedding_idx",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)

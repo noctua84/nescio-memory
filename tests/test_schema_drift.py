@@ -9,33 +9,33 @@ from alembic.migration import MigrationContext
 
 from app.models import Base
 
-# Divergences that are expected and accepted. Each entry is (operation, object
-# name). Anything not listed here is a regression.
-ACCEPTED_DRIFT = {
-    # PostgreSQL has no practical distinction between TEXT and VARCHAR without a
-    # length, so this reflects differently without meaning anything.
-    ("modify_type", "api_keys.client_name"),
-    # The HNSW index is created by migration and cannot be expressed in the
-    # model, so autogenerate always reports it as removable. Deleting it would
-    # destroy vector search performance.
-    ("remove_index", "learnings_embedding_idx"),
-}
+# No accepted divergences. The model describes the schema exactly, including the
+# HNSW index, which SQLAlchemy's PostgreSQL dialect can express. Adding an entry
+# here should be a deliberate, justified act -- an allowlisted object is one this
+# test stops guarding, and a divergence on it goes unreported.
+ACCEPTED_DRIFT: set[tuple[str, str]] = set()
 
 
-def _describe(diff) -> tuple[str, str]:
-    """Reduce an autogenerate diff entry to (operation, object name)."""
+def _describe(diff) -> list[tuple[str, str]]:
+    """Reduce an autogenerate diff entry to (operation, object name) pairs.
+
+    Returns a list because Alembic packs every alteration to a single column into
+    one list entry. Describing only the first would hide the rest.
+    """
     if isinstance(diff, list):
-        # A column alteration arrives as a list of tuples.
-        diff = diff[0]
+        return [described for entry in diff for described in _describe(entry)]
+
     operation = diff[0]
-    if operation.endswith("_index") or operation.endswith("_constraint"):
-        return operation, diff[1].name
-    if operation.endswith("_table"):
-        return operation, diff[1].name
+    if operation.endswith(("_index", "_constraint", "_fk", "_table")):
+        return [(operation, diff[1].name)]
     if operation.endswith("_column"):
-        return operation, f"{diff[2]}.{diff[3].name}"
-    # modify_* entries carry the table and column in fixed positions.
-    return operation, f"{diff[2]}.{diff[3]}"
+        return [(operation, f"{diff[2]}.{diff[3].name}")]
+    if operation.startswith("modify_"):
+        return [(operation, f"{diff[2]}.{diff[3]}")]
+    raise AssertionError(
+        f"unrecognised autogenerate diff shape: {diff!r}. Teach _describe about "
+        "it rather than letting it fall through silently."
+    )
 
 
 def test_the_models_and_the_migrated_schema_agree(engine):
@@ -46,7 +46,8 @@ def test_the_models_and_the_migrated_schema_agree(engine):
 
     unexpected = [
         described
-        for described in (_describe(diff) for diff in diffs)
+        for diff in diffs
+        for described in _describe(diff)
         if described not in ACCEPTED_DRIFT
     ]
 
