@@ -183,6 +183,17 @@ re-ingesting an updated file is safe and idempotent — and scoped to the callin
 touches another client's copy of the same path. Chunks shorter than 50 characters are dropped.
 Content over 500,000 characters is rejected with a `400`.
 
+**That 500,000-character cap is a character limit, not a byte limit — and for non-ASCII content a
+smaller byte limit fires first.** The form parser (Starlette, underneath FastAPI's `Form(...)`)
+enforces its own 1,048,576-byte (1024KB) limit per form field, ahead of and independent from the
+500,000-character check above. ASCII content hits both limits at the same size, but multi-byte
+content hits the byte limit at a much lower character count — e.g. 3-byte-per-character CJK text is
+capped at roughly 349,000 characters, well under 500,000. When the byte limit fires first, the
+response is still a `400`, but with Starlette's own message (`"Field exceeded maximum size of
+1024KB."`) rather than the character-count message above. There is no supported way to raise that
+byte limit for a `Form(...)`-declared route in the installed FastAPI/Starlette versions without
+changing this endpoint's request schema, so this is documented behavior rather than a bug fix.
+
 ```bash
 curl -X POST http://localhost:8000/api/v1/ingest \
   -H "X-API-Key: nm_your_key_here" \

@@ -18,6 +18,21 @@ router = APIRouter()
 MAX_CONTENT_CHARS = 500_000   # ~500 KB per file
 MIN_CONTENT_CHARS = 50
 
+# Starlette's form parser enforces this per-field BYTE limit
+# (starlette/formparsers.py: FormParser/MultiPartParser default
+# max_part_size = 1024 * 1024) before this module's Form(...) fields are ever
+# bound to a request, let alone before _validate_content_size below runs.
+# FastAPI's routing (fastapi/routing.py: `body = await request.form()`) calls
+# Request.form() with no arguments, so there is no application- or
+# route-level hook to raise it for a Form(...)-declared route without
+# bypassing Form(...) entirely and hand-parsing the body -- which would
+# change this endpoint's documented request schema. So for multi-byte
+# content this byte limit, not MAX_CONTENT_CHARS, is the one that actually
+# fires, and it does so via Starlette's own generic message rather than
+# ours. See docs/superpowers/specs/2026-09-29-stabilization-design.md item 2
+# review and .superpowers/sdd/task-robustness-report.md for the investigation.
+FORM_PART_BYTE_LIMIT = 1024 * 1024
+
 
 def _validate_file_path(file_path: str) -> None:
     """Reject absolute paths and traversal — file_path is stored/reflected."""
@@ -35,7 +50,10 @@ def _validate_content_size(content: str) -> None:
             status_code=400,
             detail=(
                 f"content is too large: {len(content)} characters exceeds the "
-                f"{MAX_CONTENT_CHARS} limit"
+                f"{MAX_CONTENT_CHARS} limit. Note: a {FORM_PART_BYTE_LIMIT}-byte "
+                "per-field limit is also enforced ahead of this check, which "
+                "multi-byte (non-ASCII) content can reach at a much lower "
+                "character count."
             ),
         )
 

@@ -5,6 +5,7 @@ request that happens to touch it.
 """
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 
 from app.config import settings
 
@@ -22,8 +23,17 @@ def verify_embedding_dimension(engine: Engine) -> None:
     service starts cleanly, passes its liveness probe, and then fails at the
     first ingest -- possibly long after the deploy that caused it.
     """
-    with engine.connect() as connection:
-        actual = connection.execute(_DIMENSION_QUERY).scalar()
+    try:
+        with engine.connect() as connection:
+            actual = connection.execute(_DIMENSION_QUERY).scalar()
+    except OperationalError as exc:
+        # Without this, an unreachable host surfaces as a raw SQLAlchemy
+        # traceback at boot. The operator needs the database named as the
+        # cause, not a stack trace through psycopg2.
+        raise RuntimeError(
+            "Could not connect to the database. Check DATABASE_URL and that "
+            "the database is reachable."
+        ) from exc
 
     if actual is None:
         # to_regclass returns NULL for a missing table, so the query yields no

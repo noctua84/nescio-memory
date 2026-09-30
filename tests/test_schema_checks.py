@@ -6,6 +6,7 @@ container, to prove it does not reject a correct schema.
 """
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError
 
 from app.core.schema_checks import verify_embedding_dimension
 from app.main import app
@@ -38,6 +39,13 @@ class _StubEngine:
         return _StubConnection(self._scalar)
 
 
+class _UnreachableEngine:
+    """Stands in for an engine whose connect() cannot reach the database."""
+
+    def connect(self):
+        raise OperationalError("SELECT 1", {}, Exception("connection refused"))
+
+
 def test_a_matching_dimension_passes(monkeypatch):
     from app.config import settings
 
@@ -61,6 +69,15 @@ def test_a_missing_table_names_the_remedy():
     # message must point at the actual fix rather than at the column.
     with pytest.raises(RuntimeError, match="alembic upgrade head"):
         verify_embedding_dimension(_StubEngine(None))
+
+
+def test_an_unreachable_database_names_the_cause():
+    # A connection refused (or timed out) at boot must not surface as a raw
+    # SQLAlchemy/psycopg2 traceback -- the operator needs the database named
+    # as the cause, and the original error preserved via `from exc`.
+    with pytest.raises(RuntimeError, match="database") as excinfo:
+        verify_embedding_dimension(_UnreachableEngine())
+    assert isinstance(excinfo.value.__cause__, OperationalError)
 
 
 def test_the_application_boots_against_the_migrated_schema(engine, monkeypatch):
