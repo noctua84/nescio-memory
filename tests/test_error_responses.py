@@ -233,7 +233,11 @@ def test_a_failure_partway_through_a_file_leaves_earlier_rows_intact(
         try:
             yield request_session
         finally:
-            # The line under test. Without it nothing rolls back.
+            # Closing releases this session's savepoint. Note the nuance: in
+            # production the rollback is guaranteed by db.commit() never being
+            # reached, and close() serves to release the transaction and its locks
+            # promptly. Removing this line does make THIS test fail, because the
+            # assertions read through the same connection the savepoint sits on.
             request_session.close()
 
     app.dependency_overrides[get_db] = production_shaped_get_db

@@ -325,8 +325,10 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
 - **Langfuse keys in `.env` are ignored.** `@observe` relies on the SDK reading `LANGFUSE_*` from
   the process environment, and pydantic-settings does not export `.env` values into it. Export the
   keys in your shell or service manager, or tracing silently stays off.
-- **No error handling.** A database or Ollama failure surfaces as an unhandled `500` rather than a
-  meaningful HTTP error.
+- **Unmapped errors still return a bare `500`.** Dependency failures now return a
+  documented `503` or `500` with a `{"detail": ...}` body, but any exception outside
+  those handlers surfaces as plain-text `Internal Server Error` rather than JSON, so
+  a client cannot rely on parsing `detail` from every error.
 - **Ingestion is serial and chatty.** One blocking Ollama call per chunk, with no batching and no
   retry/backoff.
 - **No index on `(client_name, repo_name, file_path)` as a unit.** Each column is indexed

@@ -113,9 +113,12 @@ and no header.
 
 ### Atomicity
 
-Ingest already rolls back correctly when a chunk fails mid-file: `get_db` closes
-the session without committing, so the `delete_by_file` and any inserts are
-discarded together. A caller therefore never observes a file half-replaced.
+Ingest already rolls back correctly when a chunk fails mid-file, and a caller never
+observes a file half-replaced. The mechanism is that `db.commit()` is never reached
+once an embedding raises, so nothing the request did is ever committed. `get_db`'s
+`finally: db.close()` then releases the transaction and its row locks promptly;
+verified against a real database, removing that `close()` still rolls back, but
+leaves an `idle in transaction` backend behind.
 
 This is currently an accident of how the dependency is written, asserted by no
 test. The behaviour stays, and gains a test that fails embedding partway through
