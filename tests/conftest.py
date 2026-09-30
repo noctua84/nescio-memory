@@ -51,7 +51,7 @@ os.environ["LANGFUSE_TRACING_ENABLED"] = "false"
 import pytest  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
-from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 from testcontainers.community.postgres import PostgresContainer  # noqa: E402
 
@@ -111,6 +111,27 @@ def connection(engine):
     """
     conn = engine.connect()
     transaction = conn.begin()
+    # Force exact search for the duration of this transaction, so vector-ordering
+    # assertions are deterministic.
+    #
+    # pgvector's HNSW index is approximate and post-filtered: it yields a bounded
+    # candidate window (~391 tuples at the default ef_search=40) and the
+    # WHERE client_name = ... predicate is applied afterwards, as `Filter:` rather
+    # than `Index Cond:`. When earlier tests' rolled-back inserts leave enough
+    # index entries to crowd out that window, a test's own live rows never
+    # surface and the search returns nothing. That made ranking assertions fail
+    # on roughly four runs in five while passing in isolation.
+    #
+    # The ranking tests use hand-built orthogonal vectors precisely so cosine
+    # distances are exact, which an approximate index cannot promise, so forcing
+    # the exact path is what they already intend. Bitmap scans stay enabled, so
+    # the composite index is still exercised.
+    #
+    # This does NOT mean production is unaffected. The same post-filter starvation
+    # occurs there on committed rows whenever a client holds a small fraction of
+    # the table -- see the open issue on HNSW recall. Disabling the index here
+    # makes the tests honest; it does not fix that.
+    conn.execute(text("SET LOCAL enable_indexscan = off"))
     yield conn
     transaction.rollback()
     conn.close()

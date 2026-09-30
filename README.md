@@ -86,6 +86,10 @@ including the HNSW index used for similarity search. Do not create tables by han
 the migrations are checked against each other, and a hand-built schema will be missing columns the
 application requires.
 
+The application also verifies at startup that `EMBEDDING_DIMENSION` matches the
+`learnings.embedding` column, so it will not start against an unmigrated or
+mismatched database. That means a reachable database is required to boot.
+
 ### 4. Create an API key
 
 Every `/api/v1` route requires an API key. Mint one per client:
@@ -177,6 +181,18 @@ with three fields: `repo_name`, `file_path`, `content`.
 Existing chunks for the same `(client_name, repo_name, file_path)` triple are deleted first, so
 re-ingesting an updated file is safe and idempotent — and scoped to the calling client, so it never
 touches another client's copy of the same path. Chunks shorter than 50 characters are dropped.
+Content over 500,000 characters is rejected with a `400`.
+
+**That 500,000-character cap is a character limit, not a byte limit — and for non-ASCII content a
+smaller byte limit fires first.** The form parser (Starlette, underneath FastAPI's `Form(...)`)
+enforces its own 1,048,576-byte (1024KB) limit per form field, ahead of and independent from the
+500,000-character check above. ASCII content hits both limits at the same size, but multi-byte
+content hits the byte limit at a much lower character count — e.g. 3-byte-per-character CJK text is
+capped at roughly 349,000 characters, well under 500,000. When the byte limit fires first, the
+response is still a `400`, but with Starlette's own message (`"Field exceeded maximum size of
+1024KB."`) rather than the character-count message above. There is no supported way to raise that
+byte limit for a `Form(...)`-declared route in the installed FastAPI/Starlette versions without
+changing this endpoint's request schema, so this is documented behavior rather than a bug fix.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/ingest \
@@ -320,8 +336,9 @@ version and publishes a GitHub Release — do not edit versions by hand.
 
 This is a PoC. Known rough edges, roughly in order of how much they matter:
 
-- **`EMBEDDING_DIMENSION` is never checked.** It is documentation only; a mismatch with the actual
-  `vector(N)` column surfaces as a database error on insert rather than at startup.
+- **Search can silently return fewer results than `top_k`.** pgvector's HNSW index is approximate
+  and filters by `client_name` after producing candidates, so a client holding a small share of the
+  table can receive an empty result set with HTTP 200 rather than an error.
 - **Langfuse keys in `.env` are ignored.** `@observe` relies on the SDK reading `LANGFUSE_*` from
   the process environment, and pydantic-settings does not export `.env` values into it. Export the
   keys in your shell or service manager, or tracing silently stays off.
@@ -331,9 +348,6 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
   a client cannot rely on parsing `detail` from every error.
 - **Ingestion is serial and chatty.** One blocking Ollama call per chunk, with no batching and no
   retry/backoff.
-- **No index on `(client_name, repo_name, file_path)` as a unit.** Each column is indexed
-  separately, so the delete-on-re-ingest path relies on PostgreSQL combining them rather than a
-  single composite index.
 
 Contributions addressing any of the above are welcome.
 

@@ -127,3 +127,76 @@ def test_validation_runs_before_any_deletion(client, db_session):
 
     db_session.expire_all()
     assert db_session.scalar(select(func.count()).select_from(Learning)) == 1
+
+
+def test_content_over_the_cap_is_rejected(client, db_session):
+    from app.api.v1.ingest import MAX_CONTENT_CHARS
+
+    key = make_api_key(db_session, "acme")
+
+    response = _ingest(client, key, content="x" * (MAX_CONTENT_CHARS + 1))
+
+    assert response.status_code == 400
+    assert "too large" in response.json()["detail"]
+    db_session.expire_all()
+    assert db_session.scalar(select(func.count()).select_from(Learning)) == 0
+
+
+def test_content_exactly_at_the_cap_is_accepted(client, db_session):
+    # Boundary: the cap is inclusive, so exactly MAX_CONTENT_CHARS of ASCII
+    # content must pass. ASCII is kept as its own case because it is the one
+    # payload whose character count equals its byte count, so it is the only
+    # content that can reach this boundary at all -- see
+    # test_multibyte_content_within_the_char_cap_is_rejected_by_the_byte_limit
+    # below for what happens to everything else.
+    from app.api.v1.ingest import MAX_CONTENT_CHARS
+
+    key = make_api_key(db_session, "acme")
+
+    response = _ingest(client, key, content="x" * MAX_CONTENT_CHARS)
+
+    assert response.status_code == 200
+    assert response.json()["ingested"] > 0
+
+
+def test_multibyte_content_within_the_char_cap_is_rejected_by_the_byte_limit(
+    client, db_session
+):
+    # Real (non-ASCII) content cannot reach MAX_CONTENT_CHARS in practice.
+    # Starlette's form parser enforces its own 1,048,576-byte per-field limit
+    # ahead of _validate_content_size, and for application/x-www-form-urlencoded
+    # bodies (what `_ingest` sends, matching the curl examples and default
+    # client behaviour) multi-byte characters are percent-encoded on the
+    # wire, inflating them further still. CJK content at HALF the documented
+    # character cap already exceeds that byte limit -- well before
+    # MAX_CONTENT_CHARS -- and the rejection carries Starlette's own message,
+    # not ours.
+    from app.api.v1.ingest import MAX_CONTENT_CHARS
+
+    key = make_api_key(db_session, "acme")
+    half_the_cap = MAX_CONTENT_CHARS // 2
+
+    response = _ingest(client, key, content="中" * half_the_cap)
+
+    assert response.status_code == 400
+    assert "1024KB" in response.json()["detail"]
+    db_session.expire_all()
+    assert db_session.scalar(select(func.count()).select_from(Learning)) == 0
+
+
+def test_the_cap_is_checked_before_any_deletion(client, db_session):
+    # Oversized content must not destroy what is already stored.
+    key = make_api_key(db_session, "acme")
+    _ingest(client, key, file_path="docs/note.md")
+
+    from app.api.v1.ingest import MAX_CONTENT_CHARS
+
+    _ingest(
+        client,
+        key,
+        file_path="docs/note.md",
+        content="x" * (MAX_CONTENT_CHARS + 1),
+    )
+
+    db_session.expire_all()
+    assert db_session.scalar(select(func.count()).select_from(Learning)) == 1
