@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Text, DateTime, func
+from sqlalchemy import DateTime, Index, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -13,10 +13,24 @@ class Learning(Base):
     """ Learning model. """
     __tablename__ = "learnings"
 
+    # One composite index rather than three single-column ones. A B-tree serves
+    # any prefix of its columns, so this covers client_name alone (every search),
+    # client_name with repo_name (a filtered search), and all three
+    # (delete_by_file, which runs on every ingest). file_path is never filtered
+    # on its own.
+    __table_args__ = (
+        Index(
+            "ix_learnings_client_repo_path",
+            "client_name",
+            "repo_name",
+            "file_path",
+        ),
+    )
+
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    repo_name: Mapped[str] = mapped_column(Text, nullable=False, index=True)
-    client_name: Mapped[str] = mapped_column(Text, nullable=False, index=True)
-    file_path: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    repo_name: Mapped[str] = mapped_column(Text, nullable=False)
+    client_name: Mapped[str] = mapped_column(Text, nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
     # `metadata` is reserved on DeclarativeBase, so the Python attribute must be named differently
