@@ -51,7 +51,7 @@ os.environ["LANGFUSE_TRACING_ENABLED"] = "false"
 import pytest  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
-from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 from testcontainers.community.postgres import PostgresContainer  # noqa: E402
 
@@ -111,6 +111,23 @@ def connection(engine):
     """
     conn = engine.connect()
     transaction = conn.begin()
+    # Force exact search for the duration of this transaction.
+    #
+    # learnings is never ANALYZEd in tests, so the planner has no statistics and
+    # picks between the HNSW index and an exact scan unpredictably. When it picks
+    # HNSW, a search can return zero of the rows a test just inserted -- they are
+    # uncommitted, inside this transaction's savepoint, which an approximate index
+    # does not handle the way a sequential or bitmap scan does. That made
+    # vector-ordering assertions fail on roughly four runs in five.
+    #
+    # The ranking tests use hand-built orthogonal vectors precisely so cosine
+    # distances are exact, which an approximate index cannot promise, so forcing
+    # the exact path is what those tests already intend. Bitmap scans stay
+    # enabled, so the composite index is still exercised.
+    #
+    # This does not change production behaviour: rows there are committed before
+    # any search runs.
+    conn.execute(text("SET LOCAL enable_indexscan = off"))
     yield conn
     transaction.rollback()
     conn.close()
