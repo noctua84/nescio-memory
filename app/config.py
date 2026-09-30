@@ -1,4 +1,5 @@
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -53,6 +54,21 @@ class Settings(BaseSettings):
                 "CHUNK_OVERLAP must satisfy 0 <= CHUNK_OVERLAP < CHUNK_SIZE, got "
                 f"CHUNK_SIZE={self.chunk_size}, CHUNK_OVERLAP={self.chunk_overlap}; "
                 "otherwise chunk_text's sliding window never advances"
+            )
+        return self
+
+    # Same reasoning as above: a malformed OLLAMA_URL otherwise surfaces per
+    # request as a 503 advertising a retry that can never succeed, or as a bare
+    # 500 when httpx raises something outside its own exception tree.
+    @model_validator(mode="after")
+    def _ollama_url_must_be_http(self) -> "Settings":
+        if self.embedding_backend != "ollama":
+            return self
+        parsed = urlparse(self.ollama_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError(
+                "OLLAMA_URL must be an absolute http:// or https:// URL with a "
+                f"host, got {self.ollama_url!r}"
             )
         return self
 
