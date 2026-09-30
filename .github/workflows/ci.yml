@@ -76,6 +76,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
+      # Anonymous Docker Hub pulls are rate limited per IP, and GitHub's hosted
+      # runners share egress addresses, so an unauthenticated pull of
+      # pgvector/pgvector and testcontainers' Ryuk reaper fails intermittently
+      # with toomanyrequests. Authenticating raises the limit substantially.
+      #
+      # The step is skipped when the secret is absent, so forks without it still
+      # run the suite -- they simply keep the anonymous rate limit.
+      - name: Docker Hub login
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
