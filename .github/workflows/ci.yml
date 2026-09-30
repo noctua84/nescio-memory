@@ -58,6 +58,11 @@ jobs:
   tests:
     name: tests (py3.12)
     runs-on: ubuntu-latest
+    # The suite completes in well under a minute; 15 is generous headroom for a
+    # cold image pull. Without a bound, a test that hangs on real network I/O --
+    # the documented failure mode for a mis-targeted embedding patch -- would run
+    # against GitHub's 360-minute default.
+    timeout-minutes: 15
     # Tests run against a real PostgreSQL + pgvector container that
     # testcontainers starts and stops itself, so there is no `services:` block
     # and no Docker setup step -- the Docker daemon is pre-installed on hosted
