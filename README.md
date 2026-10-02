@@ -336,9 +336,13 @@ version and publishes a GitHub Release — do not edit versions by hand.
 
 This is a PoC. Known rough edges, roughly in order of how much they matter:
 
-- **Search can silently return fewer results than `top_k`.** pgvector's HNSW index is approximate
-  and filters by `client_name` after producing candidates, so a client holding a small share of the
-  table can receive an empty result set with HTTP 200 rather than an error.
+- **Search recall is bounded, not guaranteed.** pgvector's HNSW index is approximate and filters by
+  `client_name` after producing candidates. The search now sets `hnsw.iterative_scan` so the index
+  keeps looking until it has `top_k` matches: on a corpus where one client held 10 rows of 8,010,
+  that took the result from 1 row to the full 10. But `hnsw.max_scan_tuples` caps the work and HNSW's
+  graph construction is randomized, so a query can still come back one row short, and a client
+  holding a very small share of a very large table can still receive a short result set rather than
+  an error.
 - **Langfuse keys in `.env` are ignored.** `@observe` relies on the SDK reading `LANGFUSE_*` from
   the process environment, and pydantic-settings does not export `.env` values into it. Export the
   keys in your shell or service manager, or tracing silently stays off.

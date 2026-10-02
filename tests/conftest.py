@@ -111,11 +111,17 @@ def connection(engine):
     """
     conn = engine.connect()
     transaction = conn.begin()
-    # No enable_indexscan override. The ranking tests were previously
-    # nondeterministic because the HNSW index gave up once its candidate window
-    # was exhausted by earlier tests' rolled-back rows; LearningRepository.search
-    # now sets hnsw.iterative_scan, so the index keeps searching and the suite
-    # exercises the same path production does.
+    # No enable_indexscan override. This fixture used to force exact scans because the
+    # HNSW index gave up once its candidate window was exhausted by earlier tests'
+    # rolled-back rows, which made ranking assertions fail in roughly four runs of five.
+    # LearningRepository.search now sets hnsw.iterative_scan, so that starvation no
+    # longer occurs and the override is unnecessary -- confirmed by 15 consecutive
+    # full-suite runs.
+    #
+    # This does NOT mean every search test now exercises the HNSW path. On the 4-10 row
+    # corpora most of them build, the planner prefers a bitmap scan on
+    # ix_learnings_client_repo_path plus an exact Sort; EXPLAIN confirms it. Only
+    # tests/test_search_recall.py, which seeds 8010 rows, reaches the HNSW index.
     yield conn
     transaction.rollback()
     conn.close()
