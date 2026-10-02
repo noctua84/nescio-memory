@@ -26,7 +26,7 @@ from pathlib import Path
 # "leaving the developer's value alone".
 os.environ.setdefault(
     "DATABASE_URL",
-    "postgresql+psycopg2://placeholder:placeholder@localhost:1/placeholder",
+    "postgresql+psycopg://placeholder:placeholder@localhost:1/placeholder",
 )
 
 # app/api/v1/ingest.py and app/api/v1/search.py are wrapped in Langfuse's
@@ -73,8 +73,12 @@ ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 @pytest.fixture(scope="session")
 def pg_container():
     """One container for the whole run. Readiness is handled internally by
-    testcontainers, which polls with psql until the server answers."""
-    with PostgresContainer(PGVECTOR_IMAGE) as container:
+    testcontainers, which polls with psql until the server answers.
+
+    PostgresContainer defaults to a psycopg2 connection URL; this project uses
+    psycopg 3, so the driver is pinned explicitly.
+    """
+    with PostgresContainer(PGVECTOR_IMAGE, driver="psycopg") as container:
         yield container
 
 

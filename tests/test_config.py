@@ -10,7 +10,7 @@ from app.config import Settings
 
 def _settings(**overrides):
     base = {
-        "database_url": "postgresql+psycopg2://u:p@localhost:5432/db",
+        "database_url": "postgresql+psycopg://u:p@localhost:5432/db",
         "ollama_url": "http://localhost:11434/api/embeddings",
     }
     base.update(overrides)
@@ -37,3 +37,4 @@ def test_the_local_backend_does_not_require_a_valid_ollama_url():
     # The local backend never reads ollama_url, so it must not be forced to
     # supply one.
     assert _settings(embedding_backend="local", ollama_url="")
+
