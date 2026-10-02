@@ -13,17 +13,21 @@ from pathlib import Path
 # This block MUST run before any `app.` import. app/config.py declares
 # database_url as a required setting and builds `settings` at module scope, so
 # importing any app module without DATABASE_URL raises a pydantic
-# ValidationError during collection.
+# ValidationError during collection -- settings is still built eagerly, so
+# DATABASE_URL is still required at import time.
 #
-# The value is deliberately unroutable. create_engine() does not connect, so
-# the module-level engine in app/core/db.py is constructed but never used once
-# get_db is overridden -- but if something ever does use it, we want an
-# immediate connection failure rather than a silent write to a real database.
-# setdefault, but note the placeholder wins locally too: a developer's
-# DATABASE_URL normally lives in .env, and pydantic-settings gives os.environ
-# priority over .env. That is the better outcome -- local and CI runs behave
-# identically and the suite never touches a real database -- but it is not
-# "leaving the developer's value alone".
+# The engine itself, though, is built lazily (issue #16): app/core/db.py's
+# get_engine()/get_sessionmaker() construct it on first call rather than at
+# import, and since this suite overrides get_db with db_session (see the
+# `client` fixture below), the app's own engine is never created during tests
+# at all. The placeholder value is kept anyway as a backstop: if something
+# ever did call get_engine()/get_db() for real, we want an immediate
+# connection failure rather than a silent write to a real database. setdefault,
+# but note the placeholder wins locally too: a developer's DATABASE_URL
+# normally lives in .env, and pydantic-settings gives os.environ priority over
+# .env. That is the better outcome -- local and CI runs behave identically and
+# the suite never touches a real database -- but it is not "leaving the
+# developer's value alone".
 os.environ.setdefault(
     "DATABASE_URL",
     "postgresql+psycopg://placeholder:placeholder@localhost:1/placeholder",

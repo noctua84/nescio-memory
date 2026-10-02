@@ -105,6 +105,6 @@ def test_the_application_boots_against_the_migrated_schema(engine, monkeypatch):
     # suite's `client` fixture does not, so this cannot be folded into it.
     import app.main as main_module
 
-    monkeypatch.setattr(main_module, "engine", engine)
+    monkeypatch.setattr(main_module, "get_engine", lambda: engine)
     with TestClient(app) as booted:
         assert booted.get("/health").status_code == 200
