@@ -10,12 +10,13 @@ means adding a class rather than extending a dispatch table.
 """
 import logging
 
-# The isinstance check below is deliberately driver-specific: a hand-built
-# QueryCanceled has no pgcode, and SQLAlchemy exposes no portable "query
-# canceled" type, so there is no abstraction-preserving way to detect this.
-# If the driver ever changes to psycopg3, this check silently stops matching
-# and timeouts revert to the generic 503+Retry-After branch -- update it then.
-import psycopg2.errors
+# The isinstance check below is deliberately driver-specific: SQLAlchemy
+# exposes no portable "query canceled" type, so there is no
+# abstraction-preserving way to detect this. If the driver ever changes
+# again, this check silently stops matching, timeouts revert to the generic
+# 503+Retry-After branch, and the 57014 tests below (test_error_responses.py,
+# test_statement_timeout.py) start failing -- update it then.
+import psycopg.errors
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import OperationalError
@@ -109,7 +110,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         # decision), so the log below must not claim a cause it cannot know
         # and states only what is actually known: where and what the
         # configured limit is.
-        if isinstance(exc.orig, psycopg2.errors.QueryCanceled):
+        if isinstance(exc.orig, psycopg.errors.QueryCanceled):
             logger.warning(
                 "Statement canceled (SQLSTATE 57014) on %s; search "
                 "statement_timeout is %d ms",

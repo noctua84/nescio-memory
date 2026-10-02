@@ -7,7 +7,7 @@ applies settings.statement_timeout_ms via SET LOCAL, that Postgres genuinely
 cancels a statement once that timeout is tight, and that the setting never
 leaks past the search transaction it was scoped to.
 """
-import psycopg2.errors
+import psycopg.errors
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
@@ -36,7 +36,7 @@ def test_search_applies_the_configured_statement_timeout_to_its_transaction(
 def test_postgres_actually_cancels_a_statement_over_a_tight_timeout(engine):
     # Exercises the real driver/server behaviour the app depends on: a tight
     # statement_timeout really does raise OperationalError with .orig a
-    # psycopg2 QueryCanceled carrying SQLSTATE 57014, which is exactly what
+    # psycopg QueryCanceled carrying SQLSTATE 57014, which is exactly what
     # app.core.errors keys off of via isinstance().
     #
     # Runs on its own connection from the `engine` fixture, not the shared
@@ -50,8 +50,8 @@ def test_postgres_actually_cancels_a_statement_over_a_tight_timeout(engine):
         conn.execute(text("SELECT set_config('statement_timeout', '100', true)"))
         with pytest.raises(OperationalError) as exc_info:
             conn.execute(text("SELECT pg_sleep(1)"))
-        assert isinstance(exc_info.value.orig, psycopg2.errors.QueryCanceled)
-        assert exc_info.value.orig.pgcode == "57014"
+        assert isinstance(exc_info.value.orig, psycopg.errors.QueryCanceled)
+        assert exc_info.value.orig.sqlstate == "57014"
     finally:
         trans.rollback()
         conn.close()

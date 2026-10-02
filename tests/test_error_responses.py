@@ -5,7 +5,7 @@ well as the mapping itself.
 """
 import logging
 
-import psycopg2.errors
+import psycopg.errors
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
@@ -200,7 +200,7 @@ def test_a_search_that_exceeds_its_statement_timeout_returns_503_with_no_retry_a
         raise OperationalError(
             "SELECT ...",
             {},
-            psycopg2.errors.QueryCanceled(
+            psycopg.errors.QueryCanceled(
                 "canceling statement due to statement timeout"
             ),
         )
