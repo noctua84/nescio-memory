@@ -43,7 +43,8 @@ values that only live in `.env` are not picked up, see
 
 - **Python 3.12+**
 - **[uv](https://docs.astral.sh/uv/)** — manages the virtualenv and the lockfile
-- **PostgreSQL 16+** with the `pgvector` extension
+- **PostgreSQL 16+** with the `pgvector` extension, **`pgvector` >= 0.8.0 required** — search sets
+  `hnsw.iterative_scan`, which earlier versions reject outright
 - **Docker** — only to run the test suite, which starts a real PostgreSQL + pgvector container
 - **Ollama** running an embedding model (e.g. `qwen3-embedding`) — unless you use the optional
   in-process backend instead
@@ -339,10 +340,11 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
 - **Search recall is bounded, not guaranteed.** pgvector's HNSW index is approximate and filters by
   `client_name` after producing candidates. The search now sets `hnsw.iterative_scan` so the index
   keeps looking until it has `top_k` matches: on a corpus where one client held 10 rows of 8,010,
-  that took the result from 1 row to the full 10. But `hnsw.max_scan_tuples` caps the work and HNSW's
-  graph construction is randomized, so a query can still come back one row short, and a client
-  holding a very small share of a very large table can still receive a short result set rather than
-  an error.
+  that took the result from 1 row to the full 10. It remains approximate — HNSW's graph construction
+  is randomized and part of the graph can be unreachable for any given query, so a query can still
+  come back one row short, and a client holding a very small share of a very large table can still
+  receive a short result set rather than an error. `hnsw.max_scan_tuples` is a safety cap on work,
+  not the limit on recall; raising it does not lengthen a short result.
 - **Langfuse keys in `.env` are ignored.** `@observe` relies on the SDK reading `LANGFUSE_*` from
   the process environment, and pydantic-settings does not export `.env` values into it. Export the
   keys in your shell or service manager, or tracing silently stays off.

@@ -5,8 +5,11 @@ candidate window and `WHERE client_name = ...` is applied afterwards. A client
 holding a small share of the table can therefore have every candidate filtered
 away and receive an empty result set with HTTP 200.
 
-This test exercises the HNSW path deliberately. The rest of the suite forces
-exact scans, which is why this defect stayed invisible.
+This test exercises the HNSW path deliberately. The suite no longer forces
+exact scans suite-wide, so this test asserts directly, via EXPLAIN, that the
+HNSW index was actually used rather than relying on a session setting -- a
+planner choice of a btree plus a Sort would otherwise pass this test just as
+happily while exercising neither HNSW nor the fix.
 """
 from sqlalchemy import text
 
@@ -58,15 +61,39 @@ def _seed_skewed_corpus(db_session) -> None:
 def test_a_small_client_still_gets_the_full_top_k(db_session):
     """A client holding a fraction of the table must still get top_k rows.
 
-    Index scans are re-enabled here deliberately: the `connection` fixture
-    disables them suite-wide, so without this the HNSW path -- the one production
-    uses -- would not be exercised at all.
+    The suite no longer forces exact scans suite-wide, so this exercises the
+    HNSW path -- the one production uses -- by default. It does not rely on
+    that implicitly: the plan assertion below confirms the HNSW index was
+    actually used, rather than trusting a session setting.
     """
-    db_session.execute(text("SET LOCAL enable_indexscan = on"))
     _seed_skewed_corpus(db_session)
 
     repo = LearningRepository(db_session, client_name="acme")
-    rows = repo.search(fake_embedding("anything at all"), top_k=TOP_K)
+    query_embedding = fake_embedding("anything at all")
+    rows = repo.search(query_embedding, top_k=TOP_K)
+
+    # Pin the plan. A count-only assertion passes just as happily when the
+    # planner picks the btree on (client_name, repo_name, file_path) plus a
+    # Sort, which is an EXACT search with perfect recall -- green while
+    # exercising neither HNSW nor the fix. Projection width and pg_class
+    # statistics both flip this choice, and autovacuum mutates pg_class mid-run,
+    # so the index has to be asserted rather than assumed.
+    vector_literal = "[" + ",".join(repr(c) for c in query_embedding) + "]"
+    plan = "\n".join(
+        row[0]
+        for row in db_session.execute(
+            text(
+                "EXPLAIN SELECT learnings.*, 1 - (embedding <=> "
+                f"'{vector_literal}') AS similarity FROM learnings "
+                "WHERE client_name = 'acme' ORDER BY embedding <=> "
+                f"'{vector_literal}' LIMIT {TOP_K}"
+            )
+        ).all()
+    )
+    assert "learnings_embedding_idx" in plan, (
+        "the search did not use the HNSW index, so this test is not exercising "
+        f"the path production takes and proves nothing about #12. Plan:\n{plan}"
+    )
 
     # Not `== TOP_K`. Spec D3: recall is improved, not guaranteed -- max_scan_tuples
     # bounds the work and HNSW's graph construction is randomized, so roughly one run
@@ -79,3 +106,13 @@ def test_a_small_client_still_gets_the_full_top_k(db_session):
         "was exhausted by other clients' rows before top_k matches were found"
     )
     assert {row[0].client_name for row in rows} == {"acme"}
+
+    # D1 chose strict_order over relaxed_order precisely so rows come back in
+    # exact distance order; relaxed_order can emit them out of order. Nothing
+    # else in the suite tests that on the HNSW path. This is independent of the
+    # recall shortfall above: it checks ordering, not count.
+    similarities = [row[1] for row in rows]
+    assert similarities == sorted(similarities, reverse=True), (
+        "strict_order must return rows in non-increasing similarity, got "
+        f"{similarities}"
+    )

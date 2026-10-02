@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import OperationalError
 
-from app.core.schema_checks import verify_embedding_dimension
+from app.core.schema_checks import verify_embedding_dimension, verify_pgvector_version
 from app.main import app
 
 
@@ -78,6 +78,25 @@ def test_an_unreachable_database_names_the_cause():
     with pytest.raises(RuntimeError, match="database") as excinfo:
         verify_embedding_dimension(_UnreachableEngine())
     assert isinstance(excinfo.value.__cause__, OperationalError)
+
+
+def test_a_supported_pgvector_version_passes():
+    verify_pgvector_version(_StubEngine("0.8.6"))
+
+
+def test_an_old_pgvector_version_raises():
+    with pytest.raises(RuntimeError, match="0.8.0"):
+        verify_pgvector_version(_StubEngine("0.7.4"))
+
+
+def test_a_missing_vector_extension_names_the_remedy():
+    with pytest.raises(RuntimeError, match="alembic upgrade head"):
+        verify_pgvector_version(_StubEngine(None))
+
+
+def test_an_unparseable_pgvector_version_raises():
+    with pytest.raises(RuntimeError, match="0.8.0"):
+        verify_pgvector_version(_StubEngine("not-a-version"))
 
 
 def test_the_application_boots_against_the_migrated_schema(engine, monkeypatch):

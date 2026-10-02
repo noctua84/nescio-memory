@@ -31,25 +31,40 @@ class LearningRepository:
         top_k: int,
         repo_filter: str | None = None,
     ) -> Sequence[Row[Any]]:
-        # Without these, the HNSW index gives up once its first candidate window
-        # is exhausted -- roughly 391 tuples at the default ef_search=40. Because
-        # client_name is applied as a post-filter rather than an index condition,
-        # a client holding a small share of the table can have every candidate
-        # filtered away and receive zero rows with no error.
+        # HNSW is approximate and post-filtered: client_name is applied after the
+        # index produces its candidate window, roughly 391 tuples at the default
+        # ef_search=40. A client holding a small share of the table could have
+        # every candidate filtered away and receive zero rows with no error.
         #
         # iterative_scan makes the index keep searching until it has top_k rows
         # that survive the filter. strict_order rather than relaxed_order: the
         # latter may emit rows out of distance order, which with LIMIT can return
-        # a row outside the true top_k while cutting a closer one.
+        # a row outside the true top_k while cutting a closer one. Measured recall
+        # was identical between the two modes, so the ordering guarantee is free.
         #
-        # set_config(..., true) is SET LOCAL -- scoped to this transaction, so it
-        # cannot leak onto a pooled connection. max_scan_tuples bounds the work,
-        # which means recall is much improved but still not guaranteed for a
-        # client holding a very small share of a very large table.
+        # ef_search is left at its default deliberately. Measured on a 10-of-8010
+        # corpus, iterative_scan at ef_search=40 recovered the full top_k on 20 of
+        # 20 query vectors -- the same as ef_search=200, at about half the buffers.
+        # A wider first window is redundant with iterative_scan and would charge
+        # every search, including the majority whose recall was never at risk.
+        #
+        # set_config(..., true) is SET LOCAL, scoped to this transaction, so it
+        # cannot leak onto a pooled connection. That scoping relies on the Session
+        # having begun a transaction, which SessionLocal(autocommit=False)
+        # guarantees by autobegin; with no transaction open, set_config would
+        # apply only to its own statement and the search would silently see the
+        # defaults again.
+        #
+        # max_scan_tuples is a safety cap so a pathological query cannot scan the
+        # whole table. It is NOT what limits recall in practice: the scan was
+        # measured stopping at ~4,786 of 8,010 tuples under every value tried,
+        # including 1,000,000, because what ends it is HNSW graph reachability.
+        # Raising this will not lengthen a short result set. REINDEX, a higher
+        # m/ef_construction, or a partial index that makes client_name an
+        # Index Cond: rather than a Filter: would.
         self.db.execute(
             text(
                 "SELECT set_config('hnsw.iterative_scan', 'strict_order', true),"
-                "       set_config('hnsw.ef_search', '200', true),"
                 "       set_config('hnsw.max_scan_tuples', '100000', true)"
             )
         )
