@@ -7,6 +7,7 @@ NOT NULL constraint, so only a real database can verify it.
 
 See docs/superpowers/specs/2026-09-26-test-infrastructure-design.md.
 """
+import logging
 import os
 from pathlib import Path
 
@@ -190,3 +191,38 @@ def client(db_session, monkeypatch):
     # into the next one, which then fails somewhere that points at the wrong
     # test.
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def app_caplog(caplog):
+    """`caplog`, but guaranteed to see records from the "app" logger hierarchy.
+
+    app/core/logging_config.py sets `logging.getLogger("app").propagate =
+    False` on purpose (so app log lines aren't printed twice when something
+    else -- alembic's fileConfig, a process manager -- configures the root
+    logger). caplog's own capturing handler is attached to the root logger,
+    so with propagate=False it would normally never see "app.*" records at
+    all.
+
+    pytest >= 9.1.0 works around exactly this: it detects non-propagating
+    loggers and auto-attaches its capture handler to them directly (verified
+    by reading pytest's _pytest/logging.py source for 9.1.1, the version
+    this project locks). pytest 8.x and 9.0.x do NOT do this. This project's
+    pyproject.toml only requires `pytest>=8.0`, so relying on the 9.1+
+    behaviour implicitly would make these tests fail on an older-but-allowed
+    pytest.
+
+    This fixture makes the dependency explicit and safe either way: it adds
+    caplog's handler to the "app" logger itself, but only if pytest hasn't
+    already done so (avoiding duplicate records on 9.1+, where adding it a
+    second time would cause every record to be captured twice).
+    """
+    app_logger = logging.getLogger("app")
+    added = caplog.handler not in app_logger.handlers
+    if added:
+        app_logger.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        if added:
+            app_logger.removeHandler(caplog.handler)

@@ -13,7 +13,6 @@ from sqlalchemy.orm import Session
 
 from app.api.v1 import ingest as ingest_module
 from app.api.v1 import search as search_module
-from app.core import errors as errors_module
 from app.core.db import get_db
 from app.core.errors import (
     QUERY_TIMEOUT_DETAIL,
@@ -187,7 +186,7 @@ def test_database_failure_returns_503(db_session, monkeypatch):
 
 
 def test_a_search_that_exceeds_its_statement_timeout_returns_503_with_no_retry_after(
-    client, db_session, monkeypatch, caplog
+    client, db_session, monkeypatch, app_caplog
 ):
     # This must arise from the search path itself (not a fake session that
     # fails on every execute, which would raise during auth and never reach
@@ -207,16 +206,7 @@ def test_a_search_that_exceeds_its_statement_timeout_returns_503_with_no_retry_a
 
     monkeypatch.setattr(LearningRepository, "search", _timed_out)
 
-    # The session-scoped `engine` fixture runs Alembic migrations, and
-    # alembic/env.py calls logging.config.fileConfig(), which (default
-    # disable_existing_loggers=True) disables every logger that already
-    # existed and isn't named in alembic.ini -- including this module's
-    # logger, created at import time when conftest imports app.main. That is
-    # an artifact of test wiring, not of the application, so it is undone
-    # here rather than by changing app/ or alembic.ini.
-    monkeypatch.setattr(errors_module.logger, "disabled", False)
-
-    with caplog.at_level(logging.WARNING, logger="app.core.errors"):
+    with app_caplog.at_level(logging.WARNING, logger="app.core.errors"):
         response = client.post(
             "/api/v1/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": key}
         )
@@ -227,7 +217,7 @@ def test_a_search_that_exceeds_its_statement_timeout_returns_503_with_no_retry_a
     # The warning is the only operator-facing signal of HNSW/timeout
     # starvation, so it must actually be emitted, mention the sqlstate, and
     # name the request path it happened on.
-    messages = [record.getMessage() for record in caplog.records]
+    messages = [record.getMessage() for record in app_caplog.records]
     assert any("57014" in message for message in messages)
     assert any("/api/v1/search" in message for message in messages)
 
