@@ -1,7 +1,7 @@
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import field_validator, model_validator
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -44,16 +44,6 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
-
-    # SQLAlchemy 2.1 changed the default PostgreSQL driver for a bare
-    # postgresql:// URL to psycopg 3, but this project ships psycopg2; an
-    # explicit driver in the URL is respected, so rewrite the bare scheme once.
-    @field_validator("database_url", mode="before")
-    @classmethod
-    def _normalize_database_url_scheme(cls, v: str) -> str:
-        if isinstance(v, str) and v.startswith("postgresql://"):
-            return v.replace("postgresql://", "postgresql+psycopg2://", 1)
-        return v
 
     # Failing here rather than only in chunk_text() means a bad .env crash-loops
     # the pod at startup instead of returning a 500 on every ingest request.

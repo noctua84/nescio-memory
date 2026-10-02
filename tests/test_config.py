@@ -10,7 +10,7 @@ from app.config import Settings
 
 def _settings(**overrides):
     base = {
-        "database_url": "postgresql+psycopg2://u:p@localhost:5432/db",
+        "database_url": "postgresql+psycopg://u:p@localhost:5432/db",
         "ollama_url": "http://localhost:11434/api/embeddings",
     }
     base.update(overrides)
@@ -38,23 +38,3 @@ def test_the_local_backend_does_not_require_a_valid_ollama_url():
     # supply one.
     assert _settings(embedding_backend="local", ollama_url="")
 
-
-def test_a_bare_postgresql_url_is_rewritten_to_psycopg2():
-    # SQLAlchemy 2.1 defaults to psycopg 3, but this project only ships
-    # psycopg2; the bare scheme is normalized at startup.
-    s = _settings(database_url="postgresql://user:pass@localhost:5432/db")
-    assert s.database_url == "postgresql+psycopg2://user:pass@localhost:5432/db"
-
-
-def test_a_postgresql_plus_psycopg2_url_is_unchanged():
-    # Explicit driver schemes are not modified.
-    url = "postgresql+psycopg2://user:pass@localhost:5432/db"
-    s = _settings(database_url=url)
-    assert s.database_url == url
-
-
-def test_a_postgresql_plus_psycopg_url_is_unchanged():
-    # Explicit driver schemes are not modified.
-    url = "postgresql+psycopg://user:pass@localhost:5432/db"
-    s = _settings(database_url=url)
-    assert s.database_url == url

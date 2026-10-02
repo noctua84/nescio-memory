@@ -29,7 +29,7 @@ def verify_embedding_dimension(engine: Engine) -> None:
     except OperationalError as exc:
         # Without this, an unreachable host surfaces as a raw SQLAlchemy
         # traceback at boot. The operator needs the database named as the
-        # cause, not a stack trace through psycopg2.
+        # cause, not a stack trace through psycopg.
         raise RuntimeError(
             "Could not connect to the database. Check DATABASE_URL and that "
             "the database is reachable."
