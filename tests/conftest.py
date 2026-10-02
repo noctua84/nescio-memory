@@ -73,11 +73,11 @@ ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 @pytest.fixture(scope="session")
 def pg_container():
     """One container for the whole run. Readiness is handled internally by
-    testcontainers, which polls with psql until the server answers."""
-    # testcontainers defaults get_connection_url() to the older psycopg
-    # (v2-style) driver name; the project now runs on psycopg 3, so this must
-    # be explicit or the resulting URL would pull in a driver we no longer
-    # depend on.
+    testcontainers, which polls with psql until the server answers.
+
+    PostgresContainer defaults to a psycopg2 connection URL; this project uses
+    psycopg 3, so the driver is pinned explicitly.
+    """
     with PostgresContainer(PGVECTOR_IMAGE, driver="psycopg") as container:
         yield container
 

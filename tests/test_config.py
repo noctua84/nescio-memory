@@ -37,3 +37,4 @@ def test_the_local_backend_does_not_require_a_valid_ollama_url():
     # The local backend never reads ollama_url, so it must not be forced to
     # supply one.
     assert _settings(embedding_backend="local", ollama_url="")
+
