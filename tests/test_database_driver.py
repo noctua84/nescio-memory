@@ -11,7 +11,6 @@ The test does not connect: create_engine() imports the DBAPI module, which fails
 if the driver is not installed. This is the same failure surface as issue #16.
 """
 from pathlib import Path
-import re
 
 import pytest
 import sqlalchemy
