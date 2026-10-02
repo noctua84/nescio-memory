@@ -6,6 +6,7 @@ from app.api.v1.router import api_router
 from app.config import settings
 from app.core.db import engine
 from app.core.errors import register_exception_handlers
+from app.core.logging_config import configure_logging
 from app.core.schema_checks import verify_embedding_dimension, verify_pgvector_version
 from app.helper import get_app_version
 
@@ -22,6 +23,12 @@ async def lifespan(_: FastAPI):
 
 
 def create_app() -> FastAPI:
+    # Configure logging here rather than in lifespan: lifespan never runs in
+    # tests that use TestClient without a context manager, and startup-time
+    # log lines (and verify_*'s own logging, if any) need the handler in
+    # place before they fire.
+    configure_logging(settings.log_level)
+
     app = FastAPI(
         title=settings.app_name,
         description="NescioAI semantic memory core.",

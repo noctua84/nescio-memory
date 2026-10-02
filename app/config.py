@@ -1,8 +1,10 @@
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 class Settings(BaseSettings):
     # Database
@@ -31,7 +33,11 @@ class Settings(BaseSettings):
 
     # app
     app_name: str = "Nescio Semantic Memory API"
-    log_level: str = "INFO"
+    # A typo'd level (e.g. "WARN", "verbose") should crash at startup rather
+    # than silently log at a surprising level. "WARN" is rejected on purpose:
+    # it's a stdlib alias for WARNING, but we keep exactly one accepted
+    # spelling to avoid ambiguity in config and docs.
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     # chunks
     chunk_size: int = 1000
@@ -48,6 +54,24 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    # Normalize case before pydantic's Literal check runs, so "info"/"Info"
+    # work from the environment (env vars arrive as plain strings, case and
+    # all). Pydantic's own Literal error names the field "log_level" in
+    # lower case, which wouldn't satisfy tooling/tests that grep for the
+    # ENV VAR name, so an invalid value is rejected here instead with a
+    # message naming LOG_LEVEL explicitly.
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _log_level_case_insensitive(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip().upper()
+        if value not in _VALID_LOG_LEVELS:
+            raise ValueError(
+                f"LOG_LEVEL must be one of {', '.join(_VALID_LOG_LEVELS)}, "
+                f"got {value!r}"
+            )
+        return value
 
     # Failing here rather than only in chunk_text() means a bad .env crash-loops
     # the pod at startup instead of returning a 500 on every ingest request.

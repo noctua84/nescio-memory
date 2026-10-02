@@ -53,3 +53,28 @@ def test_a_non_positive_statement_timeout_fails_at_startup(non_positive):
 
 def test_a_positive_statement_timeout_is_accepted():
     assert _settings(statement_timeout_ms=1234).statement_timeout_ms == 1234
+
+
+def test_log_level_defaults_to_info():
+    assert _settings().log_level == "INFO"
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [("info", "INFO"), (" Debug ", "DEBUG")],
+)
+def test_log_level_is_normalized_case_and_whitespace_insensitively(raw, expected):
+    # Env vars arrive as plain strings, case and all; a developer typing
+    # "info" or pasting " Debug " into .env should not crash at startup.
+    assert _settings(log_level=raw).log_level == expected
+
+
+@pytest.mark.parametrize("bad_level", ["WARN", "verbose", "trace", ""])
+def test_an_invalid_log_level_fails_at_startup(bad_level):
+    # "WARN" is the stdlib alias for WARNING and is deliberately rejected: we
+    # keep exactly one accepted spelling to avoid ambiguity in config and
+    # docs. Pydantic's own Literal error names the field "log_level" in lower
+    # case, so the before-validator must raise its own ValueError naming
+    # LOG_LEVEL explicitly for this match to be meaningful.
+    with pytest.raises(ValueError, match="LOG_LEVEL"):
+        _settings(log_level=bad_level)
