@@ -4,7 +4,7 @@ from fastapi import FastAPI
 
 from app.api.v1.router import api_router
 from app.config import settings
-from app.core.db import engine
+from app.core.db import get_engine
 from app.core.errors import register_exception_handlers
 from app.core.schema_checks import verify_embedding_dimension, verify_pgvector_version
 from app.helper import get_app_version
@@ -16,6 +16,7 @@ __version__ = get_app_version()
 async def lifespan(_: FastAPI):
     # Startup only. Deliberately not in create_app(): tests import this module
     # before any database exists, and a query there would fail collection.
+    engine = get_engine()
     verify_pgvector_version(engine)
     verify_embedding_dimension(engine)
     yield
