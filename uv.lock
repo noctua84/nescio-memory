@@ -743,7 +743,7 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.32" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "sentence-transformers", marker = "extra == 'local-embeddings'", specifier = "==6.1.0" },
-    { name = "sqlalchemy", specifier = ">=2.0.54" },
+    { name = "sqlalchemy", specifier = ">=2.1.0" },
     { name = "uvicorn", specifier = "==0.53.0" },
 ]
 provides-extras = ["local-embeddings"]

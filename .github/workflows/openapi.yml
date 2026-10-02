@@ -46,7 +46,7 @@ jobs:
       # so a bare `python` would resolve to the setup-python interpreter.
       - name: Generate OpenAPI spec from code
         env:
-          DATABASE_URL: postgresql://dummy:dummy@localhost:5432/dummy
+          DATABASE_URL: postgresql+psycopg://dummy:dummy@localhost:5432/dummy
           OLLAMA_URL: http://localhost:11434/api/embeddings
         run: uv run --locked python export_openapi.py
 
