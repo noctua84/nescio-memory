@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.4.0](https://github.com/noctua84/nescio-memory/compare/v0.3.1...v0.4.0) (2026-10-02)
+
+
+### Features
+
+* [impl] cap search with a configurable statement_timeout ([#17](https://github.com/noctua84/nescio-memory/issues/17)) ([f1c4c92](https://github.com/noctua84/nescio-memory/commit/f1c4c92df63e431a80dfe325d4438f4c036944f1))
+* cap search with a configurable statement_timeout ([#17](https://github.com/noctua84/nescio-memory/issues/17)) ([2933378](https://github.com/noctua84/nescio-memory/commit/29333786fbd34cb1e58b22099e7ed1797157abfe))
+
+
+### Bug Fixes
+
+* [fix] accurate timeout warning and a search-path timeout test ([#17](https://github.com/noctua84/nescio-memory/issues/17)) ([1c0a632](https://github.com/noctua84/nescio-memory/commit/1c0a6326e794454001423246458377d3808a0d22))
+* [fix] close stabilization items 2-7 ([802e385](https://github.com/noctua84/nescio-memory/commit/802e385fcf1858994d71edaab3e0ac7eecd1bca5))
+* [fix] define HTTP behaviour when Ollama or PostgreSQL fail ([b827d63](https://github.com/noctua84/nescio-memory/commit/b827d6345aedf11e046ff22325528ff55cc8ed96))
+* [fix] detect statement timeouts via psycopg 3 after the driver switch ([#17](https://github.com/noctua84/nescio-memory/issues/17)) ([047ec64](https://github.com/noctua84/nescio-memory/commit/047ec64b652e2493b611cf7a384ed6f509b70cc6))
+* [fix] pin bare postgresql:// DATABASE_URL to psycopg2 for SQLAlchemy 2.1 ([f1cecb6](https://github.com/noctua84/nescio-memory/commit/f1cecb6aa6188765d39b371834e2127b767e7a39))
+* [fix] stop HNSW post-filter starvation in /api/v1/search ([#15](https://github.com/noctua84/nescio-memory/issues/15)) ([d4eddd6](https://github.com/noctua84/nescio-memory/commit/d4eddd6bd7f93a9591fc70cb2da94fe97893648d))
+* [fix] switch PostgreSQL driver to psycopg 3 for SQLAlchemy 2.1 ([9ae8709](https://github.com/noctua84/nescio-memory/commit/9ae87091f9e3fc2aabcafa83cb3157d556ce1ea3))
+* [fix] switch PostgreSQL driver to psycopg 3 for SQLAlchemy 2.1 ([5d5b601](https://github.com/noctua84/nescio-memory/commit/5d5b6011739030f70b1ca3585ccb9c2fb42540e3))
+* [impl] switch PostgreSQL driver to psycopg 3 ([c6843ab](https://github.com/noctua84/nescio-memory/commit/c6843abe1dc52d7dcb0097a5a0cde7429e272e15)), closes [#16](https://github.com/noctua84/nescio-memory/issues/16)
+* fail loudly when search's HNSW settings do not take effect ([#22](https://github.com/noctua84/nescio-memory/issues/22)) ([20783d2](https://github.com/noctua84/nescio-memory/commit/20783d2b6251476daeab295467394021b3cff080))
+* guard psycopg 3 driver resolution with a regression test ([6f0bc2c](https://github.com/noctua84/nescio-memory/commit/6f0bc2c411860e268040153050871dfb87c09875))
+
+
+### Documentation
+
+* [chore] namespace plan scratch files per plan and ignore .superpowers/ ([0cf7653](https://github.com/noctua84/nescio-memory/commit/0cf76530596334e4d6ce83c006cc763cc357c9a9)), closes [#21](https://github.com/noctua84/nescio-memory/issues/21)
+* [docs] QA audit report for the statement_timeout change ([#17](https://github.com/noctua84/nescio-memory/issues/17)) ([0b0a225](https://github.com/noctua84/nescio-memory/commit/0b0a22560b21a8649af41063b8a95c85be95232d))
+* namespace plan scratch files per plan and ignore .superpowers/ ([1ec000b](https://github.com/noctua84/nescio-memory/commit/1ec000beded708103b8fea286c8c38824c1c3147))
+
 ## [0.3.1](https://github.com/noctua84/nescio-memory/compare/v0.3.0...v0.3.1) (2026-09-28)
 
 
