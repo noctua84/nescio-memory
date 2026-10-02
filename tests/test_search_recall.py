@@ -9,6 +9,10 @@ This test exercises the HNSW path deliberately. The `connection` fixture forces
 exact scans suite-wide so that ordering assertions elsewhere are deterministic,
 so this test re-enables index scans for itself and then asserts the HNSW index is
 genuinely used -- otherwise it would silently prove nothing.
+
+The control assertion at the end of test_a_small_client_still_gets_the_full_top_k
+verifies that the corpus still reproduces the HNSW starvation defect on the
+current machine, ensuring the test meaningfully guards fix #12.
 """
 from sqlalchemy import text
 
@@ -19,8 +23,10 @@ from tests.fakes import fake_embedding
 
 # BULK_ROWS is tuned so starvation is total on unfixed code: at this skew the
 # unfixed query returned 0-1 rows of 10 across 20 query vectors. 4,000 did NOT
-# reproduce the defect on the machine this was developed on, so if this test ever
-# passes BEFORE the fix, re-tune it rather than trusting it.
+# reproduce the defect on the machine this was developed on. The control assertion
+# at the end of test_a_small_client_still_gets_the_full_top_k enforces that this
+# corpus still reproduces the defect on the current machine; if that assertion ever
+# fails, raise BULK_ROWS and re-measure.
 #
 # SMALL_ROWS is deliberately LARGER than TOP_K. When it equalled TOP_K the query had
 # to retrieve every row the client owns -- the hardest task the corpus can pose,
@@ -31,6 +37,12 @@ from tests.fakes import fake_embedding
 BULK_ROWS = 8_000
 SMALL_ROWS = 40
 TOP_K = 10
+
+# STARVATION_CEILING is the maximum number of rows the unfixed query can return
+# for the control assertion. It's TOP_K // 2, leaving a margin to warn before the
+# corpus drifts to the point of no longer reproducing the defect at all. Measured
+# 0-1 of 10 at 8,000 rows.
+STARVATION_CEILING = TOP_K // 2
 
 
 def _seed_skewed_corpus(db_session) -> None:
@@ -71,6 +83,9 @@ def test_a_small_client_still_gets_the_full_top_k(db_session):
     The `connection` fixture forces exact scans suite-wide for determinism; this
     test opts back in to the HNSW path -- the one production uses -- and the plan
     assertion below verifies that opt-in actually took effect.
+
+    The control assertion at the end verifies the corpus still starves the unfixed
+    query, ensuring this test meaningfully guards fix #12.
     """
     # The connection fixture forces exact scans suite-wide for determinism. Opt back
     # in here: without this the HNSW path -- the one production takes -- would not be
@@ -90,16 +105,18 @@ def test_a_small_client_still_gets_the_full_top_k(db_session):
     # statistics both flip this choice, and autovacuum mutates pg_class mid-run,
     # so the index has to be asserted rather than assumed.
     vector_literal = "[" + ",".join(repr(c) for c in query_embedding) + "]"
+
+    # Factor out the query for reuse in both EXPLAIN and the control assertion.
+    search_query = (
+        "SELECT learnings.*, 1 - (embedding <=> "
+        f"'{vector_literal}') AS similarity FROM learnings "
+        "WHERE client_name = 'acme' ORDER BY embedding <=> "
+        f"'{vector_literal}' LIMIT {TOP_K}"
+    )
+
     plan = "\n".join(
         row[0]
-        for row in db_session.execute(
-            text(
-                "EXPLAIN SELECT learnings.*, 1 - (embedding <=> "
-                f"'{vector_literal}') AS similarity FROM learnings "
-                "WHERE client_name = 'acme' ORDER BY embedding <=> "
-                f"'{vector_literal}' LIMIT {TOP_K}"
-            )
-        ).all()
+        for row in db_session.execute(text(f"EXPLAIN {search_query}")).all()
     )
     assert "learnings_embedding_idx" in plan, (
         "the search did not use the HNSW index, so this test is not exercising "
@@ -127,4 +144,18 @@ def test_a_small_client_still_gets_the_full_top_k(db_session):
     assert similarities == sorted(similarities, reverse=True), (
         "strict_order must return rows in non-increasing similarity, got "
         f"{similarities}"
+    )
+
+    # Control assertion: verify the corpus still starves the unfixed HNSW query.
+    # Disable iterative_scan to simulate the pre-#12 behaviour. If this assertion
+    # fails, the corpus no longer reproduces the defect on this host -- raise BULK_ROWS
+    # and re-measure.
+    db_session.execute(text("SET LOCAL hnsw.iterative_scan = 'off'"))
+    control_rows = db_session.execute(text(search_query)).all()
+
+    assert len(control_rows) <= STARVATION_CEILING, (
+        f"with iterative_scan='off' (the pre-#12 behaviour) the query returned "
+        f"{len(control_rows)} of {TOP_K}, so BULK_ROWS={BULK_ROWS} no longer "
+        f"starves the HNSW window on this host and this test no longer guards #12 -- "
+        f"raise BULK_ROWS and re-measure (see issue #19)"
     )
