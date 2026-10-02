@@ -3,6 +3,9 @@
 These go through the real routes, so they verify the wiring in create_app() as
 well as the mapping itself.
 """
+import logging
+
+import psycopg2.errors
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
@@ -10,8 +13,10 @@ from sqlalchemy.orm import Session
 
 from app.api.v1 import ingest as ingest_module
 from app.api.v1 import search as search_module
+from app.core import errors as errors_module
 from app.core.db import get_db
 from app.core.errors import (
+    QUERY_TIMEOUT_DETAIL,
     RETRY_AFTER_SECONDS,
     EmbeddingBackendBadResponse,
     EmbeddingBackendError,
@@ -177,6 +182,61 @@ def test_database_failure_returns_503(db_session, monkeypatch):
     assert response.status_code == 503
     assert response.json() == {"detail": "Database unavailable"}
     assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)
+
+
+def test_a_canceled_search_statement_returns_503_with_no_retry_after(
+    db_session, monkeypatch, caplog
+):
+    # Only LearningRepository.search ever sets a statement_timeout, so a
+    # QueryCanceled here is a deterministic "this query was too expensive"
+    # outcome for the same input, not a transient outage -- the handler must
+    # map it distinctly from the generic OperationalError branch below, which
+    # still promises a retry.
+    from fastapi.testclient import TestClient
+
+    from tests.fakes import fake_embedding
+
+    monkeypatch.setattr(search_module, "get_embedding", fake_embedding)
+
+    # The session-scoped `engine` fixture runs Alembic migrations, and
+    # alembic/env.py calls logging.config.fileConfig(), which (default
+    # disable_existing_loggers=True) disables every logger that already
+    # existed and isn't named in alembic.ini -- including this module's
+    # logger, created at import time when conftest imports app.main. That is
+    # an artifact of test wiring, not of the application, so it is undone
+    # here rather than by changing app/ or alembic.ini.
+    monkeypatch.setattr(errors_module.logger, "disabled", False)
+
+    class _TimingOutSession:
+        def execute(self, *args, **kwargs):
+            raise OperationalError(
+                "SELECT ...",
+                {},
+                psycopg2.errors.QueryCanceled(
+                    "canceling statement due to statement timeout"
+                ),
+            )
+
+        def close(self):
+            pass
+
+    app.dependency_overrides[get_db] = lambda: _TimingOutSession()
+    try:
+        with caplog.at_level(logging.WARNING, logger="app.core.errors"):
+            response = TestClient(app).post(
+                "/api/v1/search",
+                json=SEARCH_PAYLOAD,
+                headers={"X-API-Key": "nm_irrelevant"},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": QUERY_TIMEOUT_DETAIL}
+    assert "Retry-After" not in response.headers
+    # The warning is the only operator-facing signal of HNSW/timeout
+    # starvation, so it must actually be emitted and mention the sqlstate.
+    assert any("57014" in record.getMessage() for record in caplog.records)
 
 
 def test_health_is_unaffected(client):
