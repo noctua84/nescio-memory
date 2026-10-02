@@ -42,6 +42,7 @@ TOP_K = 10
 
 
 def _seed_skewed_corpus(db_session) -> None:
+    """Seed the skewed corpus, bulk-rebuilding learnings_embedding_idx and pinning the planner onto it."""
     # Drop the HNSW index before inserting and rebuild it once afterwards,
     # instead of letting pgvector grow it incrementally one row at a time.
     # Incremental insertion of 8,000 vectors measured ~17s server-side; a bulk
@@ -109,6 +110,19 @@ def _seed_skewed_corpus(db_session) -> None:
     # storage params. This is the ~1.1s bulk build that replaces the ~17s of
     # incremental per-row insertion above.
     db_session.execute(text(indexdef))
+    # Rebuilding the index (just above) also refreshes pg_class's row estimate for the
+    # learnings table (CREATE INDEX updates reltuples), and measured
+    # behaviour was that this alone made the planner abandon HNSW for an exact
+    # Index Scan + Sort on the (client_name, repo_name, file_path) btree. That
+    # plan has perfect recall by construction, so the unfixed query -- no
+    # set_config, no iterative_scan -- passed under it: the test would still go
+    # green but would be proving nothing about #12. Disabling sort, bitmap and
+    # seqscan plans forces the planner back onto the HNSW index scan that
+    # production actually takes; the EXPLAIN assertion below is what confirms
+    # that forcing worked rather than just trusting it.
+    db_session.execute(text("SET LOCAL enable_sort = off"))
+    db_session.execute(text("SET LOCAL enable_bitmapscan = off"))
+    db_session.execute(text("SET LOCAL enable_seqscan = off"))
 
 
 def test_a_small_client_still_gets_the_full_top_k(db_session):
@@ -125,19 +139,6 @@ def test_a_small_client_still_gets_the_full_top_k(db_session):
     db_session.execute(text("SET LOCAL enable_indexscan = on"))
     _seed_skewed_corpus(db_session)
 
-    # Rebuilding the index (above) also refreshes pg_class's row estimate for the
-    # learnings table (CREATE INDEX updates reltuples), and measured
-    # behaviour was that this alone made the planner abandon HNSW for an exact
-    # Index Scan + Sort on the (client_name, repo_name, file_path) btree. That
-    # plan has perfect recall by construction, so the unfixed query -- no
-    # set_config, no iterative_scan -- passed under it: the test would still go
-    # green but would be proving nothing about #12. Disabling sort, bitmap and
-    # seqscan plans forces the planner back onto the HNSW index scan that
-    # production actually takes; the EXPLAIN assertion below is what confirms
-    # that forcing worked rather than just trusting it.
-    db_session.execute(text("SET LOCAL enable_sort = off"))
-    db_session.execute(text("SET LOCAL enable_bitmapscan = off"))
-    db_session.execute(text("SET LOCAL enable_seqscan = off"))
 
     repo = LearningRepository(db_session, client_name="acme")
     query_embedding = fake_embedding("anything at all")
