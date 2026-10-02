@@ -3,6 +3,9 @@
 These go through the real routes, so they verify the wiring in create_app() as
 well as the mapping itself.
 """
+import logging
+
+import psycopg.errors
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
@@ -10,8 +13,10 @@ from sqlalchemy.orm import Session
 
 from app.api.v1 import ingest as ingest_module
 from app.api.v1 import search as search_module
+from app.core import errors as errors_module
 from app.core.db import get_db
 from app.core.errors import (
+    QUERY_TIMEOUT_DETAIL,
     RETRY_AFTER_SECONDS,
     EmbeddingBackendBadResponse,
     EmbeddingBackendError,
@@ -19,7 +24,9 @@ from app.core.errors import (
 )
 from app.main import app
 from app.models.learning import Learning
+from app.repositories.learning import LearningRepository
 from tests.factories import make_api_key, make_learning
+from tests.fakes import fake_embedding
 
 LONG_ENOUGH = (
     "This content comfortably exceeds the fifty character minimum that the "
@@ -177,6 +184,52 @@ def test_database_failure_returns_503(db_session, monkeypatch):
     assert response.status_code == 503
     assert response.json() == {"detail": "Database unavailable"}
     assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)
+
+
+def test_a_search_that_exceeds_its_statement_timeout_returns_503_with_no_retry_after(
+    client, db_session, monkeypatch, caplog
+):
+    # This must arise from the search path itself (not a fake session that
+    # fails on every execute, which would raise during auth and never reach
+    # LearningRepository.search) -- the handler must map it distinctly from
+    # the generic OperationalError branch above, which still promises a retry.
+    key = make_api_key(db_session, "acme")
+    monkeypatch.setattr(search_module, "get_embedding", fake_embedding)
+
+    def _timed_out(self, *args, **kwargs):
+        raise OperationalError(
+            "SELECT ...",
+            {},
+            psycopg.errors.QueryCanceled(
+                "canceling statement due to statement timeout"
+            ),
+        )
+
+    monkeypatch.setattr(LearningRepository, "search", _timed_out)
+
+    # The session-scoped `engine` fixture runs Alembic migrations, and
+    # alembic/env.py calls logging.config.fileConfig(), which (default
+    # disable_existing_loggers=True) disables every logger that already
+    # existed and isn't named in alembic.ini -- including this module's
+    # logger, created at import time when conftest imports app.main. That is
+    # an artifact of test wiring, not of the application, so it is undone
+    # here rather than by changing app/ or alembic.ini.
+    monkeypatch.setattr(errors_module.logger, "disabled", False)
+
+    with caplog.at_level(logging.WARNING, logger="app.core.errors"):
+        response = client.post(
+            "/api/v1/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": key}
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": QUERY_TIMEOUT_DETAIL}
+    assert "Retry-After" not in response.headers
+    # The warning is the only operator-facing signal of HNSW/timeout
+    # starvation, so it must actually be emitted, mention the sqlstate, and
+    # name the request path it happened on.
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("57014" in message for message in messages)
+    assert any("/api/v1/search" in message for message in messages)
 
 
 def test_health_is_unaffected(client):

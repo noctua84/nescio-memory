@@ -8,15 +8,29 @@ detail crosses a layer boundary.
 Each exception carries its own mapping as class attributes, so adding a case
 means adding a class rather than extending a dispatch table.
 """
+import logging
+
+# The isinstance check below is deliberately driver-specific: SQLAlchemy
+# exposes no portable "query canceled" type, so there is no
+# abstraction-preserving way to detect this. If the driver ever changes
+# again, this check silently stops matching, timeouts revert to the generic
+# 503+Retry-After branch, and the 57014 tests below (test_error_responses.py,
+# test_statement_timeout.py) start failing -- update it then.
+import psycopg.errors
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import OperationalError
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # A dependency that is down is usually down for longer than one request, so this
 # is a hint to back off rather than a promise about recovery.
 RETRY_AFTER_SECONDS = 30
 
 DATABASE_UNAVAILABLE_DETAIL = "Database unavailable"
+QUERY_TIMEOUT_DETAIL = "Query exceeded time limit"
 
 
 class EmbeddingBackendError(RuntimeError):
@@ -50,11 +64,12 @@ class EmbeddingBackendMisconfigured(EmbeddingBackendError):
     retry_after = False
 
 
-def _service_unavailable(detail: str) -> JSONResponse:
+def _service_unavailable(detail: str, retry: bool = True) -> JSONResponse:
+    headers = {"Retry-After": str(RETRY_AFTER_SECONDS)} if retry else None
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"detail": detail},
-        headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+        headers=headers,
     )
 
 
@@ -83,4 +98,24 @@ def register_exception_handlers(app: FastAPI) -> None:
         # SQLAlchemy is already the abstraction over the database, so handling its
         # exception directly is correct rather than leaky. OperationalError is the
         # connectivity family; programming errors are bugs and stay 500s.
+        #
+        # QueryCanceled (SQLSTATE 57014) is a special case within that family.
+        # Only the search transaction ever sets a statement_timeout (see
+        # LearningRepository.search), so in practice 57014 here is almost
+        # always that timeout firing -- a deterministic outcome for the same
+        # input, not a transient outage. But 57014 is not exclusively a
+        # statement_timeout: an admin's pg_cancel_backend() or a role-level
+        # statement_timeout would raise the identical SQLSTATE, and the
+        # response mapping deliberately treats all of these alike (accepted
+        # decision), so the log below must not claim a cause it cannot know
+        # and states only what is actually known: where and what the
+        # configured limit is.
+        if isinstance(exc.orig, psycopg.errors.QueryCanceled):
+            logger.warning(
+                "Statement canceled (SQLSTATE 57014) on %s; search "
+                "statement_timeout is %d ms",
+                request.url.path,
+                settings.statement_timeout_ms,
+            )
+            return _service_unavailable(QUERY_TIMEOUT_DETAIL, retry=False)
         return _service_unavailable(DATABASE_UNAVAILABLE_DETAIL)

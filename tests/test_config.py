@@ -38,3 +38,18 @@ def test_the_local_backend_does_not_require_a_valid_ollama_url():
     # supply one.
     assert _settings(embedding_backend="local", ollama_url="")
 
+
+def test_statement_timeout_ms_defaults_to_5000():
+    assert _settings().statement_timeout_ms == 5000
+
+
+@pytest.mark.parametrize("non_positive", [0, -1, -5000])
+def test_a_non_positive_statement_timeout_fails_at_startup(non_positive):
+    # 0 would disable the timeout in Postgres and a negative value is rejected
+    # by set_config; both would silently remove the cap issue #17 added.
+    with pytest.raises(ValueError, match="STATEMENT_TIMEOUT_MS"):
+        _settings(statement_timeout_ms=non_positive)
+
+
+def test_a_positive_statement_timeout_is_accepted():
+    assert _settings(statement_timeout_ms=1234).statement_timeout_ms == 1234
