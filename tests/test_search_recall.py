@@ -149,7 +149,7 @@ def test_a_small_client_still_gets_the_full_top_k(db_session):
     # Control assertion: verify the corpus still starves the unfixed HNSW query.
     # Disable iterative_scan to simulate the pre-#12 behaviour. If this assertion
     # fails, the corpus no longer reproduces the defect on this host -- raise BULK_ROWS
-    # and re-measure, otherwise the issue is already fixed at a different level.
+    # and re-measure.
     db_session.execute(text("SET LOCAL hnsw.iterative_scan = 'off'"))
     control_rows = db_session.execute(text(search_query)).all()
 
