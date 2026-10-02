@@ -73,7 +73,7 @@ def test_a_missing_table_names_the_remedy():
 
 def test_an_unreachable_database_names_the_cause():
     # A connection refused (or timed out) at boot must not surface as a raw
-    # SQLAlchemy/psycopg2 traceback -- the operator needs the database named
+    # SQLAlchemy/psycopg traceback -- the operator needs the database named
     # as the cause, and the original error preserved via `from exc`.
     with pytest.raises(RuntimeError, match="database") as excinfo:
         verify_embedding_dimension(_UnreachableEngine())
