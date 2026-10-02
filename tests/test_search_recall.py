@@ -9,6 +9,14 @@ This test exercises the HNSW path deliberately. The `connection` fixture forces
 exact scans suite-wide so that ordering assertions elsewhere are deterministic,
 so this test re-enables index scans for itself and then asserts the HNSW index is
 genuinely used -- otherwise it would silently prove nothing.
+
+Seeding rebuilds the HNSW index from scratch instead of letting it grow
+incrementally as the 8,000 filler rows are inserted. Measured: incremental HNSW
+insertion of 8,000 384-dim vectors cost ~17s of this test's ~20s runtime, almost
+entirely server-side (inside the DB call, not `fake_embedding` generation --
+that's ~1s). Dropping the index, inserting plain rows, then building the index
+once in bulk measured seed ~5s + build ~1.1s. See `_seed_skewed_corpus` and the
+planner-pinning comment below for why that's safe and why it's mandatory.
 """
 from sqlalchemy import text
 
@@ -34,6 +42,38 @@ TOP_K = 10
 
 
 def _seed_skewed_corpus(db_session) -> None:
+    # Drop the HNSW index before inserting and rebuild it once afterwards,
+    # instead of letting pgvector grow it incrementally one row at a time.
+    # Incremental insertion of 8,000 vectors measured ~17s server-side; a bulk
+    # rebuild after the fact measured ~1.1s on top of a ~5s seed. The index
+    # itself is unchanged -- only *when* it gets built.
+    #
+    # The definition is read from pg_indexes rather than hard-coded so it can
+    # never drift from the migration that actually creates
+    # learnings_embedding_idx (access method, operator class, any future
+    # storage params). Asserting it was found turns a silent no-op (e.g. the
+    # index renamed or dropped upstream) into a loud failure instead of this
+    # test quietly reverting to the slow incremental path -- or worse, to no
+    # index at all.
+    #
+    # This is safe against leaking into other tests because DDL in Postgres is
+    # transactional: DROP/CREATE INDEX run inside the `connection` fixture's
+    # outer transaction, which is always rolled back, so the real
+    # learnings_embedding_idx is restored exactly as the migrations left it
+    # once this test ends.
+    indexdef = db_session.execute(
+        text(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE indexname = 'learnings_embedding_idx'"
+        )
+    ).scalar()
+    assert indexdef, (
+        "learnings_embedding_idx not found in pg_indexes -- this test's bulk "
+        "rebuild has nothing to rebuild from. Check the migration that creates "
+        "it hasn't renamed or dropped the index."
+    )
+    db_session.execute(text("DROP INDEX learnings_embedding_idx"))
+
     # The bulk rows are filler -- only their count and their presence in the
     # index matter -- so they are inserted in one statement rather than through
     # make_learning, which flushes per call. At these volumes that is the
@@ -64,6 +104,12 @@ def _seed_skewed_corpus(db_session) -> None:
         )
     db_session.flush()
 
+    # Rebuild the index now that every row is in place, from the exact DDL the
+    # migration used -- same access method, same operator class, same (default)
+    # storage params. This is the ~1.1s bulk build that replaces the ~17s of
+    # incremental per-row insertion above.
+    db_session.execute(text(indexdef))
+
 
 def test_a_small_client_still_gets_the_full_top_k(db_session):
     """A client holding a fraction of the table must still get top_k rows.
@@ -78,6 +124,20 @@ def test_a_small_client_still_gets_the_full_top_k(db_session):
     # below is what proves the opt-in actually worked.
     db_session.execute(text("SET LOCAL enable_indexscan = on"))
     _seed_skewed_corpus(db_session)
+
+    # Rebuilding the index (above) changes pg_class's statistics for
+    # learnings_embedding_idx relative to incremental growth, and measured
+    # behaviour was that this alone made the planner abandon HNSW for an exact
+    # Index Scan + Sort on the (client_name, repo_name, file_path) btree. That
+    # plan has perfect recall by construction, so the unfixed query -- no
+    # set_config, no iterative_scan -- passed under it: the test would still go
+    # green but would be proving nothing about #12. Disabling sort, bitmap and
+    # seqscan plans forces the planner back onto the HNSW index scan that
+    # production actually takes; the EXPLAIN assertion below is what confirms
+    # that forcing worked rather than just trusting it.
+    db_session.execute(text("SET LOCAL enable_sort = off"))
+    db_session.execute(text("SET LOCAL enable_bitmapscan = off"))
+    db_session.execute(text("SET LOCAL enable_seqscan = off"))
 
     repo = LearningRepository(db_session, client_name="acme")
     query_embedding = fake_embedding("anything at all")
