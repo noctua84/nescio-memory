@@ -271,7 +271,7 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `LANGFUSE_SECRET_KEY` | *(empty → tracing off)*                     |                                                      |
 | `LANGFUSE_HOST`       | `https://cloud.langfuse.com`                | Langfuse instance                                    |
 | `APP_NAME`            | `Nescio Semantic Memory API`                | title shown in the OpenAPI docs                      |
-| `LOG_LEVEL`           | `INFO`                                      | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL` |
+| `LOG_LEVEL`           | `INFO`                                      | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL`, case-insensitive; any other value fails at startup. Governs only the app's own logs — pass `--log-level` to `uvicorn` for its logs |
 | `CHUNK_SIZE`          | `1000`                                      | characters per chunk                                 |
 | `CHUNK_OVERLAP`       | `200`                                      | overlap between chunks — must satisfy `0 <= CHUNK_OVERLAP < CHUNK_SIZE`, otherwise the app refuses to start |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
