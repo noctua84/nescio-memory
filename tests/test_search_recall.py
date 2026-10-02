@@ -125,8 +125,8 @@ def test_a_small_client_still_gets_the_full_top_k(db_session):
     db_session.execute(text("SET LOCAL enable_indexscan = on"))
     _seed_skewed_corpus(db_session)
 
-    # Rebuilding the index (above) changes pg_class's statistics for
-    # learnings_embedding_idx relative to incremental growth, and measured
+    # Rebuilding the index (above) also refreshes pg_class's row estimate for the
+    # learnings table (CREATE INDEX updates reltuples), and measured
     # behaviour was that this alone made the planner abandon HNSW for an exact
     # Index Scan + Sort on the (client_name, repo_name, file_path) btree. That
     # plan has perfect recall by construction, so the unfixed query -- no
