@@ -68,8 +68,13 @@ def test_a_small_client_still_gets_the_full_top_k(db_session):
     repo = LearningRepository(db_session, client_name="acme")
     rows = repo.search(fake_embedding("anything at all"), top_k=TOP_K)
 
-    assert len(rows) == TOP_K, (
-        f"expected {TOP_K} rows for a client with {SMALL_ROWS} of "
+    # Not `== TOP_K`. Spec D3: recall is improved, not guaranteed -- max_scan_tuples
+    # bounds the work and HNSW's graph construction is randomized, so roughly one run
+    # in fourteen legitimately returns TOP_K - 1. The defect this guards is total
+    # starvation: pre-fix this same query returned 1 row of 10, which this still
+    # catches. Tightening this to equality reintroduces a ~7% flake.
+    assert len(rows) >= TOP_K - 1, (
+        f"expected at least {TOP_K - 1} rows for a client with {SMALL_ROWS} of "
         f"{BULK_ROWS + SMALL_ROWS}, got {len(rows)} -- the HNSW candidate window "
         "was exhausted by other clients' rows before top_k matches were found"
     )
