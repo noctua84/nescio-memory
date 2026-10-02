@@ -23,6 +23,9 @@ venv/
 # QWEN.md at the repo root stays tracked: it is shared project context.
 .qwen/settings.json
 
+# Plan-execution scratch (agent briefs/reports) - see docs/superpowers/README.md
+.superpowers/
+
 # OS
 .DS_Store
 Thumbs.db
