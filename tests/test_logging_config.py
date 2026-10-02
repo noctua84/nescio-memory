@@ -145,9 +145,9 @@ def test_the_app_logger_does_not_propagate_to_the_root_logger():
 
 
 def test_alembic_fileconfig_does_not_disable_the_app_logger_hierarchy(engine):
-    # Regression test for the bug this issue's app_caplog fixture and
-    # alembic/env.py's disable_existing_loggers=False both work around:
-    # logging.config.fileConfig() defaults to disable_existing_loggers=True,
+    # Regression test for alembic/env.py's disable_existing_loggers=False
+    # (this used to be worked around in test_error_responses.py by
+    # re-enabling the logger by hand): logging.config.fileConfig() defaults to disable_existing_loggers=True,
     # which disables every logger that already exists and isn't named in
     # alembic.ini -- including "app" and "app.core.errors", created at import
     # time when conftest imports app.main. The session-scoped `engine`
