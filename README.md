@@ -260,7 +260,7 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 
 | Variable              | Default                                    | Description                                          |
 | --------------------- | ------------------------------------------ | ---------------------------------------------------- |
-| `DATABASE_URL`        | *required*                                 | PostgreSQL connection string                         |
+| `DATABASE_URL`        | *required*                                 | PostgreSQL connection string; a plain `postgresql://` uses the bundled psycopg 3 driver |
 | `EMBEDDING_BACKEND`   | `ollama`                                    | `ollama` (HTTP) or `local` (in-process); any other value fails at startup |
 | `LOCAL_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2`  | model for the `local` backend only — see [Embedding backends](#embedding-backends) |
 | `OLLAMA_URL`          | `http://localhost:11434/api/embeddings`     | embedding endpoint (local or remote)                 |
