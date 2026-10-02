@@ -114,23 +114,25 @@ def connection(engine):
     # Force exact search for the duration of this transaction, so vector-ordering
     # assertions are deterministic.
     #
-    # pgvector's HNSW index is approximate and post-filtered: it yields a bounded
-    # candidate window (~391 tuples at the default ef_search=40) and the
-    # WHERE client_name = ... predicate is applied afterwards, as `Filter:` rather
-    # than `Index Cond:`. When earlier tests' rolled-back inserts leave enough
-    # index entries to crowd out that window, a test's own live rows never
-    # surface and the search returns nothing. That made ranking assertions fail
-    # on roughly four runs in five while passing in isolation.
+    # This was removed once, on the strength of 15 consecutive green runs, and had to
+    # come back. Those runs passed only because the search was then also setting
+    # hnsw.ef_search=200, which widened the HNSW candidate window enough to hide the
+    # problem. With ef_search back at its default -- the right call for production --
+    # the full suite went red in 4 of 6 runs, test_top_k_limits_the_number_of_results
+    # returning 0 or 1 rows of 2. Measured: ef=40 without this line, 4 of 6 red;
+    # ef=40 with it, 6 of 6 green.
     #
-    # The ranking tests use hand-built orthogonal vectors precisely so cosine
-    # distances are exact, which an approximate index cannot promise, so forcing
-    # the exact path is what they already intend. Bitmap scans stay enabled, so
-    # the composite index is still exercised.
+    # The mechanism: HNSW is approximate and post-filtered, so earlier tests'
+    # rolled-back inserts leave index entries that crowd out the candidate window and
+    # a test's own live rows never surface. The ranking tests use hand-built orthogonal
+    # vectors precisely so cosine distances are exact, which an approximate index
+    # cannot promise, so forcing the exact path is what they already intend. Bitmap
+    # scans stay enabled, so the composite index is still exercised.
     #
-    # This does NOT mean production is unaffected. The same post-filter starvation
-    # occurs there on committed rows whenever a client holds a small fraction of
-    # the table -- see the open issue on HNSW recall. Disabling the index here
-    # makes the tests honest; it does not fix that.
+    # This is a test-only setting and says nothing about production, which keeps
+    # ef_search at its default deliberately. tests/test_search_recall.py opts back in
+    # for itself and asserts the HNSW index is genuinely used, which is where the
+    # production path gets its coverage.
     conn.execute(text("SET LOCAL enable_indexscan = off"))
     yield conn
     transaction.rollback()
