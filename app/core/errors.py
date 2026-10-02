@@ -8,15 +8,23 @@ detail crosses a layer boundary.
 Each exception carries its own mapping as class attributes, so adding a case
 means adding a class rather than extending a dispatch table.
 """
+import logging
+
+import psycopg2.errors
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import OperationalError
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # A dependency that is down is usually down for longer than one request, so this
 # is a hint to back off rather than a promise about recovery.
 RETRY_AFTER_SECONDS = 30
 
 DATABASE_UNAVAILABLE_DETAIL = "Database unavailable"
+QUERY_TIMEOUT_DETAIL = "Query exceeded time limit"
 
 
 class EmbeddingBackendError(RuntimeError):
@@ -50,11 +58,12 @@ class EmbeddingBackendMisconfigured(EmbeddingBackendError):
     retry_after = False
 
 
-def _service_unavailable(detail: str) -> JSONResponse:
+def _service_unavailable(detail: str, retry: bool = True) -> JSONResponse:
+    headers = {"Retry-After": str(RETRY_AFTER_SECONDS)} if retry else None
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"detail": detail},
-        headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+        headers=headers,
     )
 
 
@@ -83,4 +92,19 @@ def register_exception_handlers(app: FastAPI) -> None:
         # SQLAlchemy is already the abstraction over the database, so handling its
         # exception directly is correct rather than leaky. OperationalError is the
         # connectivity family; programming errors are bugs and stay 500s.
+        #
+        # QueryCanceled (SQLSTATE 57014) is a special case within that family.
+        # Only the search transaction ever sets a statement_timeout (see
+        # LearningRepository.search), so 57014 here means this particular query
+        # was too expensive for its configured limit -- a deterministic outcome
+        # for the same input, not a transient outage. Advertising Retry-After
+        # would tell the client a retry can help when it cannot (same reasoning
+        # as EmbeddingBackendMisconfigured), so this branch omits the header.
+        if isinstance(exc.orig, psycopg2.errors.QueryCanceled):
+            logger.warning(
+                "Search statement canceled (SQLSTATE 57014): exceeded "
+                "statement_timeout of %d ms",
+                settings.statement_timeout_ms,
+            )
+            return _service_unavailable(QUERY_TIMEOUT_DETAIL, retry=False)
         return _service_unavailable(DATABASE_UNAVAILABLE_DETAIL)

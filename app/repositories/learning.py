@@ -3,6 +3,7 @@ from typing import Any, Sequence
 from sqlalchemy import delete, select, text, Row
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models.learning import Learning
 
 
@@ -68,11 +69,21 @@ class LearningRepository:
         # Raising this will not lengthen a short result set. REINDEX, a higher
         # m/ef_construction, or a partial index that makes client_name an
         # Index Cond: rather than a Filter: would.
+        #
+        # statement_timeout is set the same way -- scoped to this transaction
+        # only, via the same SET LOCAL mechanism -- so ingest commits and the
+        # startup schema checks in app/main.py are unaffected; only a search
+        # that runs long (e.g. a repo_filter matching nothing, see PR #15) can
+        # hit it. Settings is read at call time (attribute access on the
+        # module-level `settings` object) rather than captured at import, so
+        # tests can monkeypatch it per-case.
         self.db.execute(
             text(
                 "SELECT set_config('hnsw.iterative_scan', 'strict_order', true),"
-                "       set_config('hnsw.max_scan_tuples', '100000', true)"
-            )
+                "       set_config('hnsw.max_scan_tuples', '100000', true),"
+                "       set_config('statement_timeout', :statement_timeout, true)"
+            ),
+            {"statement_timeout": str(settings.statement_timeout_ms)},
         )
 
         distance = Learning.embedding.cosine_distance(embedding)  # the <=> operator

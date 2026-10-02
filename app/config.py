@@ -7,6 +7,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     # Database
     database_url: str
+    # Caps only the vector-search statement (set via SET LOCAL in
+    # LearningRepository.search), not the whole request or connection. 0 would
+    # disable the timeout in Postgres, which is never what we want here.
+    statement_timeout_ms: int = 5000
 
     # Embeddings backend
     # "ollama" posts to an Ollama server over HTTP; "local" runs
@@ -69,6 +73,18 @@ class Settings(BaseSettings):
             raise ValueError(
                 "OLLAMA_URL must be an absolute http:// or https:// URL with a "
                 f"host, got {self.ollama_url!r}"
+            )
+        return self
+
+    # A non-positive value would disable the statement timeout in Postgres
+    # (0) or be rejected by set_config (negative), silently removing the cap
+    # that issue #17 added rather than failing loudly at startup.
+    @model_validator(mode="after")
+    def _statement_timeout_must_be_positive(self) -> "Settings":
+        if self.statement_timeout_ms <= 0:
+            raise ValueError(
+                "STATEMENT_TIMEOUT_MS must be > 0, got "
+                f"{self.statement_timeout_ms}; 0 disables the timeout in Postgres"
             )
         return self
 
