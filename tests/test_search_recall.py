@@ -5,11 +5,10 @@ candidate window and `WHERE client_name = ...` is applied afterwards. A client
 holding a small share of the table can therefore have every candidate filtered
 away and receive an empty result set with HTTP 200.
 
-This test exercises the HNSW path deliberately. The suite no longer forces
-exact scans suite-wide, so this test asserts directly, via EXPLAIN, that the
-HNSW index was actually used rather than relying on a session setting -- a
-planner choice of a btree plus a Sort would otherwise pass this test just as
-happily while exercising neither HNSW nor the fix.
+This test exercises the HNSW path deliberately. The `connection` fixture forces
+exact scans suite-wide so that ordering assertions elsewhere are deterministic,
+so this test re-enables index scans for itself and then asserts the HNSW index is
+genuinely used -- otherwise it would silently prove nothing.
 """
 from sqlalchemy import text
 
@@ -61,11 +60,15 @@ def _seed_skewed_corpus(db_session) -> None:
 def test_a_small_client_still_gets_the_full_top_k(db_session):
     """A client holding a fraction of the table must still get top_k rows.
 
-    The suite no longer forces exact scans suite-wide, so this exercises the
-    HNSW path -- the one production uses -- by default. It does not rely on
-    that implicitly: the plan assertion below confirms the HNSW index was
-    actually used, rather than trusting a session setting.
+    The `connection` fixture forces exact scans suite-wide for determinism; this
+    test opts back in to the HNSW path -- the one production uses -- and the plan
+    assertion below verifies that opt-in actually took effect.
     """
+    # The connection fixture forces exact scans suite-wide for determinism. Opt back
+    # in here: without this the HNSW path -- the one production takes -- would not be
+    # exercised at all, which is how this defect stayed invisible. The plan assertion
+    # below is what proves the opt-in actually worked.
+    db_session.execute(text("SET LOCAL enable_indexscan = on"))
     _seed_skewed_corpus(db_session)
 
     repo = LearningRepository(db_session, client_name="acme")

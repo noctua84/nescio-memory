@@ -44,9 +44,15 @@ class LearningRepository:
         #
         # ef_search is left at its default deliberately. Measured on a 10-of-8010
         # corpus, iterative_scan at ef_search=40 recovered the full top_k on 20 of
-        # 20 query vectors -- the same as ef_search=200, at about half the buffers.
-        # A wider first window is redundant with iterative_scan and would charge
-        # every search, including the majority whose recall was never at risk.
+        # 20 query vectors -- the same as ef_search=200, at about half the buffers,
+        # so production does not pay for a wider first window it does not need.
+        #
+        # Setting it to 200 did have one real effect, recorded here so it is not
+        # rediscovered as a mystery: it widened the window enough to mask candidate
+        # window starvation in the TEST suite, whose small corpora compete with
+        # earlier tests' rolled-back rows. That is a test concern, and it is handled
+        # in tests/conftest.py by forcing exact scans there -- not by carrying a
+        # production setting that exists to keep tests green.
         #
         # set_config(..., true) is SET LOCAL, scoped to this transaction, so it
         # cannot leak onto a pooled connection. That scoping relies on the Session
