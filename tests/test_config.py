@@ -10,7 +10,7 @@ from app.config import Settings
 
 def _settings(**overrides):
     base = {
-        "database_url": "postgresql+psycopg2://u:p@localhost:5432/db",
+        "database_url": "postgresql+psycopg://u:p@localhost:5432/db",
         "ollama_url": "http://localhost:11434/api/embeddings",
     }
     base.update(overrides)

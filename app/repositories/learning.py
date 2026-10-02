@@ -56,11 +56,15 @@ class LearningRepository:
         # production setting that exists to keep tests green.
         #
         # set_config(..., true) is SET LOCAL, scoped to this transaction, so it
-        # cannot leak onto a pooled connection. That scoping relies on the Session
-        # having begun a transaction, which SessionLocal(autocommit=False)
-        # guarantees by autobegin; with no transaction open, set_config would
-        # apply only to its own statement and the search would silently see the
-        # defaults again.
+        # cannot leak onto a pooled connection. That scoping relies on an open
+        # transaction block; with none, set_config applies only to its own statement
+        # and the search would silently see the defaults again. So the setting is
+        # read back in a separate statement and a mismatch raises RuntimeError.
+        #
+        # Session.in_transaction() is not used as a guard because it is False
+        # before the first statement (autobegin is lazy) and True under isolation_level
+        # AUTOCOMMIT where SET LOCAL still no-ops — it checks the Session, not the
+        # database.
         #
         # max_scan_tuples is a safety cap so a pathological query cannot scan the
         # whole table. It is NOT what limits recall in practice: the scan was
@@ -85,6 +89,22 @@ class LearningRepository:
             ),
             {"statement_timeout": str(settings.statement_timeout_ms)},
         )
+
+        # Read back the HNSW setting to confirm it took effect. If no transaction
+        # block is open, SET LOCAL applies only to its own statement and this check
+        # will catch the mismatch before the search runs silently with defaults.
+        hnsw_setting = self.db.execute(
+            text("SELECT current_setting('hnsw.iterative_scan')")
+        ).scalar_one()
+        if hnsw_setting != 'strict_order':
+            raise RuntimeError(
+                f"hnsw.iterative_scan setting did not take effect: expected 'strict_order' "
+                f"but got {hnsw_setting!r}. set_config(..., true) is SET LOCAL and requires "
+                f"an open transaction block to persist to the next statement. With no "
+                f"transaction open (e.g., AUTOCOMMIT connection), the setting applies only to "
+                f"its own statement and the search would silently run with defaults, "
+                f"reinstating #12 (short result sets, HTTP 200)."
+            )
 
         distance = Learning.embedding.cosine_distance(embedding)  # the <=> operator
         similarity = (1 - distance).label("similarity")
