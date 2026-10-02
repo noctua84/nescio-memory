@@ -17,11 +17,19 @@ from app.repositories.learning import LearningRepository
 from tests.factories import make_learning
 from tests.fakes import fake_embedding
 
-# Tuned so starvation is total rather than partial on unfixed code. At 1% skew
-# the measured behaviour was 70 of 250 rows -- partial, so a test at that ratio
-# could pass by luck. See the plan's Task 1 for the observed figures.
+# BULK_ROWS is tuned so starvation is total on unfixed code: at this skew the
+# unfixed query returned 0-1 rows of 10 across 20 query vectors. 4,000 did NOT
+# reproduce the defect on the machine this was developed on, so if this test ever
+# passes BEFORE the fix, re-tune it rather than trusting it.
+#
+# SMALL_ROWS is deliberately LARGER than TOP_K. When it equalled TOP_K the query had
+# to retrieve every row the client owns -- the hardest task the corpus can pose,
+# because a single row landing outside HNSW's reachable set fails it outright. That
+# made this test flake on 10-17% of container builds, returning 8 or 9. Asking for
+# the nearest 10 of 40 lets a closer candidate substitute instead, which measured
+# 12 of 12 builds returning exactly TOP_K.
 BULK_ROWS = 8_000
-SMALL_ROWS = 10
+SMALL_ROWS = 40
 TOP_K = 10
 
 
@@ -98,13 +106,14 @@ def test_a_small_client_still_gets_the_full_top_k(db_session):
         f"the path production takes and proves nothing about #12. Plan:\n{plan}"
     )
 
-    # Not `== TOP_K`. Spec D3: recall is improved, not guaranteed -- max_scan_tuples
-    # bounds the work and HNSW's graph construction is randomized, so roughly one run
-    # in fourteen legitimately returns TOP_K - 1. The defect this guards is total
-    # starvation: pre-fix this same query returned 1 row of 10, which this still
-    # catches. Tightening this to equality reintroduces a ~7% flake.
-    assert len(rows) >= TOP_K - 1, (
-        f"expected at least {TOP_K - 1} rows for a client with {SMALL_ROWS} of "
+    # Exact equality. An earlier revision asserted `>= TOP_K - 1`, because at
+    # SMALL_ROWS == TOP_K this test genuinely flaked. Reshaping the corpus removed
+    # the flake rather than tolerating it -- see SMALL_ROWS above for the measurement.
+    # Spec D3 still holds in general: recall is improved, not guaranteed, and a client
+    # whose every row is needed can still come up short. This corpus is shaped so that
+    # case is not what is being asserted.
+    assert len(rows) == TOP_K, (
+        f"expected {TOP_K} rows for a client with {SMALL_ROWS} of "
         f"{BULK_ROWS + SMALL_ROWS}, got {len(rows)} -- the HNSW candidate window "
         "was exhausted by other clients' rows before top_k matches were found"
     )
