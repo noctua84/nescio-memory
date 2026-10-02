@@ -10,6 +10,11 @@ means adding a class rather than extending a dispatch table.
 """
 import logging
 
+# The isinstance check below is deliberately driver-specific: a hand-built
+# QueryCanceled has no pgcode, and SQLAlchemy exposes no portable "query
+# canceled" type, so there is no abstraction-preserving way to detect this.
+# If the driver ever changes to psycopg3, this check silently stops matching
+# and timeouts revert to the generic 503+Retry-After branch -- update it then.
 import psycopg2.errors
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
@@ -95,15 +100,20 @@ def register_exception_handlers(app: FastAPI) -> None:
         #
         # QueryCanceled (SQLSTATE 57014) is a special case within that family.
         # Only the search transaction ever sets a statement_timeout (see
-        # LearningRepository.search), so 57014 here means this particular query
-        # was too expensive for its configured limit -- a deterministic outcome
-        # for the same input, not a transient outage. Advertising Retry-After
-        # would tell the client a retry can help when it cannot (same reasoning
-        # as EmbeddingBackendMisconfigured), so this branch omits the header.
+        # LearningRepository.search), so in practice 57014 here is almost
+        # always that timeout firing -- a deterministic outcome for the same
+        # input, not a transient outage. But 57014 is not exclusively a
+        # statement_timeout: an admin's pg_cancel_backend() or a role-level
+        # statement_timeout would raise the identical SQLSTATE, and the
+        # response mapping deliberately treats all of these alike (accepted
+        # decision), so the log below must not claim a cause it cannot know
+        # and states only what is actually known: where and what the
+        # configured limit is.
         if isinstance(exc.orig, psycopg2.errors.QueryCanceled):
             logger.warning(
-                "Search statement canceled (SQLSTATE 57014): exceeded "
-                "statement_timeout of %d ms",
+                "Statement canceled (SQLSTATE 57014) on %s; search "
+                "statement_timeout is %d ms",
+                request.url.path,
                 settings.statement_timeout_ms,
             )
             return _service_unavailable(QUERY_TIMEOUT_DETAIL, retry=False)

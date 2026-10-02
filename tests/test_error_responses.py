@@ -24,7 +24,9 @@ from app.core.errors import (
 )
 from app.main import app
 from app.models.learning import Learning
+from app.repositories.learning import LearningRepository
 from tests.factories import make_api_key, make_learning
+from tests.fakes import fake_embedding
 
 LONG_ENOUGH = (
     "This content comfortably exceeds the fifty character minimum that the "
@@ -184,19 +186,26 @@ def test_database_failure_returns_503(db_session, monkeypatch):
     assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)
 
 
-def test_a_canceled_search_statement_returns_503_with_no_retry_after(
-    db_session, monkeypatch, caplog
+def test_a_search_that_exceeds_its_statement_timeout_returns_503_with_no_retry_after(
+    client, db_session, monkeypatch, caplog
 ):
-    # Only LearningRepository.search ever sets a statement_timeout, so a
-    # QueryCanceled here is a deterministic "this query was too expensive"
-    # outcome for the same input, not a transient outage -- the handler must
-    # map it distinctly from the generic OperationalError branch below, which
-    # still promises a retry.
-    from fastapi.testclient import TestClient
-
-    from tests.fakes import fake_embedding
-
+    # This must arise from the search path itself (not a fake session that
+    # fails on every execute, which would raise during auth and never reach
+    # LearningRepository.search) -- the handler must map it distinctly from
+    # the generic OperationalError branch above, which still promises a retry.
+    key = make_api_key(db_session, "acme")
     monkeypatch.setattr(search_module, "get_embedding", fake_embedding)
+
+    def _timed_out(self, *args, **kwargs):
+        raise OperationalError(
+            "SELECT ...",
+            {},
+            psycopg2.errors.QueryCanceled(
+                "canceling statement due to statement timeout"
+            ),
+        )
+
+    monkeypatch.setattr(LearningRepository, "search", _timed_out)
 
     # The session-scoped `engine` fixture runs Alembic migrations, and
     # alembic/env.py calls logging.config.fileConfig(), which (default
@@ -207,36 +216,20 @@ def test_a_canceled_search_statement_returns_503_with_no_retry_after(
     # here rather than by changing app/ or alembic.ini.
     monkeypatch.setattr(errors_module.logger, "disabled", False)
 
-    class _TimingOutSession:
-        def execute(self, *args, **kwargs):
-            raise OperationalError(
-                "SELECT ...",
-                {},
-                psycopg2.errors.QueryCanceled(
-                    "canceling statement due to statement timeout"
-                ),
-            )
-
-        def close(self):
-            pass
-
-    app.dependency_overrides[get_db] = lambda: _TimingOutSession()
-    try:
-        with caplog.at_level(logging.WARNING, logger="app.core.errors"):
-            response = TestClient(app).post(
-                "/api/v1/search",
-                json=SEARCH_PAYLOAD,
-                headers={"X-API-Key": "nm_irrelevant"},
-            )
-    finally:
-        app.dependency_overrides.clear()
+    with caplog.at_level(logging.WARNING, logger="app.core.errors"):
+        response = client.post(
+            "/api/v1/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": key}
+        )
 
     assert response.status_code == 503
     assert response.json() == {"detail": QUERY_TIMEOUT_DETAIL}
     assert "Retry-After" not in response.headers
     # The warning is the only operator-facing signal of HNSW/timeout
-    # starvation, so it must actually be emitted and mention the sqlstate.
-    assert any("57014" in record.getMessage() for record in caplog.records)
+    # starvation, so it must actually be emitted, mention the sqlstate, and
+    # name the request path it happened on.
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("57014" in message for message in messages)
+    assert any("/api/v1/search" in message for message in messages)
 
 
 def test_health_is_unaffected(client):
