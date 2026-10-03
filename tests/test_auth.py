@@ -37,7 +37,11 @@ def test_valid_api_key_reaches_the_endpoint(client, db_session):
         "/api/v1/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": key}
     )
     assert response.status_code == 200
-    assert response.json() == {"results": []}
+    # Still an exact match rather than a subset check: the point of this test
+    # is that an authenticated search reaches the endpoint and returns its
+    # whole empty-corpus body, and `contexts` is part of that body now.
+    # `contexts` is empty because the default `context` mode is "none".
+    assert response.json() == {"results": [], "contexts": []}
 
 
 def test_only_the_plaintext_key_authenticates_not_the_stored_hash(client, db_session):
