@@ -1,10 +1,35 @@
 from typing import Any, Sequence
 
-from sqlalchemy import delete, select, text, Row
+from sqlalchemy import BigInteger, Row, and_, case, cast, delete, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.learning import Learning
+
+# meta["chunk_index"] is a JSONB path expression; .astext renders it as text so
+# it can be matched against a regex before the integer cast is attempted. A
+# bare cast(..., BigInteger) on a non-numeric or NULL value raises a Postgres
+# error (500) rather than failing gracefully, so the CASE/regex guard below
+# evaluates the cast only on rows where it is known to succeed. NULL (missing
+# key), non-integer values, AND integers outside BigInteger's int8 range all
+# fall through to the `else_=None` branch instead of erroring -- the regex
+# admits at most 18 digits (plus an optional sign), and 18 nines
+# (999999999999999999) is comfortably under int8's max of
+# 9223372036854775807 (19 digits), so nothing this regex matches can ever
+# overflow the cast below. The cast itself uses BigInteger rather than
+# Integer (int4, max ~2.1 billion) because a 19-plus-digit string like
+# "99999999999999999999" matches `^-?\d+$` but overflows int4 well before it
+# would overflow int8, which previously raised NumericValueOutOfRange (a 500)
+# -- exactly the class of error this guard exists to neutralise. A NULL
+# chunk_index then makes every bounded comparison in get_chunks_for_ranges
+# NULL too, so the malformed row is simply not returned and the affected
+# context region degrades to less context rather than to an error.
+_CHUNK_INDEX_TEXT = Learning.meta["chunk_index"].astext
+_CHUNK_INDEX_IS_INTEGER = _CHUNK_INDEX_TEXT.op("~")(r"^-?\d{1,18}$")
+_CHUNK_INDEX = case(
+    (_CHUNK_INDEX_IS_INTEGER, cast(_CHUNK_INDEX_TEXT, BigInteger)),
+    else_=None,
+).label("chunk_index")
 
 
 class LearningRepository:
@@ -119,4 +144,79 @@ class LearningRepository:
             # Filter on the indexed column, not the JSONB field.
             stmt = stmt.where(Learning.repo_name == repo_filter)
 
+        return self.db.execute(stmt).all()
+
+    def get_chunks_for_ranges(
+        self, ranges: list[tuple[str, str, int | None, int | None]]
+    ) -> Sequence[Row[Any]]:
+        """Fetch the chunks covering several index ranges in ONE query.
+
+        Each element of `ranges` is (repo_name, file_path, from_index,
+        to_index); a None bound is unbounded on that side, which is how a
+        whole-document context region is expressed. Returns (Learning,
+        chunk_index) rows ordered by (repo_name, file_path, chunk_index), so
+        the caller can group them per document without a second sort.
+
+        One query rather than one per hit: a search returns up to 50 results
+        and a per-hit fetch would mean up to 50 round trips on one request
+        (see docs/superpowers/specs/2026-10-03-search-context-expansion-design.md,
+        D4).
+
+        This sets no statement_timeout of its own, but it is NOT unbounded:
+        the only caller runs it inside the same transaction as search(), whose
+        `set_config('statement_timeout', ..., true)` is a SET LOCAL and so is
+        still in force here. That inheritance is wanted rather than tolerated
+        -- a slow context fetch should not be able to hang a search that has
+        already found its answer -- and on cancellation the route's blanket
+        catch degrades to a result set with no context. Do not "fix" the
+        apparent omission by setting one here; do reconsider it if this ever
+        gains a caller outside a search transaction, because it would then
+        genuinely be uncapped.
+
+        No hnsw.* setting, though: this is a B-tree lookup on the composite
+        index (client_name, repo_name, file_path), not a vector search.
+        """
+        # An empty OR group is not a harmless no-op: or_() with no clauses
+        # compiles to a false-ish predicate (and emits a deprecation warning)
+        # or, depending on how the disjunction is assembled, to invalid SQL.
+        # Either way there is nothing to ask the database, so don't ask it.
+        if not ranges:
+            return []
+
+        disjuncts = []
+        for repo_name, file_path, from_index, to_index in ranges:
+            predicates = [
+                Learning.repo_name == repo_name,
+                Learning.file_path == file_path,
+            ]
+            # _CHUNK_INDEX evaluates to NULL for a row whose
+            # meta["chunk_index"] is missing or not an integer, so a bounded
+            # comparison against it is NULL and the row is simply not returned.
+            # A malformed row therefore degrades to "no context here" instead
+            # of erroring -- the same posture as the guard itself.
+            if from_index is not None:
+                predicates.append(_CHUNK_INDEX >= from_index)
+            if to_index is not None:
+                predicates.append(_CHUNK_INDEX <= to_index)
+            disjuncts.append(and_(*predicates))
+
+        stmt = (
+            select(Learning, _CHUNK_INDEX)
+            # The tenant boundary sits at the TOP level of the WHERE clause,
+            # ANDed with the whole OR group, deliberately. Repeating
+            # client_name inside each disjunct would make correctness depend on
+            # every copy being present: one disjunct assembled without it --
+            # one `continue` in the loop above, one refactor of the predicate
+            # list -- and that branch returns another tenant's rows while the
+            # others still look right, so the leak is invisible in review and
+            # in any test that does not exercise that exact branch. Here there
+            # is one filter, it cannot be partially applied, and no
+            # (repo_name, file_path) pair the caller derived from a hit is
+            # treated as authorisation to read those rows.
+            .where(
+                Learning.client_name == self.client_name,
+                or_(*disjuncts),
+            )
+            .order_by(Learning.repo_name, Learning.file_path, _CHUNK_INDEX)
+        )
         return self.db.execute(stmt).all()

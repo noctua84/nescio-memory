@@ -6,8 +6,13 @@ def chunk_text(
     chunk_size: int | None = None,
     overlap: int | None = None,
 ) -> list[str]:
-    size = chunk_size or settings.chunk_size
-    overlap = overlap or settings.chunk_overlap
+    # `or` would turn an explicit overlap=0 (or chunk_size=0, though that is
+    # rejected below) into the configured default, silently discarding the
+    # caller's choice. Now that ingest passes the window explicitly this is
+    # load-bearing: an ingest run configured at CHUNK_OVERLAP=0 must actually
+    # chunk at overlap 0, not silently fall back to settings.chunk_overlap.
+    size = chunk_size if chunk_size is not None else settings.chunk_size
+    overlap = overlap if overlap is not None else settings.chunk_overlap
     # Without this guard the loop below never terminates: a step of zero or
     # less leaves start standing still, or moving backwards.
     if not 0 <= overlap < size:

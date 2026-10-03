@@ -244,20 +244,109 @@ curl -X POST http://localhost:8000/api/v1/search \
         "relative_path": "docs/architecture.md",
         "chunk_index": 0
       },
-      "similarity": 0.8123
+      "similarity": 0.8123,
+      "context_ref": null
+    }
+  ],
+  "contexts": []
+}
+```
+
+| Field            | Type             | Default  | Description                            |
+| ---------------- | ---------------- | -------- | -------------------------------------- |
+| `query`          | string           | —        | text to search for (required)          |
+| `top_k`          | int              | `5`      | maximum number of results; must be between 1 and 50, otherwise `422` |
+| `repo_filter`    | string \| `null` | `null`   | restrict results to one `repo_name`    |
+| `context`        | string           | `"none"` | `"none"`, `"neighbors"` or `"document"` — how much surrounding text to return |
+| `context_chunks` | int              | `1`      | chunks either side of a hit, 1–5; only meaningful for `"neighbors"` |
+
+Each result carries `content` (the matched chunk), `metadata` (`file_name`, `relative_path`,
+`chunk_index`), `similarity` and `context_ref`.
+
+#### Context expansion
+
+A chunk is a positional 1000-character window, so a hit routinely begins and ends mid-thought.
+`context` asks for what surrounded it: `"neighbors"` expands each hit by `context_chunks` chunks
+either side, `"document"` expands to the whole note the hit came from. `"none"` is the default and
+runs no extra query at all, so existing callers are unaffected.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/search \
+  -H "X-API-Key: nm_your_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "where do embeddings come from?", "top_k": 3, "context": "neighbors", "context_chunks": 2}'
+```
+
+```json
+{
+  "results": [
+    {
+      "content": "...the chunk that matched...",
+      "metadata": { "relative_path": "docs/architecture.md", "chunk_index": 4 },
+      "similarity": 0.8123,
+      "context_ref": 0
+    },
+    {
+      "content": "...another chunk, same note...",
+      "metadata": { "relative_path": "docs/architecture.md", "chunk_index": 6 },
+      "similarity": 0.7456,
+      "context_ref": 0
+    }
+  ],
+  "contexts": [
+    {
+      "repo_name": "nescio-memory",
+      "file_path": "docs/architecture.md",
+      "content": "...expanded text, overlap stripped at every join...",
+      "chunk_index_from": 2,
+      "chunk_index_to": 8,
+      "covers": "neighbors",
+      "exact": true,
+      "note": null
     }
   ]
 }
 ```
 
-| Field         | Type             | Default | Description                            |
-| ------------- | ---------------- | ------- | -------------------------------------- |
-| `query`       | string           | —       | text to search for (required)          |
-| `top_k`       | int              | `5`     | maximum number of results; must be between 1 and 50, otherwise `422` |
-| `repo_filter` | string \| `null` | `null`  | restrict results to one `repo_name`    |
+Expanded text lives in `contexts`, not inline on each result, and `context_ref` is the index of the
+region containing that result. Regions are deduplicated and merged: two hits in the same note share
+one region rather than repeating its text, and windows that overlap or touch become a single region
+rather than two with a shared middle. `context_ref` is `null` when there is no region for a hit.
 
-Each result carries `content` (the matched chunk), `metadata` (`file_name`, `relative_path`,
-`chunk_index`) and `similarity`.
+| Context field      | Description                                                              |
+| ------------------ | ------------------------------------------------------------------------ |
+| `repo_name`        | repository the region's note belongs to                                  |
+| `file_path`        | relative path of the region's note                                       |
+| `content`          | the expanded text, with the chunks' shared overlap stripped at each join; `null` when the stored chunks admit no safe join |
+| `chunk_index_from` | lowest chunk index included                                              |
+| `chunk_index_to`   | highest chunk index included                                             |
+| `covers`           | the `context` mode the region was requested under                        |
+| `exact`            | whether the region provably reproduces that span of the original note    |
+| `note`             | why it is not exactly what was asked for, when it is not                 |
+
+Consecutive chunks share `chunk_overlap` characters, so a region is joined with that overlap
+stripped rather than concatenated — and with the window each row records having been cut with at
+ingest, not whatever the service is configured with now. Reassembling a note cut at 1000/200 under
+a guessed `CHUNK_OVERLAP=0` returns text 23% longer than the original while passing every
+consistency check, which is why the window is read from the rows.
+
+**Context is only ever returned for a note a query matched.** There is no list route, no
+fetch-by-path and no way to retrieve a note you could not find by asking for it; expansion is
+strictly more of what `search` already returned. See
+`docs/superpowers/specs/2026-10-03-search-context-expansion-design.md`.
+
+**Expansion degrades rather than erroring.** It is additive, so it can only ever fail to add, and
+no problem in it turns a successful search into a non-200:
+
+| Situation                                                        | Result                                        |
+| ---------------------------------------------------------------- | --------------------------------------------- |
+| a chunk was dropped at ingest, leaving a hole in the index sequence | the region stops at the hole rather than splicing across it, and says so in `note` |
+| a note's rows disagree about the window they were cut with       | no region for that note; its results get `context_ref: null` |
+| the response's character budget (`MAX_CONTEXT_CHARS`) is reached | lower-ranked regions are omitted; their results get `context_ref: null`, and the last included region's `note` says the budget was reached |
+| anything else unexpected                                         | the search returns normally with `contexts: []` and every `context_ref: null` |
+
+Regions are built in descending order of the best similarity among the results referencing them,
+so the budget is spent on the context most likely to be wanted.
 
 ## Configuration
 
@@ -280,6 +369,7 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `LOG_LEVEL`           | `INFO`                                      | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL` |
 | `CHUNK_SIZE`          | `1000`                                      | characters per chunk                                 |
 | `CHUNK_OVERLAP`       | `200`                                      | overlap between chunks — must satisfy `0 <= CHUNK_OVERLAP < CHUNK_SIZE`, otherwise the app refuses to start |
+| `MAX_CONTEXT_CHARS`   | `100000`                                    | total characters of expanded context one search response may carry; a cap, not a target. Must be `> 0`, otherwise the app refuses to start |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
 
 ### Embedding backends
@@ -391,8 +481,9 @@ uv run python -m scripts.check_embedding_dimension  # does the model's width mat
 
 Four things are enforced by CI:
 
-- **The test suite must pass.** `uv run pytest` runs 30 integration tests against a real PostgreSQL
-  + pgvector container on every push and pull request.
+- **The test suite must pass.** `uv run pytest` runs the integration suite against a real
+  PostgreSQL + pgvector container on every push and pull request. No count is quoted here because
+  it goes stale; `uv run pytest --collect-only -q` reports it.
 - **`uv.lock` must stay in sync with `pyproject.toml`.** If you add or change a dependency, run
   `uv lock` and commit both files.
 - **The committed OpenAPI spec must match the code.** If you touch a route, a `Form(...)` field, or
@@ -426,6 +517,10 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
   a client cannot rely on parsing `detail` from every error.
 - **Ingestion is serial and chatty.** One blocking Ollama call per chunk, with no batching and no
   retry/backoff.
+- **There is no read-back, list or mutation route.** Content is reachable only through a query
+  that semantically matched it, by design; recovering the corpus itself is a `pg_dump`/restore
+  concern, not an API one. There is no `UPDATE` or `DELETE` route either — a document changes only
+  by re-ingesting it whole.
 
 Contributions addressing any of the above are welcome.
 

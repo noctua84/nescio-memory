@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     chunk_size: int = 1000
     chunk_overlap: int = 200
 
+    # Total characters of expanded context one /api/v1/search response may
+    # carry, across all regions. A cap, not a target: regions are built in
+    # descending order of the best similarity among the results referencing
+    # them and stop once this would be exceeded. 100,000 is roughly 25 notes
+    # at this corpus's average size.
+    max_context_chars: int = 100_000
+
     # server
     host: str = "localhost"
     port: int = 8080
@@ -83,6 +90,26 @@ class Settings(BaseSettings):
             raise ValueError(
                 "OLLAMA_URL must be an absolute http:// or https:// URL with a "
                 f"host, got {self.ollama_url!r}"
+            )
+        return self
+
+    # 0 is not merely a smaller budget. The budget is spent by whole regions:
+    # a region is built only if it fits, so a budget of 0 admits no region at
+    # all and `context: "neighbors"|"document"` silently returns an empty
+    # `contexts` list with every `context_ref` null -- indistinguishable, to a
+    # caller, from `context: "none"` or from a service where the feature is
+    # broken. Someone who wants the feature off asks for "none" per request;
+    # someone who sets this to 0 has misconfigured it, and finding that out at
+    # startup beats finding it out from silently context-free search results.
+    # Negative is the same mistake with a sign on it.
+    @model_validator(mode="after")
+    def _max_context_chars_must_be_positive(self) -> "Settings":
+        if self.max_context_chars <= 0:
+            raise ValueError(
+                "MAX_CONTEXT_CHARS must be > 0, got "
+                f"{self.max_context_chars}; 0 does not shrink the context "
+                "budget, it disables context expansion while still accepting "
+                "requests that ask for it"
             )
         return self
 

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException
 from langfuse import observe
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.core.chunking import chunk_text
 from app.core.db import get_db
 from app.core.embeddings import get_embedding
@@ -76,8 +77,18 @@ def ingest_file(
     repo = LearningRepository(db, client_name=client.client_name)
     repo.delete_by_file(repo_name, file_path)
 
+    # Resolved once, here, and passed explicitly to chunk_text rather than
+    # letting it re-read settings itself -- that makes chunk_size/chunk_overlap
+    # below provably the window these chunks were cut with, not a guess about
+    # what the service happened to be configured with. Joining chunks under a
+    # window read from current settings instead is silently wrong the moment
+    # the service is reconfigured after ingest; see
+    # docs/superpowers/specs/2026-10-03-search-context-expansion-design.md, D3.
+    chunk_size = settings.chunk_size
+    chunk_overlap = settings.chunk_overlap
+
     ingested = 0
-    for i, chunk in enumerate(chunk_text(content)):
+    for i, chunk in enumerate(chunk_text(content, chunk_size, chunk_overlap)):
         if len(chunk.strip()) < MIN_CONTENT_CHARS:
             continue
 
@@ -90,6 +101,11 @@ def ingest_file(
                     "file_name": Path(file_path).name,
                     "relative_path": file_path,
                     "chunk_index": i,
+                    # Recorded per row so read-back can reassemble with the
+                    # window these chunks were actually cut with, independent
+                    # of whatever the service is configured with later.
+                    "chunk_size": chunk_size,
+                    "chunk_overlap": chunk_overlap,
                 },
                 embedding=get_embedding(chunk),
             )
