@@ -127,13 +127,19 @@ lives in [`openapi.json`](openapi.json) / [`openapi.yaml`](openapi.yaml).
 
 ### `GET /health`
 
-Liveness probe. Reports the active embedding backend and model, and deliberately does **not**
-contact PostgreSQL or Ollama — so an unhealthy dependency cannot make Kubernetes restart the pod.
+Liveness probe. Reports the active embedding backend, model and configured vector width, and
+deliberately does **not** contact PostgreSQL or Ollama — so an unhealthy dependency cannot make
+Kubernetes restart the pod.
 
 ```bash
 curl http://localhost:8000/health
-# {"status":"ok","embedding_backend":"ollama","embedding_model":"qwen3-embedding:0.6b"}
+# {"status":"ok","embedding_backend":"ollama","embedding_model":"qwen3-embedding:0.6b",
+#  "embedding_dimension":1024}
 ```
+
+`embedding_dimension` is the **configured** width, not a measured one — this endpoint contacts
+nothing. To check it against what the model really emits, see
+[Checking the dimension](#checking-the-dimension).
 
 ### Authentication
 
@@ -266,7 +272,7 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `LOCAL_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2`  | model for the `local` backend only — see [Embedding backends](#embedding-backends) |
 | `OLLAMA_URL`          | `http://localhost:11434/api/embeddings`     | embedding endpoint (local or remote)                 |
 | `OLLAMA_MODEL`        | `qwen3-embedding:0.6b`                      | embedding model name                                 |
-| `EMBEDDING_DIMENSION` | `384`                                       | must match the model **and** the `vector(N)` column  |
+| `EMBEDDING_DIMENSION` | `1024`                                      | must match the model **and** the `vector(N)` column — the default is the width `qwen3-embedding:0.6b` actually emits; verify with [`scripts/check_embedding_dimension.py`](scripts/check_embedding_dimension.py) |
 | `LANGFUSE_PUBLIC_KEY` | *(empty → tracing off)*                     | Langfuse credentials                                 |
 | `LANGFUSE_SECRET_KEY` | *(empty → tracing off)*                     |                                                      |
 | `LANGFUSE_HOST`       | `https://cloud.langfuse.com`                | Langfuse instance                                    |
@@ -291,20 +297,84 @@ it for the lifetime of the process. Selecting `local` without installing the ext
 first embedding call with an error naming the install command — it does **not** silently fall back
 to Ollama.
 
-The default `LOCAL_EMBEDDING_MODEL` (`all-MiniLM-L6-v2`) is 384-dimensional, the same width as the
-default `qwen3-embedding:0.6b`, so either backend works against a `vector(384)` column. Choosing a
-model of a different width means recreating the column and re-ingesting.
+#### The two backends are not interchangeable against one database
+
+The default `LOCAL_EMBEDDING_MODEL` (`all-MiniLM-L6-v2`) is **384**-dimensional. The default
+`OLLAMA_MODEL` (`qwen3-embedding:0.6b`) is **1024**-dimensional. A database has one
+`vector(N)` column, so it serves one of them, and switching backends is a migration plus a
+re-ingest — not a configuration flip. (An earlier version of this README claimed both were
+384-wide and therefore interchangeable. They never were; see
+[#36](https://github.com/noctua84/nescio-memory/issues/36).)
+
+| Backend                   | Default model                 | Width    | Schema it needs                                  |
+| ------------------------- | ----------------------------- | -------- | ------------------------------------------------ |
+| `ollama` (default)        | `qwen3-embedding:0.6b`        | **1024** | migration head — `EMBEDDING_DIMENSION=1024`      |
+| `local`                   | `all-MiniLM-L6-v2`            | **384**  | stop at `3d80eb22a17d` — `EMBEDDING_DIMENSION=384` |
+
+Running the `local` backend therefore means **both** of:
+
+```bash
+EMBEDDING_DIMENSION=384                   # in .env
+uv run alembic upgrade 3d80eb22a17d       # NOT `head` — head is vector(1024)
+```
+
+`3d80eb22a17d` is the last revision before the column widened to 1024, and
+`alembic downgrade -1` from head lands there. With the stock `EMBEDDING_DIMENSION=1024` the
+`local` backend fails every embedding call, loudly, on the dimension check — the mirror image of
+the defect in #36.
+
+Pointing `LOCAL_EMBEDDING_MODEL` at a genuinely 1024-dimensional sentence-transformers model
+would make one schema serve both, and is the obvious next step; it is not taken here because
+nobody has run it. An unexecuted dimension claim in this file is what caused #36 in the first
+place.
 
 ### Ollama models
 
 | Model                   | Dimensions | Rough cost          |
 | ----------------------- | ---------- | ------------------- |
-| `qwen3-embedding:0.6b`  | 384        | ~400 MB RAM         |
-| `qwen3-embedding:4b`    | 1024       | ~2.5 GB RAM         |
+| `qwen3-embedding:0.6b`  | 1024       | ~400 MB RAM         |
+| `qwen3-embedding:4b`    | 2560       | ~2.5 GB RAM         |
 | `qwen3-embedding:8b`    | 4096       | GPU recommended     |
+
+Widths taken from the models' own `hidden_size` (`Qwen/Qwen3-Embedding-{0.6B,4B,8B}`), and 0.6b
+confirmed against a running server: `/api/show` reports `qwen3.embedding_length: 1024` and
+`/api/embeddings` returns 1024 floats. The previous version of this table said 384 and 1024 for
+the first two rows, which is where #36 came from — do not re-derive a width from this file
+without running `python -m scripts.check_embedding_dimension` against the model.
 
 Switching models means recreating the `embedding` column at the new dimension and re-ingesting
 everything — vectors of different dimensions are not comparable.
+
+### Checking the dimension
+
+`EMBEDDING_DIMENSION` has to agree with two independent things, and until #36 only one of them
+was ever checked:
+
+| Must agree with                       | Checked by                                                  | When            |
+| ------------------------------------- | ----------------------------------------------------------- | --------------- |
+| the `learnings.embedding` column      | `verify_embedding_dimension` (`app/core/schema_checks.py`)   | every startup   |
+| the SQLAlchemy model                  | `tests/test_schema_drift.py`                                | every CI run    |
+| **what the model actually emits**     | `scripts/check_embedding_dimension.py`                      | **on demand**   |
+
+The third row is the gap that made the stock configuration inert while the suite stayed green: the
+tests embed through a fake that returns `EMBEDDING_DIMENSION` floats by construction, so they agree
+with the setting no matter what it says. Run the script after changing `OLLAMA_MODEL`,
+`LOCAL_EMBEDDING_MODEL`, `EMBEDDING_BACKEND` or `EMBEDDING_DIMENSION`:
+
+```bash
+uv run python -m scripts.check_embedding_dimension
+# OK  ollama backend at http://localhost:11434/api/embeddings, model qwen3-embedding:0.6b
+#   emits 1024 dimensions, matching EMBEDDING_DIMENSION
+```
+
+It exits `0` on a match, `1` on a mismatch and `2` if the backend could not be reached, so a
+deployment pipeline can treat "wrong" and "could not tell" differently.
+
+This is a script and not a startup check on purpose: probing at boot would make the API's liveness
+depend on the embedding backend, and an API that will not start because Ollama is restarting is a
+worse failure than the one being guarded against. `tests/test_embedding_width_contract.py` runs the
+same probe in the suite and **skips** when no backend is reachable — the skip is printed in every
+run's summary (`addopts = "-ra"`), because a silent skip would leave the same hole.
 
 ## Development
 
@@ -316,6 +386,7 @@ uv run python export_openapi.py       # regenerate openapi.json + openapi.yaml
 uv run uvicorn app.main:app --reload  # dev server (from the repository root)
 uv run pytest                         # integration suite (needs Docker)
 uv run alembic upgrade head           # apply migrations
+uv run python -m scripts.check_embedding_dimension  # does the model's width match EMBEDDING_DIMENSION?
 ```
 
 Four things are enforced by CI:

@@ -4,6 +4,7 @@ If these fail, nothing else in the suite can be trusted.
 """
 from sqlalchemy import inspect, select, text
 
+from app.config import settings
 from app.models.learning import Learning
 
 
@@ -21,9 +22,13 @@ def test_the_vector_extension_is_installed(engine):
 
 
 def test_the_embedding_column_has_the_configured_dimension(engine):
-    # Migration 0002 moved this column to 384 dimensions. If create_all() were
-    # ever substituted for real migrations this assertion would still pass,
-    # which is why the HNSW check below exists too.
+    # Migration 57cfbdfa0d6a restored this column to 1024 dimensions, the width
+    # qwen3-embedding:0.6b actually emits (#36). Asserted against settings
+    # rather than a literal so the column and the configuration cannot drift
+    # apart silently -- but note that both can still be wrong about the real
+    # model, which is what tests/test_embedding_width_contract.py covers.
+    # If create_all() were ever substituted for real migrations this assertion
+    # would still pass, which is why the HNSW check below exists too.
     with engine.connect() as connection:
         dimension = connection.execute(
             text(
@@ -31,11 +36,12 @@ def test_the_embedding_column_has_the_configured_dimension(engine):
                 "WHERE attrelid = 'learnings'::regclass AND attname = 'embedding'"
             )
         ).scalar()
-    assert dimension == 384
+    assert dimension == settings.embedding_dimension
 
 
 def test_the_hnsw_index_exists(engine):
-    # This index is created only by migration 8e6b572b0ae3 and rebuilt by 0002.
+    # This index is created only by migration 8e6b572b0ae3 and rebuilt by 0002
+    # and 57cfbdfa0d6a.
     # It is absent from the SQLAlchemy model, so its presence is proof that
     # real migrations ran rather than metadata.create_all().
     with engine.connect() as connection:
@@ -52,7 +58,7 @@ def _probe_row(client_name: str) -> Learning:
         file_path="probe.md",
         content="written by an isolation probe",
         meta={"chunk_index": 0},
-        embedding=[0.0] * 384,
+        embedding=[0.0] * settings.embedding_dimension,
     )
 
 

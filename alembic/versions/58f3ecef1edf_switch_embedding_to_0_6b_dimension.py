@@ -1,7 +1,19 @@
-"""switch embedding dimension to 384 (qwen3-embedding-0.6b)
+"""switch embedding dimension to 384 -- SUPERSEDED, the premise was wrong
 
 Revision ID: 0002
 Revises: 0001
+
+qwen3-embedding:0.6b is 1024-dimensional, not 384: it reports
+qwen3.embedding_length 1024 and /api/embeddings returns 1024 floats. The
+384 figure belongs to all-MiniLM-L6-v2, the `local` backend's default, and was
+applied to the Ollama default by mistake. Migration 0001 had the width right
+and this migration moved away from it, leaving the default configuration unable
+to embed anything at all.
+
+Revision 57cfbdfa0d6a reverts the column to vector(1024). This file is left in
+place because it has been applied in the wild; its title is corrected rather
+than its behaviour. Do not take the 384 below as a statement about any Ollama
+model. See issue #36.
 """
 from alembic import op
 

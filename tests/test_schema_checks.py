@@ -55,7 +55,8 @@ def test_a_matching_dimension_passes(monkeypatch):
 def test_a_mismatched_dimension_raises(monkeypatch):
     from app.config import settings
 
-    wrong = settings.embedding_dimension + 384
+    # Any value but the configured one; the offset is arbitrary.
+    wrong = settings.embedding_dimension + 1
     with pytest.raises(RuntimeError) as excinfo:
         verify_embedding_dimension(_StubEngine(wrong))
     message = str(excinfo.value)
