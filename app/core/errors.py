@@ -19,7 +19,7 @@ import logging
 import psycopg.errors
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DataError, OperationalError
 
 from app.config import settings
 
@@ -31,6 +31,7 @@ RETRY_AFTER_SECONDS = 30
 
 DATABASE_UNAVAILABLE_DETAIL = "Database unavailable"
 QUERY_TIMEOUT_DETAIL = "Query exceeded time limit"
+INVALID_DATA_DETAIL = "Request contains data the database cannot accept"
 
 
 class EmbeddingBackendError(RuntimeError):
@@ -119,3 +120,45 @@ def register_exception_handlers(app: FastAPI) -> None:
             )
             return _service_unavailable(QUERY_TIMEOUT_DETAIL, retry=False)
         return _service_unavailable(DATABASE_UNAVAILABLE_DETAIL)
+
+    @app.exception_handler(DataError)
+    async def _invalid_data(request: Request, exc: DataError) -> JSONResponse:
+        # DataError is SQLAlchemy's family for SQLSTATE class 22xxx (invalid text
+        # representation, numeric overflow, division by zero, and similar). The
+        # case that surfaced this handler is psycopg.DataError raised while
+        # adapting a parameter -- e.g. a NUL byte in a text field -- which never
+        # reaches Postgres at all, so this comment (deliberately) does not say
+        # "Postgres rejected it". A server-side 22xxx that Postgres itself raises
+        # lands here identically; both are mapped the same way below.
+        #
+        # 400, not 422: 422 is already owned by FastAPI/Pydantic request
+        # validation, whose body is {"detail": [...]} -- a list of error objects.
+        # Giving this family the same status code with a plain string detail
+        # would make `detail`'s type depend on which failure produced it, which
+        # is worse for a client than picking a different 4xx. 400 keeps `detail`
+        # a string everywhere in this file.
+        #
+        # No Retry-After: unlike OperationalError's connectivity family, the
+        # cause here is the submitted data itself, not a transient dependency
+        # state. The same request body will fail again on every retry, so
+        # advertising a retry hint would be the same lie
+        # EmbeddingBackendMisconfigured avoids telling, for an unrelated reason.
+        #
+        # Accepted tradeoff: class 22xxx is not *exclusively* caller-caused --
+        # numeric overflow or division by zero can just as easily come from this
+        # application's own SQL, in which case 400 wrongly tells the caller their
+        # input was bad when the bug is ours. We accept that because the values
+        # that actually reach SQL in this service (repo_name, file_path, content,
+        # query text, top_k) are overwhelmingly caller-supplied, and the warning
+        # below is what keeps an internal-bug DataError visible to operators
+        # instead of silently blamed on the client forever.
+        sqlstate = getattr(exc.orig, "sqlstate", None)
+        logger.warning(
+            "Invalid data for the database on %s (SQLSTATE %s)",
+            request.url.path,
+            sqlstate or "unknown",
+        )
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": INVALID_DATA_DETAIL},
+        )
