@@ -7,6 +7,7 @@ HTTP layer.
 import httpx
 import pytest
 
+from app.config import settings
 from app.core import embeddings as embeddings_module
 from app.core.embeddings import get_embedding
 from app.core.errors import (
@@ -109,7 +110,7 @@ def test_bad_response_is_a_subclass_so_one_handler_covers_both(monkeypatch):
 
 
 def test_a_successful_call_still_returns_the_vector(monkeypatch):
-    vector = [0.01] * 384
+    vector = [0.01] * settings.embedding_dimension
     _install(monkeypatch, lambda: _response({"embedding": vector}))
     assert get_embedding("anything") == vector
 
@@ -155,23 +156,28 @@ def test_a_missing_local_extra_stays_a_misconfiguration(monkeypatch):
     "bad_value, why",
     [
         ([], "empty"),
-        ([0.1] * 768, "wrong dimension"),
+        ([0.1] * (settings.embedding_dimension + 1), "wrong dimension"),
         ("notavector", "a string"),
         (None, "null"),
-        ([None] * 384, "a list of nulls"),
+        ([None] * settings.embedding_dimension, "a list of nulls"),
         ({"a": 1}, "an object"),
-        ([True] * 384, "booleans"),
+        ([True] * settings.embedding_dimension, "booleans"),
     ],
 )
 def test_an_unusable_embedding_value_is_rejected(monkeypatch, bad_value, why):
     # The key is present in every case, so the key-existence check passes and
     # only the shape check can catch these.
+    #
+    # The two full-length cases are sized from settings rather than written as
+    # a literal on purpose: at any other length they fail on the dimension
+    # check before the component-type check is ever reached, and the case stops
+    # testing what it is named for.
     _install(monkeypatch, lambda: _response({"embedding": bad_value}))
     with pytest.raises(EmbeddingBackendBadResponse):
         get_embedding(f"a response carrying {why}")
 
 
 def test_a_correctly_shaped_embedding_still_passes(monkeypatch):
-    vector = [0.01] * 384
+    vector = [0.01] * settings.embedding_dimension
     _install(monkeypatch, lambda: _response({"embedding": vector}))
     assert get_embedding("anything") == vector

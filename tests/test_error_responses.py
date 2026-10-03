@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.api.v1 import ingest as ingest_module
 from app.api.v1 import search as search_module
+from app.config import settings
 from app.core import errors as errors_module
 from app.core.db import get_db
 from app.core.errors import (
@@ -275,7 +276,7 @@ def test_a_failure_partway_through_a_file_leaves_earlier_rows_intact(
         calls["n"] += 1
         if calls["n"] >= 2:
             raise EmbeddingBackendError("backend died mid-file")
-        return [0.0] * 384
+        return [0.0] * settings.embedding_dimension
 
     monkeypatch.setattr(ingest_module, "get_embedding", fail_on_the_second_chunk)
 

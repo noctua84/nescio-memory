@@ -1,6 +1,7 @@
 """Ingest behaviour: persistence, replacement, and input validation."""
 from sqlalchemy import func, select
 
+from app.config import settings
 from app.models.learning import Learning
 from tests.factories import make_api_key
 
@@ -41,7 +42,7 @@ def test_ingest_persists_a_chunk(client, db_session):
     assert rows[0].meta["relative_path"] == "docs/note.md"
     assert rows[0].meta["file_name"] == "note.md"
     assert rows[0].meta["chunk_index"] == 0
-    assert len(rows[0].embedding) == 384
+    assert len(rows[0].embedding) == settings.embedding_dimension
 
 
 def test_reingesting_the_same_file_replaces_rather_than_duplicates(client, db_session):

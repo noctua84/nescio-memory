@@ -16,13 +16,23 @@ class Settings(BaseSettings):
     # "ollama" posts to an Ollama server over HTTP; "local" runs
     # sentence-transformers in-process and needs the local-embeddings extra.
     embedding_backend: Literal["ollama", "local"] = "ollama"
-    # 384 dimensions, matching the default embedding_dimension below.
+    # 384 dimensions, which does NOT match the embedding_dimension default
+    # below. all-MiniLM-L6-v2 is genuinely 384-wide and the Ollama default is
+    # genuinely 1024-wide, so the two backends are not interchangeable against
+    # one database: selecting "local" also means EMBEDDING_DIMENSION=384 and a
+    # vector(384) column. See the Embedding backends section of the README.
     local_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 
     # Ollama
     ollama_url: str = "http://localhost:11434/api/embeddings"
     ollama_model: str = "qwen3-embedding:0.6b"
-    embedding_dimension: int = 384
+    # qwen3-embedding:0.6b emits 1024 floats -- measured, not inferred:
+    # /api/show reports qwen3.embedding_length 1024 and /api/embeddings returns
+    # a 1024-element vector. Nothing in the suite compares this number against
+    # a real model, so `uv run python -m scripts.check_embedding_dimension`
+    # exists to do exactly that. (Was 384 until #36, which made the default
+    # configuration unable to embed anything at all.)
+    embedding_dimension: int = 1024
 
     # langfuse:
     langfuse_public_key: str = ""

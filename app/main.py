@@ -47,6 +47,12 @@ def create_app() -> FastAPI:
             "status": "ok",
             "embedding_backend": settings.embedding_backend,
             "embedding_model": model,
+            # Reported because model and width together are what has to agree,
+            # and #36 was a deployment where they did not. Read straight from
+            # settings -- this is still the configured number, not a measured
+            # one, so it stays honest about contacting nothing. The measured
+            # number comes from scripts/check_embedding_dimension.py.
+            "embedding_dimension": settings.embedding_dimension,
         }
 
     return app

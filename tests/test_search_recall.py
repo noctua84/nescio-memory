@@ -12,7 +12,8 @@ genuinely used -- otherwise it would silently prove nothing.
 
 Seeding rebuilds the HNSW index from scratch instead of letting it grow
 incrementally as the 8,000 filler rows are inserted. Measured: incremental HNSW
-insertion of 8,000 384-dim vectors cost ~17s of this test's ~20s runtime, almost
+insertion of 8,000 vectors (384-dim at the time this was measured, before
+#36 corrected the width to 1024) cost ~17s of this test's ~20s runtime, almost
 entirely server-side (inside the DB call, not `fake_embedding` generation --
 that's ~1s). Dropping the index, inserting plain rows, then building the index
 once in bulk measured seed ~5s + build ~1.1s. See `_seed_skewed_corpus` and the
