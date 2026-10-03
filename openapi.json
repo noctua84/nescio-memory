@@ -148,6 +148,74 @@
         ],
         "title": "Body_ingest_file_api_v1_ingest_post"
       },
+      "ContextRegion": {
+        "properties": {
+          "repo_name": {
+            "type": "string",
+            "title": "Repo Name",
+            "description": "Repository the region's note belongs to."
+          },
+          "file_path": {
+            "type": "string",
+            "title": "File Path",
+            "description": "Relative path of the region's note."
+          },
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content",
+            "description": "The expanded text, with the chunks' shared overlap stripped at each join. Null when the stored chunks admit no safe join (see `note`)."
+          },
+          "chunk_index_from": {
+            "type": "integer",
+            "title": "Chunk Index From",
+            "description": "Lowest chunk index included in this region."
+          },
+          "chunk_index_to": {
+            "type": "integer",
+            "title": "Chunk Index To",
+            "description": "Highest chunk index included in this region."
+          },
+          "covers": {
+            "type": "string",
+            "title": "Covers",
+            "description": "The `context` mode this region was requested under: \"neighbors\" or \"document\"."
+          },
+          "exact": {
+            "type": "boolean",
+            "title": "Exact",
+            "description": "Whether this region provably reproduces the corresponding span of the original note. False means the text is best-effort and `note` says why."
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note",
+            "description": "Why the region is not exactly what was asked for -- truncated at a dropped chunk, or joined under an unverifiable window. Null when there is nothing to report."
+          }
+        },
+        "type": "object",
+        "required": [
+          "repo_name",
+          "file_path",
+          "chunk_index_from",
+          "chunk_index_to",
+          "covers",
+          "exact"
+        ],
+        "title": "ContextRegion"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -222,6 +290,25 @@
             "examples": [
               "repo_a"
             ]
+          },
+          "context": {
+            "type": "string",
+            "enum": [
+              "none",
+              "neighbors",
+              "document"
+            ],
+            "title": "Context",
+            "description": "How much surrounding text to return alongside each matched chunk. \"none\" (the default) returns matched chunks only and runs no extra query. \"neighbors\" expands each hit by `context_chunks` chunks either side. \"document\" expands to the whole note the hit came from. Expanded text is returned in the response's `contexts` list, not inline, so two hits in the same note share one region.",
+            "default": "none"
+          },
+          "context_chunks": {
+            "type": "integer",
+            "maximum": 5,
+            "minimum": 1,
+            "title": "Context Chunks",
+            "description": "Chunks to include either side of a hit. Only meaningful when `context` is \"neighbors\" -- ignored for \"none\" and \"document\".",
+            "default": 1
           }
         },
         "type": "object",
@@ -238,6 +325,14 @@
             },
             "type": "array",
             "title": "Results"
+          },
+          "contexts": {
+            "items": {
+              "$ref": "#/components/schemas/ContextRegion"
+            },
+            "type": "array",
+            "title": "Contexts",
+            "description": "Expanded regions referenced by the results' `context_ref`. Deduplicated and merged: two hits in the same note share one region rather than repeating its text. Empty when `context` is \"none\" or when expansion produced nothing."
           }
         },
         "type": "object",
@@ -263,6 +358,18 @@
             "type": "number",
             "title": "Similarity",
             "description": "Cosine similarity score (0-1)."
+          },
+          "context_ref": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Ref",
+            "description": "Index into the response's `contexts` list of the region containing this chunk. Null when no region was built for it -- `context` was \"none\", the note's chunks could not be resolved, or the region did not fit the response's character budget."
           }
         },
         "type": "object",
