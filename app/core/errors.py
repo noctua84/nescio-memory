@@ -153,10 +153,15 @@ def register_exception_handlers(app: FastAPI) -> None:
         # below is what keeps an internal-bug DataError visible to operators
         # instead of silently blamed on the client forever.
         sqlstate = getattr(exc.orig, "sqlstate", None)
+        # The response body says nothing specific; the log is the only place
+        # the cause survives. Without exc_info, this handler would be less
+        # debuggable than the unhandled 500 it replaced, and SQLSTATE alone
+        # does not identify the offending value.
         logger.warning(
             "Invalid data for the database on %s (SQLSTATE %s)",
             request.url.path,
             sqlstate or "unknown",
+            exc_info=exc,
         )
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
