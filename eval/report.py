@@ -197,7 +197,10 @@ def build_markdown(run: dict) -> str:
         "",
         f"- **when**: {run['started_at']}",
         f"- **embedder**: `{run['embedder']['label']}` -- "
-        f"{run['embedder']['describe']}",
+        f"{run['embedder']['describe']} "
+        f"({run['embedder'].get('calls', 0)} calls, "
+        f"{run['embedder'].get('cache_hits', 0)} cache hits, "
+        f"{run['embedder'].get('retries', 0)} retries)",
         f"- **corpus**: `{run['corpus']['path']}`",
         f"- **query set**: `{run['query_set']['path']}` "
         f"({run['query_set']['queries']} queries)",

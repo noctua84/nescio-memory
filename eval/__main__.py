@@ -206,6 +206,12 @@ def run(arguments: argparse.Namespace) -> dict:
             "label": embedder.label,
             "is_real": embedder.is_real,
             "describe": embedder.describe(),
+            # Disclosed rather than swallowed: a run that needed retries was
+            # measured against a backend that wobbled, and a reader deciding
+            # how much to trust a small delta should know that.
+            "calls": getattr(embedder, "calls", 0),
+            "cache_hits": getattr(embedder, "cache_hits", 0),
+            "retries": getattr(embedder, "retries", 0),
         },
         "config": {
             "chunk_size": settings.chunk_size,
