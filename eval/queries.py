@@ -27,10 +27,32 @@ class QuerySetError(RuntimeError):
     """The query set is unusable. Always fatal -- never degraded into a run."""
 
 
+# The three case kinds, closed on purpose.
+#
+# `kind` is REQUIRED on every case and is checked against this tuple, because
+# per-class reporting is the only thing that makes an aggregate interpretable.
+# An aggregate is driven entirely by the case mix: shift the mix and the
+# headline number moves without any retrieval behaviour changing, and a reader
+# has no way to see it happen. Reporting recall and MRR per class instead makes
+# the claim falsifiable -- "summary loses on oblique queries" is a statement
+# someone can go and check.
+#
+# Free-form kinds are rejected rather than accepted, because a set that drifts
+# into eight near-synonymous labels fragments into singleton classes and the
+# per-class numbers stop meaning anything.
+#
+#   topic   - restates the note's subject in other words.
+#   buried  - a fact that appears once in the body and is ABSENT from the
+#             note's name and description.
+#   oblique - a symptom or situation, with the mechanism not named.
+QUERY_KINDS = ("topic", "buried", "oblique")
+
+
 @dataclass(frozen=True)
 class Query:
     query_id: str
     text: str
+    kind: str
     expect_notes: tuple[str, ...]
     why: str
 
@@ -80,6 +102,13 @@ def load_query_set(path: Path, notes: list[Note]) -> list[Query]:
             problems.append(f"{where}: duplicate id {query_id!r}")
         seen_ids.add(query_id)
 
+        kind = str(entry.get("kind") or "").strip().lower()
+        if kind not in QUERY_KINDS:
+            problems.append(
+                f"{where} ({query_id}): 'kind' must be one of "
+                f"{', '.join(QUERY_KINDS)}, got {kind or '<missing>'!r}"
+            )
+
         expected = entry.get("expect_notes") or entry.get("expect") or []
         if isinstance(expected, str):
             expected = [expected]
@@ -100,6 +129,7 @@ def load_query_set(path: Path, notes: list[Note]) -> list[Query]:
             Query(
                 query_id=query_id,
                 text=text,
+                kind=kind,
                 expect_notes=tuple(expected),
                 why=str(entry.get("why") or "").strip(),
             )
@@ -110,3 +140,15 @@ def load_query_set(path: Path, notes: list[Note]) -> list[Query]:
             "query set is invalid:\n  " + "\n  ".join(problems)
         )
     return queries
+
+
+def kind_mix(queries: list[Query]) -> dict[str, int]:
+    """How many cases of each kind, in QUERY_KINDS order.
+
+    Reported with every run so the mix behind an aggregate is on the page
+    next to it rather than something a reader has to go and count.
+    """
+    return {
+        kind: sum(1 for query in queries if query.kind == kind)
+        for kind in QUERY_KINDS
+    }

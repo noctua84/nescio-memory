@@ -2,9 +2,10 @@
 #
 # HOW TO ADD A CASE
 # -----------------
-# Append an entry to `queries:` with four fields:
+# Append an entry to `queries:` with five fields:
 #
 #   - id:            short, unique, stable. Referenced in reports.
+#     kind:          topic | buried | oblique. REQUIRED -- see below.
 #     query:         the question, phrased as a person would actually type it.
 #     expect_notes:  one or more note ids. A note id is the file's path
 #                    relative to the corpus root, e.g. "invoice-rounding.md".
@@ -21,8 +22,7 @@
 # A query set built only from note titles measures nothing except whether the
 # title was indexed, and it hands the `summary` strategy a win it has not
 # earned. A set built only from obscure details buried deep in bodies does the
-# mirror-image favour to `chunk`. This set deliberately mixes three kinds, and
-# the `kind` comment on each group says which:
+# mirror-image favour to `chunk`. This set deliberately mixes three kinds:
 #
 #   topic   - asks for the subject of a note in different words. Both
 #             strategies should do well.
@@ -34,38 +34,56 @@
 #             which is how people actually search. Neither strategy has an
 #             obvious advantage.
 #
-# If you add cases, add them across all three. Skewing the mix is how this
-# harness produces a confident wrong answer.
+# `kind` is a declared FIELD, not a comment, and the loader rejects a case
+# without one. Skewing the mix is how this harness produces a confident wrong
+# answer, so every report breaks recall and MRR down per kind as well as
+# overall: the aggregate is a weighted average of the per-class numbers with
+# the mix as the weights, and on its own it is as much a fact about this file
+# as about retrieval. If you add cases, add them across all three.
+#
+# CASE MIX IN THIS FILE
+# ---------------------
+# topic 6, buried 8, oblique 6 (20 cases). This mix is NOT a claim about real
+# usage -- it is a fixture mix, chosen to put a handful of cases in each class
+# so the harness's own per-class plumbing is exercised and reviewable by
+# anyone, on a corpus that can be committed to a public repository. A mix
+# chosen to reflect real usage belongs with a real corpus.
 
 queries:
-  # kind: topic
+  # ---- topic ----
   - id: pool-sizing
+    kind: topic
     query: how many database connections will we actually open across all our pods
     expect_notes: [postgres-connection-pooling.md]
     why: The note's whole subject is per-pod versus per-cluster connection arithmetic.
 
   - id: retention-how-long
+    kind: topic
     query: how long do we keep transaction records and request logs
     expect_notes: [data-retention-windows.md]
     why: Both windows are stated explicitly; this is the note's primary purpose.
 
   - id: rollout-stages
+    kind: topic
     query: what percentages do we roll a change out in and how long do we wait between them
     expect_notes: [feature-flag-rollout.md]
     why: The stage ladder and soak times are the note's headline content.
 
   - id: escalate-when
+    kind: topic
     query: how long should I work on an incident before waking someone else up
     expect_notes: [oncall-escalation.md]
     why: The thirty minute ceiling and the permission to escalate early are the point of the note.
 
   - id: idempotency-basics
+    kind: topic
     query: how do we make it safe for a client to retry a payment request
     expect_notes: [idempotency-keys.md]
     why: Client-supplied keys on retryable writes is the note's subject.
 
-  # kind: buried
+  # ---- buried ----
   - id: multipart-leak
+    kind: buried
     query: we are being billed for storage that does not show up in any object listing
     expect_notes: [object-storage-lifecycle.md]
     why: >-
@@ -74,16 +92,19 @@ queries:
       invisible bytes directly.
 
   - id: bankers-rounding
+    kind: buried
     query: should we round half to even or half away from zero
     expect_notes: [invoice-rounding.md]
     why: Rounding mode is one paragraph deep in the body; the description does not mention it.
 
   - id: refresh-race
+    kind: buried
     query: two refresh calls raced each other and the user got logged out
     expect_notes: [session-token-expiry.md]
     why: The ten second grace window for concurrent refresh is a single body paragraph.
 
   - id: flag-hash-key
+    kind: buried
     query: why do two independent experiments at the same percentage pick the same users
     expect_notes: [feature-flag-rollout.md]
     why: >-
@@ -91,6 +112,7 @@ queries:
       bucketing paragraph, and the correlation consequence only there.
 
   - id: midnight-dates
+    kind: buried
     query: a birthday shifted by a day for some users
     expect_notes: [timestamp-storage.md]
     why: >-
@@ -99,11 +121,13 @@ queries:
       with -- exactly the case worth measuring.
 
   - id: lockfile-copy
+    kind: buried
     query: our build reinstalls every dependency when we change one line of source
     expect_notes: [container-build-cache.md]
     why: Layer ordering and the narrow manifest copy are body content.
 
   - id: deletion-missed-systems
+    kind: buried
     query: which systems do we forget when erasing someone's data
     expect_notes: [data-retention-windows.md]
     why: >-
@@ -111,32 +135,38 @@ queries:
       consistently-missed ones only in the body checklist.
 
   - id: restore-reapply
+    kind: buried
     query: we restored from a backup, what do we have to redo
     expect_notes: [data-retention-windows.md]
     why: The deletion-journal replay rule is one sentence in the body.
 
-  # kind: oblique
+  # ---- oblique ----
   - id: throughput-collapse
+    kind: oblique
     query: consumers look healthy and busy but lag is climbing and nothing is being processed
     expect_notes: [consumer-group-rebalance.md]
     why: Describes the rebalance-loop symptom without naming rebalancing.
 
   - id: thundering-herd
+    kind: oblique
     query: the origin database falls over every time a popular cached value expires
     expect_notes: [cache-stampede-mitigation.md]
     why: Describes the stampede by its effect rather than its name.
 
   - id: short-results
+    kind: oblique
     query: search returns three results when we asked for ten and there is no error
     expect_notes: [vector-index-recall.md]
     why: The post-filter short-result-set symptom, described as a user would report it.
 
   - id: stuck-pipeline
+    kind: oblique
     query: the deploy job died halfway and now nobody else can apply anything
     expect_notes: [terraform-state-locking.md]
     why: A stale lock after a killed CI job, described as the situation rather than the mechanism.
 
   - id: idle-memory-growth
+    kind: oblique
     query: memory keeps growing all day but traffic is flat and we cannot find a leak
     expect_notes: [postgres-connection-pooling.md]
     why: >-
@@ -147,6 +177,7 @@ queries:
   # scored against the set. These are where a single-note-per-query set gives a
   # misleadingly harsh number.
   - id: cache-invalidation-variants
+    kind: oblique
     query: how do we avoid serving one variant of a change to users in the other group
     expect_notes: [feature-flag-rollout.md, cache-stampede-mitigation.md]
     why: >-
@@ -154,6 +185,7 @@ queries:
       serving stale values. Either is a defensible answer.
 
   - id: retry-safety
+    kind: topic
     query: what has to be true for it to be safe to retry an operation automatically
     expect_notes: [idempotency-keys.md, consumer-group-rebalance.md]
     why: >-

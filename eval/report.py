@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 from eval.metrics import StrategyScore
+from eval.queries import QUERY_KINDS
 
 # One limitation list, rendered into every report. A reader who sees only the
 # output file -- which is how these get circulated -- must see the caveats too,
@@ -25,6 +26,13 @@ LIMITATIONS = [
     "the `summary` strategy.",
     "A single embedding model at one point in time. Re-run after any change to "
     "OLLAMA_MODEL or EMBEDDING_DIMENSION; the result does not transfer.",
+    "The OVERALL row is a weighted average of the per-class rows with the case "
+    "mix as the weights, so on its own it is a fact about the query set as "
+    "much as about retrieval. Read the by-kind table; it is the part that "
+    "survives a change of mix.",
+    "`hybrid` is measured as one shared cosine ranking over both unit types, "
+    "which is what storing both in one table would mean for /search. It is "
+    "not a score fusion, and says nothing about what one would do.",
 ]
 
 STUB_BANNER = """> [!WARNING]
@@ -80,52 +88,107 @@ def _signed(value: float) -> str:
     return f"{value:+.3f}"
 
 
-def _verdict(chunk: StrategyScore, summary: StrategyScore, is_real: bool) -> str:
-    if not is_real:
+# A single threshold, named rather than implied. 0.05 on a query set of a few
+# dozen cases is roughly one or two queries changing outcome, which is not a
+# result; it is stated as inconclusive rather than rounded into one.
+MATERIAL_DELTA = 0.05
+
+
+def _leader(scores: dict[str, StrategyScore], order: list[str], metric) -> list[str]:
+    """Every strategy within MATERIAL_DELTA of the best on `metric`.
+
+    A list rather than a winner, because "best by 0.004" is not a finding and
+    naming it as one is how a measurement turns into a decision it cannot
+    support.
+    """
+    best = max(metric(scores[name]) for name in order)
+    return [
+        name for name in order if best - metric(scores[name]) < MATERIAL_DELTA
+    ]
+
+
+def _verdict(run: dict) -> str:
+    if not run["embedder"]["is_real"]:
         return (
             "**No verdict.** This run used the stub embedder; it measures word "
             "overlap, not meaning, so it cannot answer the question."
         )
-    recall_delta = summary.recall_at_k[5] - chunk.recall_at_k[5]
-    mrr_delta = summary.mrr_at_10 - chunk.mrr_at_10
-    # A single threshold, named rather than implied. 0.05 on a query set of a
-    # few dozen cases is roughly one or two queries changing outcome, which is
-    # not a result; it is stated as inconclusive rather than rounded into one.
-    if abs(recall_delta) < 0.05 and abs(mrr_delta) < 0.05:
-        leaning = (
-            "**Inconclusive.** Both recall@5 and MRR@10 differ by less than "
-            "0.05, which on this query set is a query or two changing outcome. "
-            "Add cases before concluding."
+    order = list(run["strategy_order"])
+    scores = run["scores"]
+    by_recall = _leader(scores, order, lambda score: score.recall_at_k[5])
+    by_mrr = _leader(scores, order, lambda score: score.mrr_at_10)
+    agreed = [name for name in by_recall if name in by_mrr]
+
+    lines: list[str] = []
+    if not agreed:
+        lines.append(
+            f"**Split.** recall@5 favours {_names(by_recall)} and MRR@10 "
+            f"favours {_names(by_mrr)}. The two metrics disagree, so the "
+            f"headline is not a result -- read the by-kind table."
         )
-    elif recall_delta > 0 and mrr_delta > 0:
-        leaning = (
-            f"**`summary` wins** on both headline metrics "
-            f"(recall@5 {_signed(recall_delta)}, MRR@10 {_signed(mrr_delta)})."
+    elif len(agreed) == len(order):
+        lines.append(
+            f"**Inconclusive overall.** All {len(order)} strategies sit within "
+            f"{MATERIAL_DELTA:.2f} of each other on both recall@5 and MRR@10, "
+            f"which on this query set is a query or two changing outcome."
         )
-    elif recall_delta < 0 and mrr_delta < 0:
-        leaning = (
-            f"**`chunk` wins** on both headline metrics "
-            f"(recall@5 {_signed(recall_delta)}, MRR@10 {_signed(mrr_delta)})."
+    elif len(agreed) == 1:
+        lines.append(
+            f"**`{agreed[0]}` leads** on both recall@5 and MRR@10 by more than "
+            f"{MATERIAL_DELTA:.2f}."
         )
     else:
-        leaning = (
-            f"**Split.** recall@5 {_signed(recall_delta)} but MRR@10 "
-            f"{_signed(mrr_delta)}; the two metrics disagree, so read the "
-            f"per-query table rather than the headline."
+        lines.append(
+            f"**{_names(agreed)} tie** at the top on both metrics, within "
+            f"{MATERIAL_DELTA:.2f} of each other and ahead of the rest."
         )
-    return leaning + " Deltas are `summary` minus `chunk`."
+
+    # Per-class, stated in the verdict and not only in its own table. A verdict
+    # that quoted the aggregate alone would be reporting the case mix.
+    class_scores = run["class_scores"]
+    for kind in QUERY_KINDS:
+        if kind not in class_scores[order[0]]:
+            continue
+        slices = {name: class_scores[name][kind] for name in order}
+        winners = _leader(slices, order, lambda score: score.mrr_at_10)
+        count = slices[order[0]].queries
+        detail = ", ".join(
+            f"`{name}` {slices[name].mrr_at_10:.3f}" for name in order
+        )
+        lines.append(
+            f"- **{kind}** (n={count}): MRR@10 {detail} -- "
+            + (
+                "no separation."
+                if len(winners) == len(order)
+                else f"{_names(winners)} ahead."
+            )
+        )
+    return "\n".join(lines)
+
+
+def _names(names: list[str]) -> str:
+    quoted = [f"`{name}`" for name in names]
+    if len(quoted) == 1:
+        return quoted[0]
+    return ", ".join(quoted[:-1]) + " and " + quoted[-1]
 
 
 def build_markdown(run: dict) -> str:
     ks = run["ks"]
-    chunk = run["scores"]["chunk"]
-    summary = run["scores"]["summary"]
+    order = list(run["strategy_order"])
+    scores = run["scores"]
+    class_scores = run["class_scores"]
     is_real = run["embedder"]["is_real"]
 
-    out: list[str] = ["# Retrieval evaluation: `chunk` vs `summary`", ""]
+    out: list[str] = [
+        "# Retrieval evaluation: " + " vs ".join(f"`{name}`" for name in order),
+        "",
+    ]
     if not is_real:
         out += [STUB_BANNER, ""]
 
+    mix = run["query_set"]["kind_mix"]
+    total = sum(mix.values()) or 1
     out += [
         "Hand-run measurement, not a test. See `eval/__init__.py` for why this "
         "is not in `tests/`.",
@@ -138,13 +201,28 @@ def build_markdown(run: dict) -> str:
         f"- **corpus**: `{run['corpus']['path']}`",
         f"- **query set**: `{run['query_set']['path']}` "
         f"({run['query_set']['queries']} queries)",
+        "- **case mix**: "
+        + ", ".join(
+            f"{kind} {count} ({count / total:.0%})" for kind, count in mix.items()
+        ),
         f"- **chunking config**: CHUNK_SIZE={run['config']['chunk_size']}, "
         f"CHUNK_OVERLAP={run['config']['chunk_overlap']}, "
         f"min chunk chars={run['config']['min_content_chars']}",
+        f"- **embedding dimension**: {run['config']['embedding_dimension']}",
+        f"- **frontmatter mode**: `{run['config']['frontmatter_mode']}`",
         "",
-        "## Corpus shape",
+        "## Strategies",
         "",
     ]
+    out.append(
+        _table(
+            ["strategy", "rule"],
+            [[f"`{name}`", run["config"]["strategies"][name]] for name in order],
+            aligns="ll",
+        )
+    )
+
+    out += ["", "## Corpus shape", ""]
     shape = run["corpus"]["shape"]
     out.append(
         _table(
@@ -152,96 +230,154 @@ def build_markdown(run: dict) -> str:
             [[key.replace("_", " "), f"{value:g}"] for key, value in shape.items()],
         )
     )
+    recovered = shape.get("notes_with_recovered_frontmatter", 0)
+    if run["config"]["frontmatter_mode"] == "strict":
+        out += [
+            "",
+            "> [!NOTE]",
+            "> `--frontmatter strict`: a block that does not parse as YAML "
+            "contributed nothing, and a description YAML ate as a `#` comment "
+            "stayed eaten. This is what a production ingest on a stock YAML "
+            "parser sees, so `summary` is measured here on the keys the "
+            "corpus can actually hand it rather than on what its authors "
+            "wrote. Compare against the `recover` run of the same query set.",
+        ]
+    elif recovered:
+        out += [
+            "",
+            "> [!NOTE]",
+            f"> `--frontmatter recover`: {recovered} of {shape['notes']} notes "
+            f"needed authored `name`/`description` text restored, because "
+            f"their frontmatter either does not parse as YAML (an unquoted "
+            f"`:` in a plain scalar) or parses but loses the value to a `#` "
+            f"comment. `summary` is measured here on what the human wrote. "
+            f"Treating a fixable quoting bug as a missing description would "
+            f"instead credit that loss to indexing granularity -- compare "
+            f"against the `strict` run to see the size of the difference.",
+        ]
 
     out += ["", "## Index shape", ""]
-    chunk_stats = run["index"]["chunk"]
-    summary_stats = run["index"]["summary"]
+    stats = {name: run["index"][name] for name in order}
     out.append(
         _table(
-            ["property", "chunk", "summary"],
+            ["property"] + [f"`{name}`" for name in order],
             [
-                ["retrievable units", str(chunk_stats["units"]), str(summary_stats["units"])],
-                ["notes indexed", str(chunk_stats["notes_indexed"]), str(summary_stats["notes_indexed"])],
-                ["units per note", f"{chunk_stats['units_per_note']:.2f}", f"{summary_stats['units_per_note']:.2f}"],
-                ["mean unit chars", f"{chunk_stats['mean_unit_chars']:.1f}", f"{summary_stats['mean_unit_chars']:.1f}"],
-                [
-                    "notes w/o description (name-only fallback)",
-                    "n/a",
-                    str(summary_stats["notes_without_description"]),
+                ["retrievable units"]
+                + [str(stats[name]["units"]) for name in order],
+                ["notes indexed"]
+                + [str(stats[name]["notes_indexed"]) for name in order],
+                ["units per note"]
+                + [f"{stats[name]['units_per_note']:.2f}" for name in order],
+                ["mean unit chars"]
+                + [f"{stats[name]['mean_unit_chars']:.1f}" for name in order],
+                ["notes w/o description (name-only summary unit)"]
+                + [
+                    str(stats[name]["notes_without_description"]) or "0"
+                    for name in order
                 ],
-                [
-                    "notes with no unit at all",
-                    str(len(chunk_stats["notes_without_units"])),
-                    str(len(summary_stats["notes_without_units"])),
-                ],
+                ["notes with no unit at all"]
+                + [str(len(stats[name]["notes_without_units"])) for name in order],
             ],
         )
     )
 
-    out += ["", "## Results", ""]
-    metric_rows = []
-    for k in ks:
-        metric_rows.append(
-            [
-                f"recall@{k}",
-                f"{chunk.recall_at_k[k]:.3f}",
-                f"{summary.recall_at_k[k]:.3f}",
-                _signed(summary.recall_at_k[k] - chunk.recall_at_k[k]),
-            ]
-        )
-    metric_rows.append(
-        [
-            "MRR@10",
-            f"{chunk.mrr_at_10:.3f}",
-            f"{summary.mrr_at_10:.3f}",
-            _signed(summary.mrr_at_10 - chunk.mrr_at_10),
+    out += ["", "## Results: overall", "", _metric_table(scores, order, ks), ""]
+    out += [
+        "> [!IMPORTANT]",
+        "> This table is a weighted average of the next one, with the case mix "
+        "as the weights. Change the mix and the winner here can change with no "
+        "retrieval behaviour changing at all. The by-kind table is the finding; "
+        "this one is a summary of it.",
+        "",
+        "## Results: by query kind",
+        "",
+        "`topic` restates the note's subject in other words. `buried` asks for "
+        "a fact that appears once in a body and is absent from the name and "
+        "description. `oblique` describes a symptom without naming the "
+        "mechanism.",
+        "",
+    ]
+    for kind in QUERY_KINDS:
+        if kind not in class_scores[order[0]]:
+            continue
+        slices = {name: class_scores[name][kind] for name in order}
+        count = slices[order[0]].queries
+        out += [
+            f"### `{kind}` (n={count})",
+            "",
+            _metric_table(slices, order, ks),
+            "",
         ]
-    )
-    out.append(_table(["metric", "chunk", "summary", "delta"], metric_rows))
 
     out += [
-        "",
         "### Diagnostic: distinct notes among the top k units",
         "",
         "`summary` is one unit per note, so this is k by construction. For "
-        "`chunk` it shows how many result slots are duplicate notes -- the "
-        "mechanism behind any recall gap above.",
+        "`chunk` and `hybrid` it shows how many result slots are duplicate "
+        "notes -- the mechanism behind any recall gap above.",
         "",
     ]
     out.append(
         _table(
-            ["k", "chunk", "summary"],
+            ["k"] + [f"`{name}`" for name in order],
             [
-                [
-                    str(k),
-                    f"{chunk.mean_distinct_notes_at_k[k]:.2f}",
-                    f"{summary.mean_distinct_notes_at_k[k]:.2f}",
-                ]
+                [str(k)]
+                + [f"{scores[name].mean_distinct_notes_at_k[k]:.2f}" for name in order]
                 for k in ks
             ],
         )
     )
 
-    out += ["", "## Verdict", "", _verdict(chunk, summary, is_real), ""]
+    routes = run.get("first_hit_routes", {})
+    if "hybrid" in routes:
+        counted: dict[str, int] = {}
+        for route in routes["hybrid"].values():
+            counted[route or "miss"] = counted.get(route or "miss", 0) + 1
+        out += [
+            "",
+            "### Diagnostic: which route reached the note first in `hybrid`",
+            "",
+            "If one route never wins, the union is carrying dead weight and "
+            "the simpler single-type index is the better design.",
+            "",
+            _table(
+                ["route", "queries"],
+                [
+                    [key, str(value)]
+                    for key, value in sorted(
+                        counted.items(), key=lambda row: -row[1]
+                    )
+                ],
+            ),
+        ]
+
+    out += ["", "## Verdict", "", _verdict(run), ""]
 
     out += ["## Per query (rank of first relevant note, 1-based in unit space)", ""]
-    per_chunk = {score.query_id: score for score in chunk.per_query}
-    per_summary = {score.query_id: score for score in summary.per_query}
+    per_strategy = {
+        name: {score.query_id: score for score in scores[name].per_query}
+        for name in order
+    }
     rows = []
     for query in run["query_set"]["entries"]:
         query_id = query["id"]
-        chunk_rank = per_chunk[query_id].first_relevant_rank
-        summary_rank = per_summary[query_id].first_relevant_rank
         text = query["query"]
-        rows.append(
-            [
-                query_id,
-                text if len(text) <= 58 else text[:55] + "...",
-                str(chunk_rank) if chunk_rank else "miss",
-                str(summary_rank) if summary_rank else "miss",
-            ]
+        row = [
+            query_id,
+            query["kind"],
+            text if len(text) <= 52 else text[:49] + "...",
+        ]
+        for name in order:
+            rank = per_strategy[name][query_id].first_relevant_rank
+            row.append(str(rank) if rank else "miss")
+        rows.append(row)
+    out.append(
+        _table(
+            ["id", "kind", "query"] + [f"`{name}`" for name in order],
+            rows,
+            aligns="lll" + "r" * len(order),
         )
-    out.append(_table(["id", "query", "chunk", "summary"], rows, aligns="llrr"))
+    )
     out += ["", "`miss` means no expected note appeared in the top 10.", ""]
 
     out += ["## What this does not measure", ""]
@@ -250,9 +386,27 @@ def build_markdown(run: dict) -> str:
     return "\n".join(out)
 
 
+def _metric_table(
+    scores: dict[str, StrategyScore], order: list[str], ks: list[int]
+) -> str:
+    """recall@k and MRR@10, one column per strategy.
+
+    The delta column the two-strategy version carried is gone: with three
+    strategies there is no single baseline to subtract, and picking one would
+    quietly privilege it. The leader is named in the verdict instead.
+    """
+    rows = [
+        [f"recall@{k}"] + [f"{scores[name].recall_at_k[k]:.3f}" for name in order]
+        for k in ks
+    ]
+    rows.append(["MRR@10"] + [f"{scores[name].mrr_at_10:.3f}" for name in order])
+    return _table(["metric"] + [f"`{name}`" for name in order], rows)
+
+
 def _score_to_dict(score: StrategyScore) -> dict:
     return {
         "strategy": score.strategy_name,
+        "kind": score.kind or "overall",
         "queries": score.queries,
         "recall_at_k": {str(k): value for k, value in score.recall_at_k.items()},
         "mrr_at_10": score.mrr_at_10,
@@ -286,13 +440,26 @@ def build_json(run: dict) -> str:
         "query_set": {
             "path": run["query_set"]["path"],
             "queries": run["query_set"]["queries"],
+            "kind_mix": run["query_set"]["kind_mix"],
             "entries": run["query_set"]["entries"],
         },
         "ks": list(run["ks"]),
+        "strategy_order": list(run["strategy_order"]),
         "index": run["index"],
         "scores": {
             name: _score_to_dict(score) for name, score in run["scores"].items()
         },
+        # The per-class slices, which are the interpretable part: `scores`
+        # above is these weighted by the case mix. A consumer comparing two
+        # runs should compare here, because two query sets over the same corpus
+        # differ in mix even when both are honest.
+        "class_scores": {
+            name: {
+                kind: _score_to_dict(score) for kind, score in by_kind.items()
+            }
+            for name, by_kind in run["class_scores"].items()
+        },
+        "first_hit_routes": run["first_hit_routes"],
         "limitations": LIMITATIONS,
     }
     return json.dumps(payload, indent=2, sort_keys=False)

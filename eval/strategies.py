@@ -1,9 +1,18 @@
-"""The two indexing strategies under comparison, behind one interface.
+"""The indexing strategies under comparison, behind one interface.
 
-A strategy is nothing more than a rule for turning one note into the list of
-texts that get embedded, each of which becomes one retrievable unit pointing
-back at that note. Both strategies then go through the identical embedder,
-index builder and scorer, so the only variable between two runs is this rule.
+A PRIMITIVE strategy is nothing more than a rule for turning one note into the
+list of texts that get embedded, each of which becomes one retrievable unit
+pointing back at that note. Every primitive then goes through the identical
+embedder, index builder and scorer, so the only variable between two runs is
+this rule.
+
+A COMPOSITE strategy embeds nothing of its own. It names primitives whose
+indexes are unioned into one ranking (see eval.retrieval.union_index), which is
+what `hybrid` is. Composites are kept a separate concept rather than a third
+primitive whose unit_texts concatenates the others', because a primitive gets
+its vectors from the embedder and a composite must provably not: the embedder
+is one serial HTTP call per unit, and a third pass over the real corpus would
+cost another ~2,800 calls to recompute vectors already held in memory.
 """
 from dataclasses import dataclass
 from typing import Callable
@@ -77,3 +86,33 @@ SUMMARY = Strategy(
 )
 
 STRATEGIES = {strategy.name: strategy for strategy in (CHUNK, SUMMARY)}
+
+
+@dataclass(frozen=True)
+class Composite:
+    """A strategy whose index is the union of other strategies' indexes."""
+
+    name: str
+    parts: tuple[str, ...]
+    summary: str
+
+    def describe(self) -> str:
+        return self.summary
+
+
+HYBRID = Composite(
+    name="hybrid",
+    parts=("summary", "chunk"),
+    summary=(
+        "both unit types in one index: one name+description unit per note PLUS "
+        "its body chunks, ranked together in a single cosine ordering as "
+        "/search would if both were stored in one table"
+    ),
+)
+
+COMPOSITES = {composite.name: composite for composite in (HYBRID,)}
+
+# The order every report lists strategies in: the two primitives as ADR 0005
+# frames the choice, then the composite that is only on the table because the
+# first measurement made it worth asking about.
+REPORT_ORDER = ("chunk", "summary", "hybrid")

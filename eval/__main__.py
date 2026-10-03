@@ -12,13 +12,23 @@ import eval.appenv  # noqa: F401  -- must precede any app. import; see appenv
 
 from app.config import settings
 from app.core.errors import EmbeddingBackendError
-from eval.corpus import CorpusError, corpus_shape, load_corpus
+from eval.corpus import (
+    FRONTMATTER_MODES,
+    CorpusError,
+    corpus_shape,
+    load_corpus,
+)
 from eval.embedders import build_embedder
-from eval.metrics import DEFAULT_KS, aggregate, score_query
-from eval.queries import QuerySetError, load_query_set
+from eval.metrics import DEFAULT_KS, aggregate, aggregate_by_kind, score_query
+from eval.queries import QUERY_KINDS, QuerySetError, kind_mix, load_query_set
 from eval.report import write_reports
-from eval.retrieval import build_index, search
-from eval.strategies import MIN_CONTENT_CHARS, STRATEGIES
+from eval.retrieval import build_index, search, union_index
+from eval.strategies import (
+    COMPOSITES,
+    MIN_CONTENT_CHARS,
+    REPORT_ORDER,
+    STRATEGIES,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CORPUS = REPO_ROOT / "eval" / "corpora" / "synthetic"
@@ -82,6 +92,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="where to write the .md and .json report (default: eval-out/)",
     )
     parser.add_argument(
+        "--frontmatter",
+        choices=FRONTMATTER_MODES,
+        default="recover",
+        help=(
+            "how to read a note's name/description. 'strict' is yaml.safe_load "
+            "alone -- a block that will not parse contributes nothing, and a "
+            "value YAML eats as a '#' comment stays eaten, which is what a "
+            "production ingest on a stock YAML parser would see. 'recover' "
+            "additionally reads the authored text for keys YAML dropped or "
+            "truncated, which is what the human wrote. The choice moves the "
+            "result on a hand-maintained corpus, so run BOTH rather than "
+            "arguing it (default: recover)"
+        ),
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -106,7 +131,7 @@ def resolve_query_set(corpus: Path, explicit: Path | None) -> Path:
 
 def run(arguments: argparse.Namespace) -> dict:
     started = datetime.now(timezone.utc)
-    notes = load_corpus(arguments.corpus)
+    notes = load_corpus(arguments.corpus, arguments.frontmatter)
     if arguments.limit is not None:
         notes = notes[: arguments.limit]
     query_path = resolve_query_set(arguments.corpus, arguments.queries)
@@ -121,11 +146,33 @@ def run(arguments: argparse.Namespace) -> dict:
             file=sys.stderr,
         )
 
+    kinds = {query.query_id: query.kind for query in queries}
+
+    # Primitives first, because the composites are unions of their indexes and
+    # must not trigger a second embedding pass. built[] keeps the Index objects
+    # (vectors included) alive for exactly that reason.
+    built = {
+        name: build_index(notes, strategy, embedder)
+        for name, strategy in STRATEGIES.items()
+    }
+    for name, composite in COMPOSITES.items():
+        print(
+            f"[{name}] unioning {' + '.join(composite.parts)} -- no embedding",
+            file=sys.stderr,
+            flush=True,
+        )
+        built[name] = union_index(
+            name, [built[part] for part in composite.parts]
+        )
+
     indexes = {}
     scores = {}
-    for name, strategy in STRATEGIES.items():
-        index = build_index(notes, strategy, embedder)
+    class_scores = {}
+    first_hit_routes = {}
+    for name in REPORT_ORDER:
+        index = built[name]
         per_query = []
+        routes: dict[str, str | None] = {}
         for query in queries:
             hits = search(index, embedder(query.text), RETRIEVE_LIMIT)
             per_query.append(
@@ -136,14 +183,24 @@ def run(arguments: argparse.Namespace) -> dict:
                     DEFAULT_KS,
                 )
             )
+            # Which unit type reached the note first. Meaningless for a
+            # primitive (always itself) and the whole point for `hybrid`: it is
+            # the only way to see whether the union is actually using both
+            # routes or whether one of them is dead weight.
+            routes[query.query_id] = next(
+                (hit.unit_kind for hit in hits if hit.note_id in query.relevant),
+                None,
+            )
         indexes[name] = index.stats()
         scores[name] = aggregate(name, per_query, DEFAULT_KS)
+        class_scores[name] = aggregate_by_kind(name, per_query, kinds, DEFAULT_KS)
+        first_hit_routes[name] = routes
 
     return {
         "started_at": started.isoformat(timespec="seconds"),
         "slug": (
             f"{started.strftime('%Y%m%d-%H%M%S')}-{arguments.corpus.name}"
-            f"-{embedder.label}"
+            f"-{embedder.label}-{arguments.frontmatter}"
         ),
         "embedder": {
             "label": embedder.label,
@@ -155,8 +212,10 @@ def run(arguments: argparse.Namespace) -> dict:
             "chunk_overlap": settings.chunk_overlap,
             "min_content_chars": MIN_CONTENT_CHARS,
             "embedding_dimension": settings.embedding_dimension,
+            "frontmatter_mode": arguments.frontmatter,
             "strategies": {
-                name: strategy.describe() for name, strategy in STRATEGIES.items()
+                name: (STRATEGIES.get(name) or COMPOSITES[name]).describe()
+                for name in REPORT_ORDER
             },
         },
         "corpus": {
@@ -166,10 +225,12 @@ def run(arguments: argparse.Namespace) -> dict:
         "query_set": {
             "path": str(query_path),
             "queries": len(queries),
+            "kind_mix": kind_mix(queries),
             "entries": [
                 {
                     "id": query.query_id,
                     "query": query.text,
+                    "kind": query.kind,
                     "expect_notes": list(query.expect_notes),
                     "why": query.why,
                 }
@@ -177,8 +238,11 @@ def run(arguments: argparse.Namespace) -> dict:
             ],
         },
         "ks": list(DEFAULT_KS),
+        "strategy_order": list(REPORT_ORDER),
         "index": indexes,
         "scores": scores,
+        "class_scores": class_scores,
+        "first_hit_routes": first_hit_routes,
     }
 
 
@@ -213,21 +277,49 @@ def main(argv: list[str] | None = None) -> int:
 
     markdown_path, json_path = write_reports(result, arguments.out)
 
-    chunk = result["scores"]["chunk"]
-    summary = result["scores"]["summary"]
+    order = result["strategy_order"]
+    mix = result["query_set"]["kind_mix"]
     print()
     print(f"corpus   {result['corpus']['shape']['notes']} notes, "
-          f"{result['query_set']['queries']} queries")
+          f"{result['query_set']['queries']} queries "
+          f"({', '.join(f'{kind} {count}' for kind, count in mix.items())})")
     print(f"embedder {result['embedder']['label']} -- "
           f"{result['embedder']['describe']}")
     print()
-    print(f"{'metric':<10}{'chunk':>9}{'summary':>9}{'delta':>9}")
+    header = f"{'metric':<10}" + "".join(f"{name:>9}" for name in order)
+    print(header)
     for k in DEFAULT_KS:
-        delta = summary.recall_at_k[k] - chunk.recall_at_k[k]
-        print(f"{'recall@' + str(k):<10}{chunk.recall_at_k[k]:>9.3f}"
-              f"{summary.recall_at_k[k]:>9.3f}{delta:>+9.3f}")
-    print(f"{'MRR@10':<10}{chunk.mrr_at_10:>9.3f}{summary.mrr_at_10:>9.3f}"
-          f"{summary.mrr_at_10 - chunk.mrr_at_10:>+9.3f}")
+        row = f"{'recall@' + str(k):<10}"
+        row += "".join(
+            f"{result['scores'][name].recall_at_k[k]:>9.3f}" for name in order
+        )
+        print(row)
+    print(f"{'MRR@10':<10}" + "".join(
+        f"{result['scores'][name].mrr_at_10:>9.3f}" for name in order
+    ))
+
+    # The per-class block, printed rather than left to the report file, because
+    # the aggregate above is a weighted average of these with the case mix as
+    # the weights -- reading it alone is how a case mix gets mistaken for a
+    # finding.
+    print()
+    print("recall@5 / MRR@10 by query kind")
+    print(f"{'kind':<10}{'n':>4}" + "".join(f"{name:>17}" for name in order))
+    for kind in QUERY_KINDS:
+        present = [
+            name for name in order if kind in result["class_scores"][name]
+        ]
+        if not present:
+            continue
+        count = result["class_scores"][present[0]][kind].queries
+        row = f"{kind:<10}{count:>4}"
+        for name in order:
+            slice_ = result["class_scores"][name].get(kind)
+            if slice_ is None:
+                row += f"{'--':>17}"
+            else:
+                row += f"{slice_.recall_at_k[5]:>10.3f}/{slice_.mrr_at_10:>6.3f}"
+        print(row)
     print()
     print(f"report   {markdown_path}")
     print(f"json     {json_path}")

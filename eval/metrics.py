@@ -77,6 +77,10 @@ def score_query(
 class StrategyScore:
     strategy_name: str
     queries: int
+    # "" for the overall score; one of eval.queries.QUERY_KINDS for a
+    # per-class slice. Carried on the score rather than only in the dict key
+    # so a score passed around on its own still says what it covers.
+    kind: str
     recall_at_k: dict[int, float]
     mrr_at_10: float
     mean_distinct_notes_at_k: dict[int, float]
@@ -87,6 +91,7 @@ def aggregate(
     strategy_name: str,
     scores: list[QueryScore],
     ks: tuple[int, ...] = DEFAULT_KS,
+    kind: str = "",
 ) -> StrategyScore:
     """Macro-average over queries: every query weighs the same.
 
@@ -99,6 +104,7 @@ def aggregate(
     return StrategyScore(
         strategy_name=strategy_name,
         queries=count,
+        kind=kind,
         recall_at_k={
             k: sum(score.recall_at_k[k] for score in scores) / count for k in ks
         },
@@ -109,3 +115,41 @@ def aggregate(
         },
         per_query=scores,
     )
+
+
+def aggregate_by_kind(
+    strategy_name: str,
+    scores: list[QueryScore],
+    kinds: dict[str, str],
+    ks: tuple[int, ...] = DEFAULT_KS,
+) -> dict[str, StrategyScore]:
+    """The same aggregate, sliced by the query set's `kind` field.
+
+    WHY THIS IS NOT OPTIONAL. The overall figure is a weighted average of these
+    slices with the case mix as the weights, so on its own it is not a finding
+    about retrieval at all -- it is a finding about the query set. Two honest
+    sets over the same corpus, differing only in how many `buried` cases they
+    contain, will report different winners. The per-class numbers are what
+    survive a change of mix, and they are what makes a claim like "summary
+    loses when the query names a symptom rather than the mechanism" something a
+    reader can check rather than take.
+
+    An absent kind is simply absent from the result; it is not reported as a
+    class with zero queries, which would read as a measured failure rather than
+    an unmeasured case. A query_id missing from `kinds` raises, because
+    silently dropping a case would shift every slice.
+    """
+    grouped: dict[str, list[QueryScore]] = {}
+    for score in scores:
+        try:
+            kind = kinds[score.query_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"query {score.query_id!r} has no kind; every case must declare "
+                f"one or the per-class slices are built on a partial set"
+            ) from exc
+        grouped.setdefault(kind, []).append(score)
+    return {
+        kind: aggregate(strategy_name, group, ks, kind=kind)
+        for kind, group in grouped.items()
+    }
