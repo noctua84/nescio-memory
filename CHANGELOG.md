@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/noctua84/nescio-memory/compare/v0.4.0...v0.4.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* [impl] set the embedding dimension to the model's real width (1024) ([d8335a2](https://github.com/noctua84/nescio-memory/commit/d8335a2eaec629807d6b5951a369657f9ab1a469)), closes [#36](https://github.com/noctua84/nescio-memory/issues/36)
+* set the embedding dimension to the model's real width (1024) ([158cd05](https://github.com/noctua84/nescio-memory/commit/158cd057ff64ba3910306f6ae19d5670b551ab43))
+
 ## [0.4.0](https://github.com/noctua84/nescio-memory/compare/v0.3.1...v0.4.0) (2026-10-02)
 
 
