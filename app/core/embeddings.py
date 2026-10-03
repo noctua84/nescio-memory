@@ -59,7 +59,14 @@ def _get_local_model():
     return _local_model
 
 
-def get_embedding(text: str) -> list[float]:
+def _fetch(text: str) -> object:
+    """Ask the configured backend for an embedding, without validating it.
+
+    Split out of get_embedding so probe_embedding_dimension() can measure what
+    the backend actually emits. Routing it through get_embedding instead would
+    mean the dimension check rejects the very vector being measured, which is
+    the one thing the probe must not do.
+    """
     if settings.embedding_backend == "local":
         try:
             vector = _get_local_model().encode(text).tolist()
@@ -75,7 +82,7 @@ def get_embedding(text: str) -> list[float]:
             raise EmbeddingBackendError(
                 f"Local embedding backend failed: {exc}"
             ) from exc
-        return _validated(vector)
+        return vector
 
     payload = {"model": settings.ollama_model, "prompt": text}
     try:
@@ -103,4 +110,37 @@ def get_embedding(text: str) -> list[float]:
         raise EmbeddingBackendBadResponse(
             f"Ollama response was not a usable embedding: {exc}"
         ) from exc
-    return _validated(vector)
+    return vector
+
+
+def get_embedding(text: str) -> list[float]:
+    return _validated(_fetch(text))
+
+
+# Short and fixed. The probe's only job is to make the backend emit one vector,
+# and a constant keeps the measurement comparable between runs.
+PROBE_TEXT = "nescio embedding dimension probe"
+
+
+def probe_embedding_dimension() -> int:
+    """How many floats the configured backend actually returns.
+
+    This is the number nothing else in this project measures. The startup check
+    in app.core.schema_checks compares EMBEDDING_DIMENSION against the database
+    column, and the test suite's fake embedder returns EMBEDDING_DIMENSION
+    floats by construction, so a configured width that disagrees with the real
+    model stays invisible until the first ingest fails -- which is exactly how
+    issue #36 survived a green suite.
+
+    Deliberately not called at startup: that would make boot depend on the
+    embedding backend being reachable, and a liveness probe that fails because
+    Ollama is restarting is worse than the mismatch it guards against. Called
+    instead by scripts/check_embedding_dimension.py and by the live-model
+    contract test.
+    """
+    vector = _fetch(PROBE_TEXT)
+    if not isinstance(vector, list):
+        raise EmbeddingBackendBadResponse(
+            f"embedding was {type(vector).__name__}, expected a list"
+        )
+    return len(vector)

@@ -1,8 +1,10 @@
 """Deterministic stand-ins for the one thing these tests do not exercise.
 
 Only the Ollama embedding call is faked. The database, the pgvector extension,
-the vector(384) column, the <=> cosine operator and the HNSW index are all
-real.
+the vector(N) column, the <=> cosine operator and the HNSW index are all
+real. Width comes from settings.embedding_dimension, so this file states no
+opinion about any model's output size -- which is precisely why it could not
+have caught issue #36.
 """
 import hashlib
 import math
