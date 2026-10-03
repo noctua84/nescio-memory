@@ -63,6 +63,31 @@ def _raise(exception):
     return _raiser
 
 
+def _handler_log_messages(caplog):
+    """The formatted messages this module's handler logger emitted, and no others.
+
+    caplog captures every logger in the process, so iterating caplog.records
+    directly makes an assertion about the whole run rather than about
+    app.core.errors. The `all(... not in message ...)` assertions are where that
+    actually bites: any unrelated library warning that happens to contain the
+    substring -- "unknown" is an ordinary English word, and SQLAlchemy, httpx and
+    testcontainers all log during these requests -- would fail the test for a
+    reason with nothing to do with the handler. Filtering by logger name keeps
+    the negative assertions about the one logger whose output is the contract.
+
+    getMessage() rather than caplog.text is also deliberate: the handler now
+    passes exc_info, so caplog.text carries the driver's traceback (including
+    psycopg's NUL wording). That belongs in the log and is exactly what the
+    exc_info change is for, but it would make a naive substring search over
+    caplog.text match things this test is not asserting about.
+    """
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "app.core.errors"
+    ]
+
+
 @contextmanager
 def _client_that_reports_server_errors(db_session):
     """A TestClient wired to the test transaction that returns 5xx responses.
@@ -347,12 +372,19 @@ def test_a_nul_byte_in_the_search_query_text_never_reaches_the_database(
     # The premise the test above rests on, pinned so it cannot quietly stop being
     # true. Search is vector search: the query string's only destination is the
     # embedding backend, and what goes to Postgres is a list of floats. So an
-    # unrepresentable byte in `query` is not a database concern at all and must
-    # NOT be answered with 400 -- the search is simply performed and matches
-    # nothing. If someone later adds a lexical/trigram fallback that binds the
-    # raw query text, this test turns red, which is the correct moment to decide
+    # unrepresentable byte in `query` is not a database concern at all, and the
+    # search runs to completion against the real table rather than being mapped
+    # to 400. If someone later adds a lexical/trigram fallback that binds the raw
+    # query text, this test turns red, which is the correct moment to decide
     # whether that path should be mapped too.
+    #
+    # A row is seeded deliberately. Asserting an empty result list would be
+    # vacuous -- an empty table returns [] whether the query ran or not, so the
+    # assertion would prove only "not a 400". With a row present, a 200 carrying
+    # that row's content is positive evidence that the statement reached Postgres
+    # and came back, which is the claim this test is actually making.
     key = make_api_key(db_session, "acme")
+    make_learning(db_session, "acme", content=ORIGINAL_CONTENT)
     monkeypatch.setattr(search_module, "get_embedding", fake_embedding)
 
     with _client_that_reports_server_errors(db_session) as http:
@@ -363,7 +395,8 @@ def test_a_nul_byte_in_the_search_query_text_never_reaches_the_database(
         )
 
     assert response.status_code == 200
-    assert response.json() == {"results": []}
+    contents = [result["content"] for result in response.json()["results"]]
+    assert contents == [ORIGINAL_CONTENT]
 
 
 def test_the_drivers_nul_byte_message_does_not_reach_the_client(
@@ -424,7 +457,7 @@ def test_a_client_side_rejection_is_logged_with_the_path_and_an_unknown_sqlstate
             )
 
     assert response.status_code == 400
-    messages = [record.getMessage() for record in caplog.records]
+    messages = _handler_log_messages(caplog)
     assert any("/api/v1/ingest" in message for message in messages), messages
     assert any("SQLSTATE unknown" in message for message in messages), messages
     # The log is allowed internal detail, but it must not be the response's
@@ -479,7 +512,7 @@ def test_a_server_side_22xxx_is_also_a_400_and_its_sqlstate_is_logged(
     assert response.json() == {"detail": INVALID_DATA_DETAIL}
     assert "Retry-After" not in response.headers
 
-    messages = [record.getMessage() for record in caplog.records]
+    messages = _handler_log_messages(caplog)
     assert any("22003" in message for message in messages), messages
     assert any("/api/v1/search" in message for message in messages), messages
     assert all("unknown" not in message for message in messages), messages
@@ -567,4 +600,85 @@ def test_a_failure_partway_through_a_file_leaves_earlier_rows_intact(
     ).all()
     assert len(surviving) == 1
     assert surviving[0].content == ORIGINAL_CONTENT
+    assert check.scalar(select(func.count()).select_from(Learning)) == 1
+
+
+def test_a_commit_time_rejection_leaves_the_existing_chunks_intact(
+    connection, monkeypatch
+):
+    """A DataError raised by the commit itself must still be all-or-nothing.
+
+    The sibling above, test_a_failure_partway_through_a_file_leaves_earlier_rows_
+    intact, does NOT cover this. Its failure arrives from get_embedding, i.e.
+    inside the loop and strictly before db.commit(). A NUL byte in `content`
+    fails at a genuinely different moment: the DELETE has already been issued
+    and every embedding has already succeeded, and the rejection happens only
+    when the INSERTs are flushed at the commit. That is the worst moment for it
+    to happen -- delete_by_file() has notionally removed the caller's previous
+    chunks for this file, so a commit that half-applied would answer 400 and
+    destroy data in the same breath.
+
+    The `client` fixture and this module's _client_that_reports_server_errors
+    helper both override get_db with `lambda: db_session` -- a plain function,
+    not a generator, so the `finally: db.close()` that performs the rollback in
+    production never runs and the rollback cannot be observed from the
+    assertions. The override below is generator shaped, like the real get_db,
+    which is the same reason the sibling test builds its own.
+
+    raise_server_exceptions=False is still required on top of that, for the
+    reason given on the helper: without it a missing handler would raise out of
+    client.post() instead of letting this test see the response and then check
+    the rows.
+    """
+    # Setup lives in its own session and is committed, so releasing the
+    # endpoint's savepoint later cannot take the setup row with it.
+    setup = Session(bind=connection, join_transaction_mode="create_savepoint")
+    key = make_api_key(setup, "acme")
+    make_learning(
+        setup,
+        "acme",
+        repo_name=INGEST_PAYLOAD["repo_name"],
+        file_path=INGEST_PAYLOAD["file_path"],
+        content=ORIGINAL_CONTENT,
+    )
+    setup.commit()
+
+    # Embedding must succeed for all chunks: the point is to reach the commit
+    # with real rows pending, not to fail earlier for an unrelated reason.
+    monkeypatch.setattr(ingest_module, "get_embedding", fake_embedding)
+
+    def production_shaped_get_db():
+        request_session = Session(
+            bind=connection, join_transaction_mode="create_savepoint"
+        )
+        try:
+            yield request_session
+        finally:
+            request_session.close()
+
+    app.dependency_overrides[get_db] = production_shaped_get_db
+    try:
+        # Same repo_name and file_path as the seeded row, so delete_by_file()
+        # genuinely targets it. The NUL rides on the content, which survives
+        # chunking untouched and is only rejected when the INSERT is flushed.
+        response = TestClient(app, raise_server_exceptions=False).post(
+            "/api/v1/ingest",
+            data={**INGEST_PAYLOAD, "content": LONG_ENOUGH + NUL_BYTE},
+            headers={"X-API-Key": key},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": INVALID_DATA_DETAIL}
+
+    check = Session(bind=connection, join_transaction_mode="create_savepoint")
+    surviving = check.scalars(
+        select(Learning).where(Learning.client_name == "acme")
+    ).all()
+    # The pre-existing chunk is still there, with its original text: the DELETE
+    # was rolled back with the failed INSERT rather than surviving it.
+    assert len(surviving) == 1
+    assert surviving[0].content == ORIGINAL_CONTENT
+    # And nothing from the rejected request was partially written.
     assert check.scalar(select(func.count()).select_from(Learning)) == 1
