@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.api.v1 import ingest as ingest_module
 from app.api.v1 import search as search_module
 from app.config import settings
+from app.core import embeddings as embeddings_module
 from app.core import errors as errors_module
 from app.core.db import get_db
 from app.core.errors import (
@@ -54,6 +55,27 @@ NUL_BYTE = "\x00"
 # psycopg's own wording for that rejection. It is an internal diagnostic and the
 # assertion below is that it never appears in a response body.
 PSYCOPG_NUL_MESSAGE = "PostgreSQL text fields cannot contain NUL (0x00) bytes"
+
+BAD_RESPONSE_DETAIL = "Embedding backend returned an unexpected response"
+
+
+def _vector_with_a_non_finite_component() -> list[float]:
+    """A vector that is the right width and the right type, and still unusable.
+
+    Every component is a genuine float and there are exactly
+    EMBEDDING_DIMENSION of them, so the list, length and component-type checks
+    in _validated() all pass and only its finiteness check can reject this.
+    That is the point: a NaN is not a malformed response in any way the older
+    checks could see.
+
+    Built in Python rather than decoded from a raw JSON body because this
+    module's subject is the endpoint contract. That the bare `NaN` / `Infinity`
+    literals really arrive off the wire as these values is pinned separately, in
+    tests/test_embeddings.py.
+    """
+    vector = [0.01] * settings.embedding_dimension
+    vector[0] = float("nan")
+    return vector
 
 
 def _raise(exception):
@@ -682,3 +704,72 @@ def test_a_commit_time_rejection_leaves_the_existing_chunks_intact(
     assert surviving[0].content == ORIGINAL_CONTENT
     # And nothing from the rejected request was partially written.
     assert check.scalar(select(func.count()).select_from(Learning)) == 1
+
+
+def test_a_degenerate_embedding_is_a_503_on_search_and_not_a_400(
+    db_session, monkeypatch
+):
+    # The alerting contract, pinned. This is the one test in the suite that
+    # catches a revert of the finiteness check, and it is built to discriminate.
+    #
+    # _fetch is what gets patched, not get_embedding. search_module.get_embedding
+    # is left as the real function so the real get_embedding -> _validated chain
+    # runs and raises on its own. Patching get_embedding to raise
+    # EmbeddingBackendBadResponse directly would only re-test the handler mapping
+    # -- which test_an_unreadable_backend_response_is_reported_distinctly already
+    # covers -- and would still pass with the finiteness check removed, making it
+    # worthless as a guard.
+    #
+    # Without that check the NaN reaches pgvector, which rejects it with SQLSTATE
+    # 22000 on the distance comparison, producing a DataError that the handler
+    # above maps to 400. So a wholly broken embedding backend would render every
+    # search a *client* error: 5xx alerts, error-rate dashboards and SLOs all
+    # stay green while the service returns nothing usable. 503 is the honest
+    # answer, because the backend answered with something unreadable and that is
+    # not the caller's fault.
+    key = make_api_key(db_session, "acme")
+    monkeypatch.setattr(
+        embeddings_module, "_fetch", lambda text: _vector_with_a_non_finite_component()
+    )
+
+    with _client_that_reports_server_errors(db_session) as http:
+        response = http.post(
+            "/api/v1/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": key}
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": BAD_RESPONSE_DETAIL}
+    # Retry-After *present* is the assertion that distinguishes this from the
+    # inversion it guards against. The DataError 400 this path produces without
+    # the fix carries no Retry-After (see the NUL-byte tests above), so a test
+    # that checked only the status and body would still be satisfied by a future
+    # handler change that got the code right and the semantics wrong. The header
+    # is also the substantive difference for a caller: a transient backend fault
+    # is worth retrying, and a rejected request never is.
+    assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)
+
+
+def test_a_degenerate_embedding_is_a_503_on_ingest_and_persists_nothing(
+    db_session, monkeypatch
+):
+    # The second route, for the same reason the NUL-byte tests cover two: the
+    # mapping has to be reachable from more than one call site. Ingest also adds
+    # the persistence assertion search cannot make -- delete_by_file() runs
+    # before the first embedding, so a failure that left the transaction
+    # committed would lose the file's existing chunks rather than merely fail.
+    key = make_api_key(db_session, "acme")
+    monkeypatch.setattr(
+        embeddings_module, "_fetch", lambda text: _vector_with_a_non_finite_component()
+    )
+
+    with _client_that_reports_server_errors(db_session) as http:
+        response = http.post(
+            "/api/v1/ingest", data=INGEST_PAYLOAD, headers={"X-API-Key": key}
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": BAD_RESPONSE_DETAIL}
+    assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)
+
+    db_session.expire_all()
+    assert db_session.scalar(select(func.count()).select_from(Learning)) == 0
