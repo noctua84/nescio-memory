@@ -1,3 +1,5 @@
+import math
+
 import httpx
 
 from app.config import settings
@@ -37,6 +39,13 @@ def _validated(vector: object) -> list[float]:
         if isinstance(component, bool) or not isinstance(component, (int, float)):
             raise EmbeddingBackendBadResponse(
                 f"embedding contained a {type(component).__name__}, expected numbers"
+            )
+        # NaN passes isinstance(..., float), so the type check above is
+        # insufficient to guarantee a usable value. math.isfinite rejects NaN,
+        # Infinity, and -Infinity.
+        if not math.isfinite(component):
+            raise EmbeddingBackendBadResponse(
+                f"embedding component was {component}, expected finite numbers"
             )
     return vector
 
