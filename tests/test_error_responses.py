@@ -773,3 +773,63 @@ def test_a_degenerate_embedding_is_a_503_on_ingest_and_persists_nothing(
 
     db_session.expire_all()
     assert db_session.scalar(select(func.count()).select_from(Learning)) == 0
+
+
+def _vector_with_a_float32_overflowing_component() -> list[float]:
+    """A vector of genuine finite floats that pgvector still cannot store.
+
+    Sibling of `_vector_with_a_non_finite_component()`, and the harder case of
+    the two. Every component is finite -- math.isfinite(1e39) is True -- the
+    width is exactly EMBEDDING_DIMENSION, and 1e39 is an ordinary JSON number
+    that needs no non-standard literal to reach us. So the list, length,
+    component-type *and* finiteness checks in _validated() all pass, and only
+    its float32-range check can reject this.
+
+    1e39 rather than something larger because it is barely over the bound: the
+    point is that the value looks entirely unremarkable until it meets a float4
+    column.
+    """
+    vector = [0.01] * settings.embedding_dimension
+    vector[0] = 1e39
+    return vector
+
+
+def test_a_float32_overflowing_embedding_is_a_503_on_search_and_not_a_400(
+    db_session, monkeypatch
+):
+    # The same alerting inversion as the NaN tests above, reached by a value no
+    # JSON extension is needed to express -- which makes it the likelier of the
+    # two to arrive from a real backend.
+    #
+    # pgvector's `vector` is float4. Without the range check in _validated(),
+    # 1e39 reaches the database and is rejected with SQLSTATE 22003 ("1e+39" is
+    # out of range for type vector) on the distance comparison. That surfaces as
+    # sqlalchemy.exc.DataError, which the handler maps to 400 with no
+    # Retry-After -- so a wholly broken embedding backend would make every
+    # search look like a client error while 5xx alerts, error-rate dashboards
+    # and SLOs all stayed green. That mapping is what this test pins against.
+    #
+    # _fetch is patched rather than get_embedding, and search_module.get_embedding
+    # is left as the real function, for the reason spelled out on the NaN test:
+    # patching get_embedding to raise would only re-test the handler and would
+    # stay green with the range check removed.
+    key = make_api_key(db_session, "acme")
+    monkeypatch.setattr(
+        embeddings_module,
+        "_fetch",
+        lambda text: _vector_with_a_float32_overflowing_component(),
+    )
+
+    with _client_that_reports_server_errors(db_session) as http:
+        response = http.post(
+            "/api/v1/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": key}
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": BAD_RESPONSE_DETAIL}
+    # Retry-After present is what separates this from the 400 it guards against:
+    # the DataError path carries none, so a test checking only status and body
+    # could still be satisfied by a change that got the code right and the
+    # semantics wrong. One route is enough here -- the two NaN tests above
+    # already prove the handler is reachable from both ingest and search.
+    assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)

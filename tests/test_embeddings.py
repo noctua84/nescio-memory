@@ -11,7 +11,7 @@ import pytest
 
 from app.config import settings
 from app.core import embeddings as embeddings_module
-from app.core.embeddings import get_embedding
+from app.core.embeddings import FLOAT32_MAX, get_embedding
 from app.core.errors import (
     EmbeddingBackendBadResponse,
     EmbeddingBackendError,
@@ -95,6 +95,21 @@ NON_FINITE_LITERALS = ["NaN", "Infinity", "-Infinity"]
 # index-0 case while missing the realistic one, where a backend's degenerate
 # component sits somewhere in the middle of a 1024-wide vector.
 NON_FINITE_POSITIONS = [0, settings.embedding_dimension - 1]
+
+# The wording _validated() uses for a component it can evaluate as a float and
+# still will not accept -- non-finite, or finite but outside float32's range.
+# Matched on rather than left implicit because _fetch() translates a JSON
+# *decode* failure into the very same exception class, so a body that never
+# parsed at all would satisfy a bare pytest.raises(EmbeddingBackendBadResponse)
+# with the component loop never entered. Pinning the message is what makes the
+# rejection tests statements about the range check rather than about any of the
+# half-dozen other ways this call can fail.
+UNUSABLE_COMPONENT_MESSAGE = "expected finite float32 values"
+
+# And the wording for the one component _validated() cannot even evaluate: an
+# integer literal too large for float conversion, where math.isfinite() raises
+# instead of returning False.
+UNEVALUABLE_COMPONENT_MESSAGE = "too large to evaluate as a float"
 
 
 def test_connection_failure_raises_embedding_backend_error(monkeypatch):
@@ -244,8 +259,15 @@ def test_a_non_finite_embedding_component_is_rejected(monkeypatch, literal, inde
     # a broken backend would make every request look like a client error while
     # 5xx alerting stayed green. 503 is the honest answer: the backend returned
     # something unusable and it is not the caller's fault.
+    #
+    # The `match=` is what keeps this honest. _fetch() raises the same
+    # EmbeddingBackendBadResponse for a body that failed to parse, so a typo in
+    # _embedding_body() -- or a stdlib json that stopped accepting the bare
+    # literals -- would turn a bare pytest.raises green while the finiteness
+    # check was never reached. The premise test below pins the same thing from
+    # the other side; both are cheap and they fail differently, which is useful.
     _install(monkeypatch, lambda: _raw_response(_embedding_body(literal, index)))
-    with pytest.raises(EmbeddingBackendBadResponse):
+    with pytest.raises(EmbeddingBackendBadResponse, match=UNUSABLE_COMPONENT_MESSAGE):
         get_embedding(f"a response carrying {literal} at index {index}")
 
 
@@ -288,3 +310,147 @@ def test_a_full_length_vector_of_ints_still_passes(monkeypatch):
     vector = [0] * settings.embedding_dimension
     _install(monkeypatch, lambda: _response({"embedding": vector}))
     assert get_embedding("anything") == vector
+
+
+def _vector_with(value, index: int = 0) -> list[float]:
+    """A full-length vector of ordinary components with `value` at `index`.
+
+    The Python-side sibling of `_embedding_body()`, used for the cases that are
+    perfectly ordinary JSON numbers and therefore need no raw-bytes workaround.
+    Sized from settings for the same reason every other full-length case here
+    is: at any other length the dimension check fires first and the case stops
+    testing what it is named for.
+    """
+    vector = [0.01] * settings.embedding_dimension
+    vector[index] = value
+    return vector
+
+
+# Finite in Python's float64 and unrepresentable in pgvector's float4. 1e39 is
+# barely over the bound, 1e300 is absurdly over it, and -1e39 covers the
+# negative side -- the guard compares abs(), so a version that only checked the
+# positive end would pass the first two and fail the third.
+FLOAT32_OVERFLOW_VALUES = [1e39, 1e300, -1e39]
+
+
+@pytest.mark.parametrize("value", FLOAT32_OVERFLOW_VALUES)
+@pytest.mark.parametrize("index", NON_FINITE_POSITIONS)
+def test_a_float32_overflowing_component_is_rejected(monkeypatch, value, index):
+    # math.isfinite(1e39) is True, so finiteness alone does not catch this: the
+    # value is a perfectly well-behaved float64 and a perfectly well-formed JSON
+    # number. The destination column is float4, though, and pgvector rejects it
+    # with SQLSTATE 22003 ("out of range for type vector") on insert *and* on
+    # distance comparison. Since DataError maps to 400, an unguarded 1e39 turns
+    # a wholly broken backend into a stream of *client* errors while 5xx alerts
+    # and SLOs stay green -- the same inversion the NaN case guards against,
+    # reached by a value that needs no non-standard JSON at all.
+    #
+    # Driven through `_response()`/`json=` deliberately: these values survive
+    # httpx's encoder, so this exercises the ordinary decode path rather than
+    # the raw-bytes workaround the non-finite cases are forced into.
+    _install(monkeypatch, lambda: _response({"embedding": _vector_with(value, index)}))
+    with pytest.raises(EmbeddingBackendBadResponse, match=UNUSABLE_COMPONENT_MESSAGE):
+        get_embedding(f"a response carrying {value} at index {index}")
+
+
+@pytest.mark.parametrize("index", NON_FINITE_POSITIONS)
+def test_the_largest_float32_is_accepted_rather_than_rejected(monkeypatch, index):
+    """The bound's inclusive side, which nothing else in this file would catch.
+
+    Every other case here asserts a rejection, so an off-by-one bound -- `>=`
+    where the implementation means `>` -- would leave the whole file green while
+    the service refused a legitimate component that round-trips through float32
+    exactly. Paired with the just-over case below, this pins the boundary from
+    both sides.
+
+    FLOAT32_MAX is imported from the module rather than written out as a literal
+    so the test tracks the constant. A future correction to the bound should
+    move this test with it; a re-typed literal would instead start failing for a
+    reason that looks like a bug in the implementation.
+    """
+    expected = _vector_with(FLOAT32_MAX, index)
+    _install(monkeypatch, lambda: _response({"embedding": expected}))
+    assert get_embedding("anything") == expected
+
+
+@pytest.mark.parametrize("index", NON_FINITE_POSITIONS)
+def test_a_value_just_past_the_largest_float32_is_rejected(monkeypatch, index):
+    # The other half of the pair above. 3.5e38 is the smallest "obviously over"
+    # magnitude available -- close enough to the bound that a guard which went
+    # looking for something dramatic like 1e39 would miss it, and far enough
+    # over that no float32 rounding argument applies.
+    _install(monkeypatch, lambda: _response({"embedding": _vector_with(3.5e38, index)}))
+    with pytest.raises(EmbeddingBackendBadResponse, match=UNUSABLE_COMPONENT_MESSAGE):
+        get_embedding(f"a response carrying 3.5e38 at index {index}")
+
+
+# JSON puts no bound on an integer literal and stdlib json decodes one into a
+# Python int of arbitrary size, so this is a shape a real backend can emit.
+# 400 digits is far past float64's range without being so large that the
+# conversion attempt itself is slow.
+HUGE_INT_LITERALS = ["9" * 400, "-" + "9" * 400]
+
+
+@pytest.mark.parametrize("literal", HUGE_INT_LITERALS)
+@pytest.mark.parametrize("index", NON_FINITE_POSITIONS)
+def test_a_huge_integer_component_is_rejected_as_a_backend_fault(
+    monkeypatch, literal, index
+):
+    # This case exists because of *how* it used to fail, not merely that it did.
+    # math.isfinite() on an int too large to convert raises OverflowError, which
+    # is an ArithmeticError -- outside _fetch()'s
+    # `except (ValueError, KeyError, TypeError)` and outside every clause in
+    # between. So it escaped the module entirely as a bare OverflowError and
+    # surfaced as an opaque 500, breaking this module's contract that every
+    # backend fault leaves as an EmbeddingBackendError. The assertion below is
+    # therefore as much about the exception's *type* as about its being raised:
+    # with the guard reverted this test fails by erroring out of get_embedding
+    # rather than by a wrong status.
+    #
+    # Delivered as raw bytes because that is the production shape: stdlib json
+    # has to be the thing that produces the Python int. Handing _response() a
+    # ready-made Python int would test the loop while skipping the decode step
+    # that is the only reason such a value can exist here at all.
+    _install(monkeypatch, lambda: _raw_response(_embedding_body(literal, index)))
+    with pytest.raises(
+        EmbeddingBackendBadResponse, match=UNEVALUABLE_COMPONENT_MESSAGE
+    ) as excinfo:
+        get_embedding(f"a response carrying a {len(literal)}-digit int at {index}")
+    # The one-handler contract: a caller that does not care which kind of
+    # backend fault occurred catches the base class, and this must be covered
+    # by that catch rather than sailing past it as an ArithmeticError.
+    assert isinstance(excinfo.value, EmbeddingBackendError)
+
+
+@pytest.mark.parametrize("literal", HUGE_INT_LITERALS)
+@pytest.mark.parametrize("index", NON_FINITE_POSITIONS)
+def test_the_raw_payload_really_decodes_to_an_unconvertible_int(literal, index):
+    """The premise the test above rests on, pinned so it cannot pass vacuously.
+
+    Same hazard as the non-finite premise test: _fetch() translates a decode
+    failure into the same exception class _validated() raises here, so a
+    malformed body would make the rejection test green with the component loop
+    never entered. This asserts the body parses, that it parses to the right
+    width, that the component really arrives as a Python `int` (not a float, and
+    not a string), and that math.isfinite() on it really raises OverflowError --
+    which is the whole reason the try/except in _validated() exists.
+    """
+    vector = _raw_response(_embedding_body(literal, index)).json()["embedding"]
+    assert len(vector) == settings.embedding_dimension
+    assert type(vector[index]) is int
+    with pytest.raises(OverflowError):
+        math.isfinite(vector[index])
+
+
+def test_a_vector_of_plausible_magnitudes_delivered_as_raw_bytes_still_passes(
+    monkeypatch,
+):
+    # The control for the new rejections, mirroring the finite-vector control
+    # above. A bound applied with the comparison inverted, or a try/except that
+    # swallowed too much, would reject ordinary vectors; without a passing case
+    # alongside the failing ones, every rejection test here would still be
+    # green. 1e38 is a real float32 value an order of magnitude under the bound.
+    last = settings.embedding_dimension - 1
+    expected = _vector_with(1e38, last)
+    _install(monkeypatch, lambda: _raw_response(_embedding_body("1e38", last)))
+    assert get_embedding("anything") == expected
