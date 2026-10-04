@@ -4,11 +4,13 @@ These go through the real routes, so they verify the wiring in create_app() as
 well as the mapping itself.
 """
 import logging
+from contextlib import contextmanager
 
 import psycopg.errors
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import func, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DataError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.api.v1 import ingest as ingest_module
@@ -17,6 +19,7 @@ from app.config import settings
 from app.core import errors as errors_module
 from app.core.db import get_db
 from app.core.errors import (
+    INVALID_DATA_DETAIL,
     QUERY_TIMEOUT_DETAIL,
     RETRY_AFTER_SECONDS,
     EmbeddingBackendBadResponse,
@@ -41,12 +44,78 @@ INGEST_PAYLOAD = {
 SEARCH_PAYLOAD = {"query": "anything", "top_k": 5}
 ORIGINAL_CONTENT = "the original content, which must survive a failed re-ingest"
 
+# A NUL byte is the cheapest value that is a perfectly legal Python string and a
+# perfectly legal HTTP body, yet cannot be represented in a PostgreSQL text
+# column. It is therefore the one input that reaches the DataError handler
+# without any monkeypatching at all -- the failure is produced by the real
+# driver on the real database, not staged.
+NUL_BYTE = "\x00"
+
+# psycopg's own wording for that rejection. It is an internal diagnostic and the
+# assertion below is that it never appears in a response body.
+PSYCOPG_NUL_MESSAGE = "PostgreSQL text fields cannot contain NUL (0x00) bytes"
+
 
 def _raise(exception):
     def _raiser(text):
         raise exception
 
     return _raiser
+
+
+def _handler_log_messages(caplog):
+    """The formatted messages this module's handler logger emitted, and no others.
+
+    caplog captures every logger in the process, so iterating caplog.records
+    directly makes an assertion about the whole run rather than about
+    app.core.errors. The `all(... not in message ...)` assertions are where that
+    actually bites: any unrelated library warning that happens to contain the
+    substring -- "unknown" is an ordinary English word, and SQLAlchemy, httpx and
+    testcontainers all log during these requests -- would fail the test for a
+    reason with nothing to do with the handler. Filtering by logger name keeps
+    the negative assertions about the one logger whose output is the contract.
+
+    getMessage() rather than caplog.text is also deliberate: the handler now
+    passes exc_info, so caplog.text carries the driver's traceback (including
+    psycopg's NUL wording). That belongs in the log and is exactly what the
+    exc_info change is for, but it would make a naive substring search over
+    caplog.text match things this test is not asserting about.
+    """
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "app.core.errors"
+    ]
+
+
+@contextmanager
+def _client_that_reports_server_errors(db_session):
+    """A TestClient wired to the test transaction that returns 5xx responses.
+
+    Two departures from the `client` fixture, both deliberate.
+
+    `raise_server_exceptions=False` is the important one, and no other test in
+    this suite needs it. With the default (True), Starlette's TestClient
+    re-raises any exception that no handler claimed instead of producing a
+    response. For the DataError tests that would be actively misleading: if the
+    handler were removed or stopped matching, the tests would fail by raising
+    sqlalchemy.exc.DataError out of client.post() rather than by observing the
+    bare 500 a real caller would get. With the flag off, the test asserts on the
+    same bytes an HTTP client would see in production either way, so a removal of
+    the handler shows up as `assert 500 == 400` -- a statement about the contract
+    -- rather than as an error in the test harness.
+
+    Second, the override is installed here rather than by the fixture only
+    because the fixture hands back an already-constructed TestClient and the flag
+    has to be passed to the constructor. Clearing in `finally` matches
+    test_database_failure_returns_503: a leaked override carries this test's
+    session into the next one and fails somewhere misleading.
+    """
+    app.dependency_overrides[get_db] = lambda: db_session
+    try:
+        yield TestClient(app, raise_server_exceptions=False)
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_ingest_returns_503_when_the_embedding_backend_is_down(
@@ -233,6 +302,222 @@ def test_a_search_that_exceeds_its_statement_timeout_returns_503_with_no_retry_a
     assert any("/api/v1/search" in message for message in messages)
 
 
+@pytest.mark.parametrize("field", ["repo_name", "file_path", "content"])
+def test_a_nul_byte_in_an_ingest_field_is_a_400_with_no_retry_after(
+    db_session, monkeypatch, field
+):
+    # The whole DataError mapping, end to end, with nothing staged: a real form
+    # post, the real route, the real psycopg driver. Before the handler existed
+    # this returned 500 with a text/plain "Internal Server Error" body.
+    #
+    # Parametrized rather than written three times because the three fields are
+    # not three copies of one case -- they fail at two different moments in the
+    # request, and both must land on the same response:
+    #   repo_name / file_path  -> bound into the DELETE that delete_by_file()
+    #                             issues before anything is embedded, so the
+    #                             error is raised early in the endpoint body;
+    #   content                -> survives chunking and only fails when the
+    #                             INSERTs are flushed at db.commit(), i.e. after
+    #                             a successful DELETE and a successful embedding.
+    # A handler that only covered one of those moments would still look correct
+    # against a single-field test.
+    key = make_api_key(db_session, "acme")
+    monkeypatch.setattr(ingest_module, "get_embedding", fake_embedding)
+
+    payload = dict(INGEST_PAYLOAD)
+    payload[field] = payload[field] + NUL_BYTE
+
+    with _client_that_reports_server_errors(db_session) as http:
+        response = http.post(
+            "/api/v1/ingest", data=payload, headers={"X-API-Key": key}
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": INVALID_DATA_DETAIL}
+    # No Retry-After, unlike every 503 above. The same bytes will be rejected on
+    # every attempt, so a retry hint here would be a promise the server cannot
+    # keep. This assertion is the one that distinguishes the DataError mapping
+    # from OperationalError's, which is otherwise the nearest neighbour.
+    assert "Retry-After" not in response.headers
+
+
+def test_a_nul_byte_in_the_search_repo_filter_is_a_400(db_session, monkeypatch):
+    # The handler must be reachable from more than one route, so this is the
+    # second one. repo_filter -- not `query` -- is the field to use, and that was
+    # checked rather than assumed: search hands `query` to get_embedding and
+    # sends the resulting *vector* to Postgres, so the raw query text is never a
+    # SQL parameter and a NUL in it is simply searched for and not found (see the
+    # test immediately below, which pins that). repo_filter is the one search
+    # input that becomes a bound text parameter, via
+    # `Learning.repo_name == repo_filter`, so it is the field that can actually
+    # reach the driver's parameter adaptation.
+    key = make_api_key(db_session, "acme")
+    monkeypatch.setattr(search_module, "get_embedding", fake_embedding)
+
+    with _client_that_reports_server_errors(db_session) as http:
+        response = http.post(
+            "/api/v1/search",
+            json={**SEARCH_PAYLOAD, "repo_filter": f"repo_a{NUL_BYTE}"},
+            headers={"X-API-Key": key},
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": INVALID_DATA_DETAIL}
+    assert "Retry-After" not in response.headers
+
+
+def test_a_nul_byte_in_the_search_query_text_never_reaches_the_database(
+    db_session, monkeypatch
+):
+    # The premise the test above rests on, pinned so it cannot quietly stop being
+    # true. Search is vector search: the query string's only destination is the
+    # embedding backend, and what goes to Postgres is a list of floats. So an
+    # unrepresentable byte in `query` is not a database concern at all, and the
+    # search runs to completion against the real table rather than being mapped
+    # to 400. If someone later adds a lexical/trigram fallback that binds the raw
+    # query text, this test turns red, which is the correct moment to decide
+    # whether that path should be mapped too.
+    #
+    # A row is seeded deliberately. Asserting an empty result list would be
+    # vacuous -- an empty table returns [] whether the query ran or not, so the
+    # assertion would prove only "not a 400". With a row present, a 200 carrying
+    # that row's content is positive evidence that the statement reached Postgres
+    # and came back, which is the claim this test is actually making.
+    key = make_api_key(db_session, "acme")
+    make_learning(db_session, "acme", content=ORIGINAL_CONTENT)
+    monkeypatch.setattr(search_module, "get_embedding", fake_embedding)
+
+    with _client_that_reports_server_errors(db_session) as http:
+        response = http.post(
+            "/api/v1/search",
+            json={**SEARCH_PAYLOAD, "query": f"hello{NUL_BYTE}world"},
+            headers={"X-API-Key": key},
+        )
+
+    assert response.status_code == 200
+    contents = [result["content"] for result in response.json()["results"]]
+    assert contents == [ORIGINAL_CONTENT]
+
+
+def test_the_drivers_nul_byte_message_does_not_reach_the_client(
+    db_session, monkeypatch
+):
+    # The sibling of test_internal_exception_messages_do_not_reach_the_client,
+    # for the one family whose exception text is produced by the driver rather
+    # than by this codebase. `detail` must come from the class constant; a
+    # handler that reached for str(exc) would pass the status-code assertions
+    # above and still hand the caller psycopg's internals.
+    key = make_api_key(db_session, "acme")
+    monkeypatch.setattr(ingest_module, "get_embedding", fake_embedding)
+
+    with _client_that_reports_server_errors(db_session) as http:
+        response = http.post(
+            "/api/v1/ingest",
+            data={**INGEST_PAYLOAD, "repo_name": f"repo_a{NUL_BYTE}"},
+            headers={"X-API-Key": key},
+        )
+
+    assert response.status_code == 400
+    assert PSYCOPG_NUL_MESSAGE not in response.text
+    # Not just the exact sentence: no fragment of the driver's vocabulary, and no
+    # trace of the SQL statement SQLAlchemy attaches to the exception.
+    assert "psycopg" not in response.text.lower()
+    assert "DELETE" not in response.text
+    assert response.json() == {"detail": INVALID_DATA_DETAIL}
+
+
+def test_a_client_side_rejection_is_logged_with_the_path_and_an_unknown_sqlstate(
+    db_session, monkeypatch, caplog
+):
+    # The warning is the only operator-facing trace of a 400 from this family, so
+    # it has to actually be emitted and has to name where it happened.
+    #
+    # The SQLSTATE assertion records a real property of this path rather than a
+    # nicety: psycopg rejects the NUL byte itself, while adapting the parameter,
+    # so the statement is never sent and Postgres never assigns a SQLSTATE --
+    # exc.orig.sqlstate is None here. The handler must therefore degrade to
+    # "unknown" instead of crashing or printing "None", and an operator reading
+    # the log must be able to tell this case apart from a server-side 22xxx (the
+    # next test), which does carry a code.
+    key = make_api_key(db_session, "acme")
+    monkeypatch.setattr(ingest_module, "get_embedding", fake_embedding)
+
+    # Same alembic/env.py fileConfig() hazard as the statement-timeout test
+    # above: the session-scoped `engine` fixture runs the migrations, which
+    # disables every logger that already existed, app.core.errors' included.
+    # Undone here rather than in app/ or alembic.ini, because it is test wiring.
+    monkeypatch.setattr(errors_module.logger, "disabled", False)
+
+    with caplog.at_level(logging.WARNING, logger="app.core.errors"):
+        with _client_that_reports_server_errors(db_session) as http:
+            response = http.post(
+                "/api/v1/ingest",
+                data={**INGEST_PAYLOAD, "repo_name": f"repo_a{NUL_BYTE}"},
+                headers={"X-API-Key": key},
+            )
+
+    assert response.status_code == 400
+    messages = _handler_log_messages(caplog)
+    assert any("/api/v1/ingest" in message for message in messages), messages
+    assert any("SQLSTATE unknown" in message for message in messages), messages
+    # The log is allowed internal detail, but it must not be the response's
+    # source: the two must not have converged on the same string.
+    assert all(INVALID_DATA_DETAIL not in message for message in messages)
+
+
+def test_a_server_side_22xxx_is_also_a_400_and_its_sqlstate_is_logged(
+    db_session, monkeypatch, caplog
+):
+    # The other half of the family. Everything above exercises the client-side
+    # adaptation failure, where no SQLSTATE exists; this is a DataError that
+    # PostgreSQL itself raised -- numeric_value_out_of_range, SQLSTATE 22003 --
+    # which is the shape SQLAlchemy produces for the rest of class 22xxx
+    # (invalid text representation, division by zero, datetime field overflow).
+    #
+    # It is injected at the repository rather than provoked with real SQL because
+    # no caller-reachable input to this service overflows a column: the schema's
+    # text columns are unbounded and top_k is clamped to 1..50 by Pydantic before
+    # it is ever bound. Staging it is the only way to assert the branch, and what
+    # is being asserted is the handler's behaviour, not SQLAlchemy's. The
+    # precedent is test_a_search_that_exceeds_its_statement_timeout_..., which
+    # patches the same method for the same reason.
+    #
+    # Two things must hold that the NUL tests cannot show: a DataError carrying a
+    # genuine SQLSTATE still maps to 400 (the handler does not key off the
+    # absence of one), and the warning prints that code rather than "unknown",
+    # which is what lets an operator see an internal-SQL bug mis-reported as a
+    # client error instead of it hiding behind a generic 400 forever.
+    key = make_api_key(db_session, "acme")
+    monkeypatch.setattr(search_module, "get_embedding", fake_embedding)
+
+    def _overflowed(self, *args, **kwargs):
+        raise DataError(
+            "SELECT ...",
+            {},
+            psycopg.errors.NumericValueOutOfRange("value out of range"),
+        )
+
+    monkeypatch.setattr(LearningRepository, "search", _overflowed)
+    monkeypatch.setattr(errors_module.logger, "disabled", False)
+
+    with caplog.at_level(logging.WARNING, logger="app.core.errors"):
+        with _client_that_reports_server_errors(db_session) as http:
+            response = http.post(
+                "/api/v1/search",
+                json=SEARCH_PAYLOAD,
+                headers={"X-API-Key": key},
+            )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": INVALID_DATA_DETAIL}
+    assert "Retry-After" not in response.headers
+
+    messages = _handler_log_messages(caplog)
+    assert any("22003" in message for message in messages), messages
+    assert any("/api/v1/search" in message for message in messages), messages
+    assert all("unknown" not in message for message in messages), messages
+
+
 def test_health_is_unaffected(client):
     # /health must keep contacting nothing, so a dependency outage cannot turn a
     # liveness probe into a restart.
@@ -315,4 +600,85 @@ def test_a_failure_partway_through_a_file_leaves_earlier_rows_intact(
     ).all()
     assert len(surviving) == 1
     assert surviving[0].content == ORIGINAL_CONTENT
+    assert check.scalar(select(func.count()).select_from(Learning)) == 1
+
+
+def test_a_commit_time_rejection_leaves_the_existing_chunks_intact(
+    connection, monkeypatch
+):
+    """A DataError raised by the commit itself must still be all-or-nothing.
+
+    The sibling above, test_a_failure_partway_through_a_file_leaves_earlier_rows_
+    intact, does NOT cover this. Its failure arrives from get_embedding, i.e.
+    inside the loop and strictly before db.commit(). A NUL byte in `content`
+    fails at a genuinely different moment: the DELETE has already been issued
+    and every embedding has already succeeded, and the rejection happens only
+    when the INSERTs are flushed at the commit. That is the worst moment for it
+    to happen -- delete_by_file() has notionally removed the caller's previous
+    chunks for this file, so a commit that half-applied would answer 400 and
+    destroy data in the same breath.
+
+    The `client` fixture and this module's _client_that_reports_server_errors
+    helper both override get_db with `lambda: db_session` -- a plain function,
+    not a generator, so the `finally: db.close()` that performs the rollback in
+    production never runs and the rollback cannot be observed from the
+    assertions. The override below is generator shaped, like the real get_db,
+    which is the same reason the sibling test builds its own.
+
+    raise_server_exceptions=False is still required on top of that, for the
+    reason given on the helper: without it a missing handler would raise out of
+    client.post() instead of letting this test see the response and then check
+    the rows.
+    """
+    # Setup lives in its own session and is committed, so releasing the
+    # endpoint's savepoint later cannot take the setup row with it.
+    setup = Session(bind=connection, join_transaction_mode="create_savepoint")
+    key = make_api_key(setup, "acme")
+    make_learning(
+        setup,
+        "acme",
+        repo_name=INGEST_PAYLOAD["repo_name"],
+        file_path=INGEST_PAYLOAD["file_path"],
+        content=ORIGINAL_CONTENT,
+    )
+    setup.commit()
+
+    # Embedding must succeed for all chunks: the point is to reach the commit
+    # with real rows pending, not to fail earlier for an unrelated reason.
+    monkeypatch.setattr(ingest_module, "get_embedding", fake_embedding)
+
+    def production_shaped_get_db():
+        request_session = Session(
+            bind=connection, join_transaction_mode="create_savepoint"
+        )
+        try:
+            yield request_session
+        finally:
+            request_session.close()
+
+    app.dependency_overrides[get_db] = production_shaped_get_db
+    try:
+        # Same repo_name and file_path as the seeded row, so delete_by_file()
+        # genuinely targets it. The NUL rides on the content, which survives
+        # chunking untouched and is only rejected when the INSERT is flushed.
+        response = TestClient(app, raise_server_exceptions=False).post(
+            "/api/v1/ingest",
+            data={**INGEST_PAYLOAD, "content": LONG_ENOUGH + NUL_BYTE},
+            headers={"X-API-Key": key},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": INVALID_DATA_DETAIL}
+
+    check = Session(bind=connection, join_transaction_mode="create_savepoint")
+    surviving = check.scalars(
+        select(Learning).where(Learning.client_name == "acme")
+    ).all()
+    # The pre-existing chunk is still there, with its original text: the DELETE
+    # was rolled back with the failed INSERT rather than surviving it.
+    assert len(surviving) == 1
+    assert surviving[0].content == ORIGINAL_CONTENT
+    # And nothing from the rejected request was partially written.
     assert check.scalar(select(func.count()).select_from(Learning)) == 1
