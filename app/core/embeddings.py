@@ -15,6 +15,14 @@ _local_model = None
 # bounds a failed ingest at roughly one timeout rather than one per chunk.
 OLLAMA_TIMEOUT_SECONDS = 30.0
 
+# pgvector's `vector` column type is float4 (float32), not float8. A component
+# that is finite in Python's float64 but beyond this magnitude is just as
+# unusable as a NaN -- pgvector rejects it with SQLSTATE 22003 ("out of range
+# for type vector"), which the error layer maps to a client error even though
+# the backend produced the bad value. This is float32's largest finite value;
+# it round-trips through float32 exactly, so it is the correct inclusive bound.
+FLOAT32_MAX = 3.4028234663852886e38
+
 
 def _validated(vector: object) -> list[float]:
     """Reject anything that is not a usable embedding.
@@ -41,11 +49,21 @@ def _validated(vector: object) -> list[float]:
                 f"embedding contained a {type(component).__name__}, expected numbers"
             )
         # NaN passes isinstance(..., float), so the type check above is
-        # insufficient to guarantee a usable value. math.isfinite rejects NaN,
-        # Infinity, and -Infinity.
-        if not math.isfinite(component):
+        # insufficient to guarantee a usable value, and math.isfinite is still
+        # not sufficient on its own: the destination column is float32, narrower
+        # than a Python float, so a finite float64 can still be unrepresentable
+        # there, and an unbounded int (valid JSON, decoded by stdlib json into a
+        # Python int of arbitrary size) makes math.isfinite itself raise rather
+        # than return False.
+        try:
+            finite = math.isfinite(component)
+        except OverflowError as exc:
             raise EmbeddingBackendBadResponse(
-                f"embedding component was {component}, expected finite numbers"
+                "embedding component was too large to evaluate as a float"
+            ) from exc
+        if not finite or abs(component) > FLOAT32_MAX:
+            raise EmbeddingBackendBadResponse(
+                f"embedding component was {component}, expected finite float32 values"
             )
     return vector
 
