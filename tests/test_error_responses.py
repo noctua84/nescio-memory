@@ -4,6 +4,7 @@ These go through the real routes, so they verify the wiring in create_app() as
 well as the mapping itself.
 """
 import logging
+import traceback
 from contextlib import contextmanager
 
 import psycopg.errors
@@ -108,6 +109,34 @@ def _handler_log_messages(caplog):
         for record in caplog.records
         if record.name == "app.core.errors"
     ]
+
+
+def _handler_log_records(caplog):
+    """The records themselves, filtered the same way, for the level and exc_info.
+
+    Sibling of `_handler_log_messages()` rather than a change to it, because
+    that helper's callers assert on strings and must keep doing so. Two things
+    about an embedding-backend log line are not in its formatted message at
+    all: the level it was emitted at (a deliberate split -- see the cases
+    below) and the exception attached by exc_info, which is the only place the
+    diagnostic raised in app.core.embeddings survives, since the client is
+    shown nothing but the class's fixed detail.
+    """
+    return [record for record in caplog.records if record.name == "app.core.errors"]
+
+
+def _logged_traceback(record) -> str:
+    """The exception text an operator would actually read off `record`.
+
+    Formatted from exc_info rather than compared against `str(exc)` on purpose:
+    asserting that the exception object is attached says nothing about whether
+    the handler's chosen format would print it, and `exc_info=exc` being
+    silently dropped or replaced with `exc_info=True` (which, outside an
+    `except` block, attaches nothing) are both changes that would leave a
+    non-null attribute behind.
+    """
+    assert record.exc_info is not None, "the handler logged no exception info"
+    return "".join(traceback.format_exception(record.exc_info[1]))
 
 
 @contextmanager
@@ -833,3 +862,193 @@ def test_a_float32_overflowing_embedding_is_a_503_on_search_and_not_a_400(
     # semantics wrong. One route is enough here -- the two NaN tests above
     # already prove the handler is reachable from both ingest and search.
     assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)
+
+
+# Each embedding-backend class with the level it must be logged at and the
+# response it must still produce, so the two are asserted together: a log line
+# added to a handler must not have moved anything the caller sees.
+#
+# The level column is the point. WARNING for the two transient-by-assumption
+# cases and ERROR for the misconfiguration is a deliberate split, not an
+# accident of where the code was written: a misconfiguration never self-heals
+# and maps to a 500, so logging it at WARNING would make a permanent deployment
+# fault read exactly like routine backend flakiness and let it sit unnoticed in
+# the same noise. Nothing else in the suite would notice that being flattened.
+EMBEDDING_FAILURE_CASES = [
+    pytest.param(
+        EmbeddingBackendError,
+        logging.WARNING,
+        503,
+        "Embedding backend unavailable",
+        True,
+        id="transient",
+    ),
+    pytest.param(
+        EmbeddingBackendBadResponse,
+        logging.WARNING,
+        503,
+        BAD_RESPONSE_DETAIL,
+        True,
+        id="bad-response",
+    ),
+    pytest.param(
+        EmbeddingBackendMisconfigured,
+        logging.ERROR,
+        500,
+        "Embedding backend is misconfigured",
+        False,
+        id="misconfigured",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "exception_class, level, status_code, detail, retry_after",
+    EMBEDDING_FAILURE_CASES,
+)
+def test_an_embedding_backend_failure_is_logged_and_the_response_is_unchanged(
+    client, db_session, monkeypatch, caplog, exception_class, level, status_code,
+    detail, retry_after,
+):
+    """The operator's only view of a backend fault, and the client's unchanged one.
+
+    By design the client is shown nothing but the class's fixed detail --
+    test_internal_exception_messages_do_not_reach_the_client pins that, and it
+    is right. The consequence is that every carefully worded diagnostic raised
+    in app.core.embeddings (which dimension mismatched, which component was
+    NaN, what the backend actually sent) had nowhere to go: the handler logged
+    nothing at all, so those messages were constructed and discarded, and a 503
+    from a restarting Ollama was indistinguishable from one raised by a
+    permanent misconfiguration.
+
+    So three things are asserted at once. The level, which is the split
+    described above. The identifying facts -- class name and request path --
+    which are what a reader needs before reading the exception at all. And the
+    exception's own message, via exc_info, which is the only place that detail
+    survives.
+
+    The response assertions are here rather than in a separate test on purpose:
+    a log line is the kind of change that gets made without re-reading what the
+    handler returns, and the point is that adding one moved nothing a caller
+    sees -- status, body and Retry-After all still come from the class.
+
+    The format string itself is deliberately not asserted on. Rewording the
+    message is a reasonable thing to do; dropping the path or the class name
+    from it is not, and only the second should fail.
+    """
+    key = make_api_key(db_session, "acme")
+    internal = (
+        "embedding component was nan at index 7 of 1024 from "
+        "http://internal-ollama.corp:11434"
+    )
+    monkeypatch.setattr(
+        search_module, "get_embedding", _raise(exception_class(internal))
+    )
+    # Same alembic/env.py fileConfig() hazard as the SQLSTATE tests above: the
+    # session-scoped `engine` fixture runs the migrations, which disables every
+    # logger that already existed, app.core.errors' included.
+    monkeypatch.setattr(errors_module.logger, "disabled", False)
+
+    with caplog.at_level(logging.WARNING, logger="app.core.errors"):
+        response = client.post(
+            "/api/v1/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": key}
+        )
+
+    assert response.status_code == status_code
+    assert response.json() == {"detail": detail}
+    if retry_after:
+        assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)
+    else:
+        # A misconfiguration will never succeed on retry, so advertising a
+        # Retry-After would tell the client something untrue.
+        assert "Retry-After" not in response.headers
+    assert internal not in response.text
+
+    records = _handler_log_records(caplog)
+    # Exactly one: a handler that logged twice would double every alert this
+    # line feeds, and one that logged nothing is the bug being fixed.
+    assert len(records) == 1, records
+    record = records[0]
+
+    assert record.levelno == level
+    # Which of the two very different situations occurred. Without the class
+    # name a reader cannot tell a transient 503 from a 500 that will not
+    # recover without a deployment change.
+    assert exception_class.__name__ in record.getMessage()
+    assert "/api/v1/search" in record.getMessage()
+    # The log is allowed internal detail, but it must not be the response's
+    # source: the two must not have converged on the same string.
+    assert detail not in record.getMessage()
+
+    # The whole reason the change was made. `exc_info[0] is exception_class`
+    # rather than isinstance, because the subclasses carry different status
+    # codes and a traceback naming the parent would misdirect the reader.
+    assert record.exc_info[0] is exception_class
+    assert internal in _logged_traceback(record)
+
+
+def test_the_logged_path_is_the_request_that_failed(
+    client, db_session, monkeypatch, caplog
+):
+    # The path is read off the request, so it has to be asserted from a second
+    # route or a hardcoded string would satisfy the test above. Ingest is the
+    # useful second one: these faults arrive in bulk during a re-ingest, and a
+    # log line that said "/api/v1/search" for all of them would send an
+    # operator looking at the wrong endpoint's traffic.
+    key = make_api_key(db_session, "acme")
+    monkeypatch.setattr(
+        ingest_module, "get_embedding", _raise(EmbeddingBackendError("refused"))
+    )
+    monkeypatch.setattr(errors_module.logger, "disabled", False)
+
+    with caplog.at_level(logging.WARNING, logger="app.core.errors"):
+        response = client.post(
+            "/api/v1/ingest", data=INGEST_PAYLOAD, headers={"X-API-Key": key}
+        )
+
+    assert response.status_code == 503
+    messages = _handler_log_messages(caplog)
+    assert any("/api/v1/ingest" in message for message in messages), messages
+    assert all("/api/v1/search" not in message for message in messages), messages
+
+
+def test_a_degenerate_embedding_is_logged_with_the_component_that_was_wrong(
+    db_session, monkeypatch, caplog
+):
+    """The end-to-end case: a real NaN, through the real chain, into the log.
+
+    Every other logging test here stages the exception, which proves the
+    handler formats what it is given. This one patches `_fetch` and leaves the
+    real get_embedding -> _validated chain in place, so the message that
+    reaches the log is the one app.core.embeddings actually composed. That is
+    what makes the two halves meet: the diagnostic names the offending
+    component and its value, and until the handler passed exc_info there was no
+    way for an operator to ever read it -- the client sees only
+    "Embedding backend returned an unexpected response", which says nothing
+    about NaN, nothing about index 0, and nothing about which backend.
+    """
+    key = make_api_key(db_session, "acme")
+    monkeypatch.setattr(
+        embeddings_module, "_fetch", lambda text: _vector_with_a_non_finite_component()
+    )
+    monkeypatch.setattr(errors_module.logger, "disabled", False)
+
+    with caplog.at_level(logging.WARNING, logger="app.core.errors"):
+        with _client_that_reports_server_errors(db_session) as http:
+            response = http.post(
+                "/api/v1/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": key}
+            )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": BAD_RESPONSE_DETAIL}
+    assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)
+
+    records = _handler_log_records(caplog)
+    assert len(records) == 1, records
+    logged = _logged_traceback(records[0])
+    # The actual sentence _validated() composed, not a restatement of it: the
+    # value and the wording both have to survive the trip.
+    assert "nan" in logged
+    assert "expected finite float32 values" in logged
+    # And none of it reached the caller.
+    assert "nan" not in response.text
