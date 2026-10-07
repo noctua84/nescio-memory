@@ -1,3 +1,6 @@
+import math
+from typing import NamedTuple
+
 import httpx
 
 from app.config import settings
@@ -12,6 +15,70 @@ _local_model = None
 # Kept hardcoded deliberately. Because the first failure aborts the request, this
 # bounds a failed ingest at roughly one timeout rather than one per chunk.
 OLLAMA_TIMEOUT_SECONDS = 30.0
+
+# pgvector's `vector` column type is float4 (float32), not float8. A component
+# that is finite in Python's float64 but beyond this magnitude is just as
+# unusable as a NaN -- pgvector rejects it with SQLSTATE 22003 ("out of range
+# for type vector"), which the error layer maps to a client error even though
+# the backend produced the bad value. This is float32's largest finite value;
+# it round-trips through float32 exactly, so it is the correct inclusive bound.
+FLOAT32_MAX = 3.4028234663852886e38
+
+
+class UnusableComponent(NamedTuple):
+    """One component of a vector that pgvector's float4 column cannot hold.
+
+    `message` is the sentence the API surfaces, so the two callers of the rule
+    below cannot end up describing the same fault differently. `index` is what
+    a diagnostic needs and a request does not: _validated() stops at the first
+    fault, while a probe reports every one of them and has to say where.
+    """
+
+    index: int
+    message: str
+    # Set only for a component that could not be evaluated at all, so
+    # _validated() can still chain the OverflowError the verdict came from.
+    # Without it the traceback would stop at this module and lose the reason.
+    cause: BaseException | None = None
+
+
+def _component_fault(index: int, component: object) -> UnusableComponent | None:
+    """Judge one component against float4, without raising.
+
+    The single home of the rule. _validated() turns the first fault into the
+    error the caller sees; probe_embedding() collects them all and still reports
+    the width. A second copy of this predicate would drift from the first, and
+    the probe needs the one thing _validated() must not do -- to measure a
+    vector it would reject.
+    """
+    # bool is a subclass of int, so check it out explicitly rather than
+    # letting True sail through as 1.0.
+    if isinstance(component, bool) or not isinstance(component, (int, float)):
+        return UnusableComponent(
+            index,
+            f"embedding contained a {type(component).__name__}, expected numbers",
+        )
+    # NaN passes isinstance(..., float), so the type check above is
+    # insufficient to guarantee a usable value, and math.isfinite is still
+    # not sufficient on its own: the destination column is float32, narrower
+    # than a Python float, so a finite float64 can still be unrepresentable
+    # there, and an unbounded int (valid JSON, decoded by stdlib json into a
+    # Python int of arbitrary size) makes math.isfinite itself raise rather
+    # than return False.
+    try:
+        finite = math.isfinite(component)
+    except OverflowError as exc:
+        return UnusableComponent(
+            index,
+            "embedding component was too large to evaluate as a float",
+            exc,
+        )
+    if not finite or abs(component) > FLOAT32_MAX:
+        return UnusableComponent(
+            index,
+            f"embedding component was {component}, expected finite float32 values",
+        )
+    return None
 
 
 def _validated(vector: object) -> list[float]:
@@ -31,13 +98,15 @@ def _validated(vector: object) -> list[float]:
         raise EmbeddingBackendBadResponse(
             f"embedding had {len(vector)} dimensions, expected {expected}"
         )
-    for component in vector:
-        # bool is a subclass of int, so check it out explicitly rather than
-        # letting True sail through as 1.0.
-        if isinstance(component, bool) or not isinstance(component, (int, float)):
-            raise EmbeddingBackendBadResponse(
-                f"embedding contained a {type(component).__name__}, expected numbers"
-            )
+    for index, component in enumerate(vector):
+        fault = _component_fault(index, component)
+        if fault is None:
+            continue
+        # First fault only: a request has nothing to gain from the rest of the
+        # vector once one component makes it unstorable.
+        if fault.cause is not None:
+            raise EmbeddingBackendBadResponse(fault.message) from fault.cause
+        raise EmbeddingBackendBadResponse(fault.message)
     return vector
 
 
@@ -122,6 +191,41 @@ def get_embedding(text: str) -> list[float]:
 PROBE_TEXT = "nescio embedding dimension probe"
 
 
+class EmbeddingProbe(NamedTuple):
+    """One measurement of the backend: how wide it is, and what it cannot store.
+
+    Both halves come from a single call, because two calls could disagree -- and
+    an operator told the width by one request and the usability by another has
+    no grounds to believe the two describe the same backend state.
+    """
+
+    dimensions: int
+    unusable: tuple[UnusableComponent, ...]
+
+
+def probe_embedding() -> EmbeddingProbe:
+    """Measure what the backend emits, reporting faults instead of raising.
+
+    Reporting rather than rejecting is the whole point. _validated() stops at
+    the first bad component because the request is already lost; a probe is the
+    opposite -- a backend emitting NaNs may *also* be the wrong width, and
+    raising here would withhold the one measurement this exists to produce. So
+    every fault comes back as data and the caller decides what it means.
+
+    See probe_embedding_dimension() for why this is a script and a contract
+    test rather than a startup check.
+    """
+    vector = _fetch(PROBE_TEXT)
+    if not isinstance(vector, list):
+        # The one fault a probe still cannot report around: with no list there
+        # is no width to measure and no components to inspect.
+        raise EmbeddingBackendBadResponse(
+            f"embedding was {type(vector).__name__}, expected a list"
+        )
+    faults = (_component_fault(i, component) for i, component in enumerate(vector))
+    return EmbeddingProbe(len(vector), tuple(f for f in faults if f is not None))
+
+
 def probe_embedding_dimension() -> int:
     """How many floats the configured backend actually returns.
 
@@ -135,12 +239,8 @@ def probe_embedding_dimension() -> int:
     Deliberately not called at startup: that would make boot depend on the
     embedding backend being reachable, and a liveness probe that fails because
     Ollama is restarting is worse than the mismatch it guards against. Called
-    instead by scripts/check_embedding_dimension.py and by the live-model
-    contract test.
+    instead by the live-model contract test, and -- through probe_embedding(),
+    which also reports whether the values are storable -- by
+    scripts/check_embedding_dimension.py.
     """
-    vector = _fetch(PROBE_TEXT)
-    if not isinstance(vector, list):
-        raise EmbeddingBackendBadResponse(
-            f"embedding was {type(vector).__name__}, expected a list"
-        )
-    return len(vector)
+    return probe_embedding().dimensions

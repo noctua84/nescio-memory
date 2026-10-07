@@ -83,6 +83,35 @@ def register_exception_handlers(app: FastAPI) -> None:
     ) -> JSONResponse:
         # detail comes from the class, never from str(exc): exception messages
         # carry internal detail for logs and must not reach the client.
+        #
+        # But that means the client-facing response says nothing specific, and
+        # the f-string diagnostics raised in app.core.embeddings (which
+        # dimension mismatched, which component was nan, what the backend
+        # actually sent back) would otherwise be discarded entirely -- a 503
+        # from a down backend would be indistinguishable from one raised by a
+        # permanent misconfiguration. The exception class name tells the
+        # reader which of those two very different situations occurred (a
+        # plain 503 is transient; EmbeddingBackendMisconfigured is a 500 that
+        # will not recover on retry), and exc_info carries the actual message
+        # and traceback -- the only place that detail survives.
+        #
+        # EmbeddingBackendMisconfigured gets `error` rather than `warning`:
+        # a `warning` here would read the same as the transient, self-healing
+        # case it is handled alongside, but a misconfiguration never recovers
+        # without a deployment change and maps to a 500, not a 503 -- it
+        # deserves the louder level so it doesn't get lost in routine
+        # backend-flakiness noise.
+        log = (
+            logger.error
+            if isinstance(exc, EmbeddingBackendMisconfigured)
+            else logger.warning
+        )
+        log(
+            "Embedding backend failure (%s) on %s",
+            type(exc).__name__,
+            request.url.path,
+            exc_info=exc,
+        )
         headers = (
             {"Retry-After": str(RETRY_AFTER_SECONDS)} if exc.retry_after else None
         )
