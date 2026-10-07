@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.5.0](https://github.com/noctua84/nescio-memory/compare/v0.4.0...v0.5.0) (2026-10-07)
+
+
+### Features
+
+* [impl] expand search hits to their surrounding context ([400a531](https://github.com/noctua84/nescio-memory/commit/400a5313893afd063199ca99ee25c3b11f06eadf))
+* expand search hits to their surrounding context ([b04b807](https://github.com/noctua84/nescio-memory/commit/b04b8070171baadc879e832db2e42e06318f173e))
+
+
+### Bug Fixes
+
+* [impl] attach traceback to the DataError warning log ([53aa640](https://github.com/noctua84/nescio-memory/commit/53aa64071936425fbd14867eba1a5ef2c5d6a315))
+* [impl] log embedding backend failures before responding ([c675e5f](https://github.com/noctua84/nescio-memory/commit/c675e5fd1a66bd2c267d95089c48cfb3236fd8ad))
+* [impl] map sqlalchemy.exc.DataError to a 400 client-error response ([449fbba](https://github.com/noctua84/nescio-memory/commit/449fbbacc6bf49efe62483af93ce051e5161a6b8))
+* [impl] reject float32-overflowing and huge-int embedding components ([0a86667](https://github.com/noctua84/nescio-memory/commit/0a86667c3f44d555757b60897843c16255abceda))
+* [impl] reject non-finite embedding components in _validated() ([ec002c6](https://github.com/noctua84/nescio-memory/commit/ec002c69751882efe124aff32027aaecf651891a))
+* [impl] report a backend emitting unstorable embedding values ([8c94e93](https://github.com/noctua84/nescio-memory/commit/8c94e937f68725603eea7e08909938924cea9b00))
+* [impl] set the embedding dimension to the model's real width (1024) ([d8335a2](https://github.com/noctua84/nescio-memory/commit/d8335a2eaec629807d6b5951a369657f9ab1a469)), closes [#36](https://github.com/noctua84/nescio-memory/issues/36)
+* map sqlalchemy.exc.DataError to a 400 instead of a bare 500 ([705e50c](https://github.com/noctua84/nescio-memory/commit/705e50c047827e192bc0f78a7c566bfefbe5348f))
+* reject embedding values pgvector cannot store, and make the failure visible ([8c0659b](https://github.com/noctua84/nescio-memory/commit/8c0659bef7ae0bb2cc082bdfc1289663af549ba5))
+* set the embedding dimension to the model's real width (1024) ([158cd05](https://github.com/noctua84/nescio-memory/commit/158cd057ff64ba3910306f6ae19d5670b551ab43))
+
+
+### Documentation
+
+* [docs] narrow the unmapped-errors limitation for the DataError handler ([dfbb0d0](https://github.com/noctua84/nescio-memory/commit/dfbb0d02a98f4158ab11dbac346569045d582b2a))
+* [docs] specify context expansion in search ([b5eaad2](https://github.com/noctua84/nescio-memory/commit/b5eaad269319303534dc6d0c83d56b9e886091ad))
+
 ## [0.4.0](https://github.com/noctua84/nescio-memory/compare/v0.3.1...v0.4.0) (2026-10-02)
 
 
