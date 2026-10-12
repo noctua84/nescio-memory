@@ -519,8 +519,13 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
   `detail` from every error.
 - **Ingestion is serial and chatty.** One blocking Ollama call per chunk, with no batching and no
   retry/backoff.
-- **There is no read-back, list or mutation route.** Content is reachable only through a query
-  that semantically matched it, by design; recovering the corpus itself is a `pg_dump`/restore
+- **There is no enumeration route.** No list, no fetch-by-path, no export: content is reachable
+  only through a query that semantically matched it, by design. Note that a hit *can* be expanded
+  to its whole document (`context: "document"` returns the note byte-for-byte), so this is a
+  guarantee about **discovery**, not about response size — you can read what you can find, and you
+  cannot find what you have not matched. It is deliberately an architectural guarantee and **not a
+  security boundary**: there is no completeness signal and no rate limiting, so bulk retrieval is
+  bounded by query effort rather than refused. Recovering the corpus itself is a `pg_dump`/restore
   concern, not an API one. There is no `UPDATE` or `DELETE` route either — a document changes only
   by re-ingesting it whole.
 
