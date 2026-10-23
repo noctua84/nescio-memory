@@ -40,11 +40,11 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies (fails if uv.lock is stale)
-        run: uv sync --locked --python ${{ matrix.python-version }}
+        run: uv sync --locked --no-build --python ${{ matrix.python-version }}
 
       - name: Import check
         run: |
-          uv run --locked --python ${{ matrix.python-version }} python -c "
+          uv run --locked --no-build --python ${{ matrix.python-version }} python -c "
           import fastapi, uvicorn, psycopg, pgvector, langfuse, httpx, pydantic, pydantic_settings
           print('all runtime dependencies import OK')
           "
@@ -53,7 +53,7 @@ jobs:
       # --dry-run resolves it against the lockfile without downloading torch,
       # which is enough to catch a constraint that has rotted.
       - name: Verify the local-embeddings extra resolves
-        run: uv sync --locked --extra local-embeddings --dry-run --python ${{ matrix.python-version }}
+        run: uv sync --locked --no-build --extra local-embeddings --dry-run --python ${{ matrix.python-version }}
 
   tests:
     name: tests (py3.12)
