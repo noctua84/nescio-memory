@@ -21,7 +21,7 @@ from eval.corpus import (
 from eval.embedders import build_embedder
 from eval.metrics import DEFAULT_KS, aggregate, aggregate_by_kind, score_query
 from eval.queries import QUERY_KINDS, QuerySetError, kind_mix, load_query_set
-from eval.report import write_reports
+from eval.report import ReportError, write_reports
 from eval.retrieval import build_index, search, union_index
 from eval.strategies import (
     COMPOSITES,
@@ -58,6 +58,14 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
+        # --corpus is deliberately NOT confined to the repository. Pointing it
+        # at an arbitrary directory outside this checkout is the entire point
+        # of the tool -- the real use is a brain living somewhere else
+        # entirely, e.g. `--corpus /path/to/brain` (see the epilog above and
+        # eval/README.md). Do not "harden" this one; it would break the
+        # harness for its actual job. --out and --queries below carry the
+        # confinement instead, because they are the primitives that write and
+        # read on this operator-supplied path, not merely index its contents.
         "--corpus",
         type=Path,
         default=DEFAULT_CORPUS,
@@ -116,17 +124,80 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def path_is_confined(path: Path, *roots: Path) -> bool:
+    """True if `path`, once resolved, is one of `roots` or sits inside one.
+
+    Containment is checked on RESOLVED paths, not the raw argument. Two
+    reasons, both load-bearing:
+
+      * `Path.resolve()` is non-strict by default, so a destination that does
+        not exist yet (the common case for --out, which its caller is about
+        to create) still resolves to a real, comparable path.
+      * A `..` segment, a symlink, or an absolute path that happens to type
+        inside `root` as a string all have to be caught, and only the
+        resolved filesystem location can be trusted to catch all three. A
+        string check for ".." (or any other textual heuristic) misses a
+        symlink entirely and is the kind of "fix" that looks right in review
+        and is wrong in production.
+    """
+    resolved = path.resolve()
+    for root in roots:
+        try:
+            resolved.relative_to(root.resolve())
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def confine_out_dir(out_dir: Path) -> None:
+    """Refuse an --out that resolves outside the repository.
+
+    write_reports() creates `out_dir` (mkdir(parents=True, exist_ok=True))
+    and then writes two files into it with no further checks -- an arbitrary
+    file write if `out_dir` is left unconstrained, and this harness is driven
+    by an agent assembling command lines, so a prompt-injected --out is not
+    hypothetical. Confining it costs nothing: DEFAULT_OUT is already in-repo,
+    and nobody has a legitimate reason to write a report outside this
+    checkout. Unlike --corpus, this argument is safe to lock down.
+    """
+    if not path_is_confined(out_dir, REPO_ROOT):
+        raise ReportError(
+            f"--out must resolve inside the repository ({REPO_ROOT}); "
+            f"{out_dir} resolves to {out_dir.resolve()}, outside it"
+        )
+
+
 def resolve_query_set(corpus: Path, explicit: Path | None) -> Path:
     if explicit is not None:
-        return explicit
-    candidate = corpus / QUERY_SET_FILENAME
-    if candidate.is_file():
-        return candidate
-    raise QuerySetError(
-        f"no {QUERY_SET_FILENAME} in {corpus} -- pass --queries explicitly. For a "
-        f"real brain directory, keep the query set outside it (eval/private/ is "
-        f"gitignored) rather than writing into the brain."
-    )
+        path = explicit
+    else:
+        candidate = corpus / QUERY_SET_FILENAME
+        if not candidate.is_file():
+            raise QuerySetError(
+                f"no {QUERY_SET_FILENAME} in {corpus} -- pass --queries explicitly. "
+                f"For a real brain directory, keep the query set outside it "
+                f"(eval/private/ is gitignored) rather than writing into the brain."
+            )
+        path = candidate
+
+    # --queries has exactly two legitimate homes: inside this repository (the
+    # gitignored eval/private/ is where a real query set belongs -- see the
+    # epilog above) or inside the --corpus directory the operator already
+    # named (<corpus>/queries.yaml, the default resolved just above).
+    # load_query_set() both reads this file and parses it as YAML, echoing
+    # path and content fragments into its error messages on a bad parse --
+    # an arbitrary-file-read primitive if this path is left unconstrained, and
+    # this harness is driven by an agent assembling command lines while
+    # reading a private corpus, so a prompt-injected --queries is not
+    # hypothetical either.
+    if not path_is_confined(path, REPO_ROOT, corpus):
+        raise QuerySetError(
+            f"--queries must resolve inside the repository ({REPO_ROOT}) or "
+            f"inside --corpus ({corpus}); {path} resolves to {path.resolve()}, "
+            f"outside both"
+        )
+    return path
 
 
 def run(arguments: argparse.Namespace) -> dict:
@@ -260,8 +331,12 @@ def main(argv: list[str] | None = None) -> int:
 
     arguments = build_parser().parse_args(argv)
     try:
+        # Checked before run() does any work (including the embedding pass),
+        # so a bad --out fails fast rather than after several minutes against
+        # a real model.
+        confine_out_dir(arguments.out)
         result = run(arguments)
-    except (CorpusError, QuerySetError) as exc:
+    except (CorpusError, QuerySetError, ReportError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except EmbeddingBackendError as exc:

@@ -10,6 +10,17 @@ from pathlib import Path
 from eval.metrics import StrategyScore
 from eval.queries import QUERY_KINDS
 
+
+class ReportError(RuntimeError):
+    """The requested report destination is unusable. Always fatal.
+
+    Raised by callers of write_reports() before it runs -- write_reports()
+    itself is the write primitive (mkdir(parents=True, exist_ok=True), then
+    two file writes with no further checks), so the containment check has to
+    happen on the way in, not after the fact.
+    """
+
+
 # One limitation list, rendered into every report. A reader who sees only the
 # output file -- which is how these get circulated -- must see the caveats too,
 # not have to find them in a module docstring.
