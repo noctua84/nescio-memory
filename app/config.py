@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     # LearningRepository.search), not the whole request or connection. 0 would
     # disable the timeout in Postgres, which is never what we want here.
     statement_timeout_ms: int = 5000
+    # Connect timeout per resolved address in seconds. libpq silently raises any
+    # connect_timeout below 2 to 2 seconds, so a smaller value would claim a
+    # bound that is not applied; 0 would disable the timeout entirely.
+    db_connect_timeout_s: int = 10
 
     # Embeddings backend
     # "ollama" posts to an Ollama server over HTTP; "local" runs
@@ -53,6 +57,15 @@ class Settings(BaseSettings):
     # them and stop once this would be exceeded. 100,000 is roughly 25 notes
     # at this corpus's average size.
     max_context_chars: int = 100_000
+
+    # How many distinct notes one /api/v1/search response may expand. The
+    # character budget above is spent after the rows are already in memory, so
+    # it alone does not bound the FETCH: `context: "document"` with top_k=50
+    # hits in 50 different notes asks the database for every chunk of all 50,
+    # however large they are, only to discard most of it (#48). This caps the
+    # documents, in rank order, before anything is fetched. 25 pairs with the
+    # 100,000-character budget above, which is roughly 25 notes' worth.
+    max_context_documents: int = 25
 
     # server
     host: str = "localhost"
@@ -113,15 +126,55 @@ class Settings(BaseSettings):
             )
         return self
 
-    # A non-positive value would disable the statement timeout in Postgres
-    # (0) or be rejected by set_config (negative), silently removing the cap
-    # that issue #17 added rather than failing loudly at startup.
+    # 0 fails for the same reason MAX_CONTEXT_CHARS=0 does, one step earlier in
+    # the pipeline: no document is planned, so `context: "neighbors"|"document"`
+    # returns an empty `contexts` list with every `context_ref` null and looks,
+    # to a caller, exactly like `context: "none"` or a broken service. Turning
+    # the feature off is a per-request decision ("none"), not a deployment-wide
+    # one that still accepts requests asking for it. Negative is the same
+    # mistake with a sign on it.
     @model_validator(mode="after")
-    def _statement_timeout_must_be_positive(self) -> "Settings":
-        if self.statement_timeout_ms <= 0:
+    def _max_context_documents_must_be_positive(self) -> "Settings":
+        if self.max_context_documents <= 0:
             raise ValueError(
-                "STATEMENT_TIMEOUT_MS must be > 0, got "
-                f"{self.statement_timeout_ms}; 0 disables the timeout in Postgres"
+                "MAX_CONTEXT_DOCUMENTS must be > 0, got "
+                f"{self.max_context_documents}; 0 does not narrow context "
+                "expansion, it disables it while still accepting requests "
+                "that ask for it"
+            )
+        return self
+
+    # libpq silently raises any connect_timeout below 2 to 2 seconds, so a
+    # smaller value would claim a bound that is not actually applied; 0 would
+    # disable the timeout entirely. Reject smaller values to fail loudly at
+    # startup rather than silently applying a different timeout than configured.
+    @model_validator(mode="after")
+    def _db_connect_timeout_must_be_valid(self) -> "Settings":
+        if self.db_connect_timeout_s < 2:
+            raise ValueError(
+                "DB_CONNECT_TIMEOUT_S must be >= 2, got "
+                f"{self.db_connect_timeout_s}; libpq silently raises any "
+                "connect_timeout below 2 to 2 seconds"
+            )
+        return self
+
+    # 0 disables the timeout in Postgres entirely, and a negative value is
+    # rejected by set_config -- either way the cap that issue #17 added would
+    # be silently removed rather than failing loudly at startup. A value above
+    # 60000 is a misconfiguration guard: this is a PER-STATEMENT timeout, not
+    # per request -- a search with context runs up to three such statements
+    # (the vector search, the context measurement, the context fetch) -- so
+    # the ceiling prevents a typo from reinstating the unbounded search
+    # mentioned in #17 (closed) under a wall-clock worse than it looks.
+    @model_validator(mode="after")
+    def _statement_timeout_must_be_in_range(self) -> "Settings":
+        if not 1 <= self.statement_timeout_ms <= 60000:
+            raise ValueError(
+                "STATEMENT_TIMEOUT_MS must be in range 1..60000, got "
+                f"{self.statement_timeout_ms}; 0 disables the timeout in "
+                "Postgres, and above 60000 risks reinstating the unbounded "
+                "search #17 closed -- a search with context runs up to three "
+                "statements under this ceiling, not one"
             )
         return self
 

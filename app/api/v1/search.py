@@ -4,7 +4,16 @@ from fastapi import APIRouter, Depends
 from langfuse import observe
 from sqlalchemy.orm import Session
 
-from app.core.context import ContextHit, FetchedChunk, build_regions, plan_ranges
+from app.core.context import (
+    ContextHit,
+    FetchBounds,
+    FetchedChunk,
+    RangeSize,
+    admit_ranges,
+    build_regions,
+    documents_within_cap,
+    plan_ranges,
+)
 from app.core.db import get_db
 from app.core.embeddings import get_embedding
 from app.core.security import get_current_client
@@ -32,20 +41,50 @@ def _chunk_index(meta: dict) -> int | None:
 def _expand(
     repo: LearningRepository, hits: list[ContextHit], request: SearchRequest
 ):
-    """Fetch and build the context regions for `hits`. One query, or none."""
-    ranges = plan_ranges(hits, request.context, request.context_chunks)
+    """Fetch and build the context regions for `hits`. Two queries, or none.
+
+    The two bounds on the fetch (#48) are applied here, where the I/O is, and
+    nowhere else: app/core/context.py decides WHAT they allow, this decides
+    when to ask the database. `hits` is passed to `build_regions` whole, not
+    capped -- the bounds remove context, never results.
+    """
+    expandable, documents_over_cap = documents_within_cap(hits)
+    ranges = plan_ranges(expandable, request.context, request.context_chunks)
+
+    # The measuring query returns one small row per range instead of the
+    # rows' text, so a document that cannot fit the character budget is
+    # recognised without transferring it.
+    sizes = {
+        row.range_id: RangeSize(
+            rows=row.rows,
+            total_chars=row.total_chars,
+            recorded_step=row.recorded_step,
+        )
+        for row in repo.measure_ranges(ranges)
+    }
+    admitted, regions_over_budget = admit_ranges(ranges, sizes, expandable)
+
     fetched = [
         FetchedChunk(
-            repo_name=learning.repo_name,
-            file_path=learning.file_path,
-            chunk_index=chunk_index,
-            content=learning.content,
-            chunk_size=learning.meta.get("chunk_size"),
-            chunk_overlap=learning.meta.get("chunk_overlap"),
+            repo_name=row.repo_name,
+            file_path=row.file_path,
+            chunk_index=row.chunk_index,
+            content=row.content,
+            chunk_size=row.meta.get("chunk_size"),
+            chunk_overlap=row.meta.get("chunk_overlap"),
         )
-        for learning, chunk_index in repo.get_chunks_for_ranges(ranges)
+        for row in repo.get_chunks_for_ranges(admitted)
     ]
-    return build_regions(hits, fetched, request.context, request.context_chunks)
+    return build_regions(
+        hits,
+        fetched,
+        request.context,
+        request.context_chunks,
+        bounds=FetchBounds(
+            documents_over_cap=documents_over_cap,
+            regions_over_budget=regions_over_budget,
+        ),
+    )
 
 
 @router.post(

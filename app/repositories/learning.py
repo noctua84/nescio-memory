@@ -1,6 +1,19 @@
 from typing import Any, Sequence
 
-from sqlalchemy import BigInteger, Row, and_, case, cast, delete, or_, select, text
+from sqlalchemy import (
+    BigInteger,
+    Float,
+    Row,
+    and_,
+    case,
+    cast,
+    delete,
+    func,
+    literal,
+    or_,
+    select,
+    text,
+)
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -30,6 +43,57 @@ _CHUNK_INDEX = case(
     (_CHUNK_INDEX_IS_INTEGER, cast(_CHUNK_INDEX_TEXT, BigInteger)),
     else_=None,
 ).label("chunk_index")
+
+# The chunking window this row records having been cut with, reduced to its
+# step (chunk_size - chunk_overlap). Guarded by the same regex-before-cast
+# reasoning as _CHUNK_INDEX above -- meta is free-form JSONB, so a bare cast
+# would turn a hand-edited row into a 500 -- and NULL whenever either key is
+# missing or not a plain non-negative integer. measure_ranges() takes the
+# minimum over a range's rows, so a NULL simply does not vote and the caller
+# falls back to the service's configured step.
+_CHUNK_SIZE_TEXT = Learning.meta["chunk_size"].astext
+_CHUNK_OVERLAP_TEXT = Learning.meta["chunk_overlap"].astext
+_RECORDED_STEP = case(
+    (
+        and_(
+            _CHUNK_SIZE_TEXT.op("~")(r"^\d{1,18}$"),
+            _CHUNK_OVERLAP_TEXT.op("~")(r"^\d{1,18}$"),
+        ),
+        cast(_CHUNK_SIZE_TEXT, BigInteger) - cast(_CHUNK_OVERLAP_TEXT, BigInteger),
+    ),
+    else_=None,
+)
+
+
+def _range_disjuncts(
+    ranges: list[tuple[str, str, int | None, int | None]],
+) -> list[Any]:
+    """One OR-able predicate per (repo_name, file_path, from_index, to_index).
+
+    Shared by get_chunks_for_ranges and measure_ranges so the rows that are
+    measured are exactly the rows that would be fetched -- a pre-flight
+    measurement over a different set of rows than the fetch is worse than no
+    measurement at all. Neither the tenant filter nor any ordering belongs
+    here: see get_chunks_for_ranges on why client_name stays at the top level
+    of the WHERE clause rather than inside these disjuncts.
+    """
+    disjuncts = []
+    for repo_name, file_path, from_index, to_index in ranges:
+        predicates = [
+            Learning.repo_name == repo_name,
+            Learning.file_path == file_path,
+        ]
+        # _CHUNK_INDEX evaluates to NULL for a row whose
+        # meta["chunk_index"] is missing or not an integer, so a bounded
+        # comparison against it is NULL and the row is simply not returned.
+        # A malformed row therefore degrades to "no context here" instead
+        # of erroring -- the same posture as the guard itself.
+        if from_index is not None:
+            predicates.append(_CHUNK_INDEX >= from_index)
+        if to_index is not None:
+            predicates.append(_CHUNK_INDEX <= to_index)
+        disjuncts.append(and_(*predicates))
+    return disjuncts
 
 
 class LearningRepository:
@@ -134,9 +198,44 @@ class LearningRepository:
         distance = Learning.embedding.cosine_distance(embedding)  # the <=> operator
         similarity = (1 - distance).label("similarity")
 
+        # #42: a stored row's SELF cosine-distance -- Learning.embedding
+        # against itself, not against the query -- is NaN for every
+        # degenerate zero-norm shape pgvector's float4 arithmetic can
+        # produce: all-zero, all-subnormal, or a vector whose squared
+        # components underflow float32 before they are summed. That self-
+        # distance is pgvector's own definition of "this stored vector has
+        # zero norm," and it is unconditional: it does not depend on what is
+        # being searched for, so it is evaluated once per row regardless of
+        # query. _validated() rejects a zero-norm embedding in float64
+        # before it is written, but pgvector's float4 column can flatten a
+        # component differently than Python's float64 evaluated it on the
+        # way in -- a vector that looked fine to _validated() can still land
+        # zero-norm once stored. Excluding by self-distance is what catches
+        # that: a query-time `distance != NaN` only ever excludes a STORED
+        # all-zero row, because that is the one degenerate shape that stays
+        # NaN at query time too. The other degenerate shapes (all-subnormal,
+        # underflowing-norm) do NOT come back NaN against a real query
+        # vector -- pgvector clamps the resulting +-Inf similarity into
+        # [-1, 1], so the degenerate row's query-time distance lands at 0.0
+        # and it is reported as a perfect match instead of being excluded
+        # (confirmed against the real container). The query-time
+        # `distance != NaN` clause is kept anyway, purely as cheap defense:
+        # the query vector is already validated by _validated() before it
+        # reaches here, so this clause should never itself exclude a row,
+        # but it costs nothing extra once `distance` is already computed
+        # for ORDER BY. Postgres defines NaN = NaN as TRUE, so `!= NaN`
+        # excludes exactly the NaN rows (by either definition) without
+        # excluding anything else; both are post-index filters like
+        # client_name above them, not a change to ORDER BY/LIMIT.
+        self_distance = Learning.embedding.cosine_distance(Learning.embedding)
+
         stmt = (
             select(Learning, similarity)
-            .where(Learning.client_name == self.client_name)
+            .where(
+                Learning.client_name == self.client_name,
+                self_distance != cast(literal(float("nan")), Float),
+                distance != cast(literal(float("nan")), Float),
+            )
             .order_by(distance)          # smaller distance = more similar
             .limit(top_k)
         )
@@ -153,9 +252,10 @@ class LearningRepository:
 
         Each element of `ranges` is (repo_name, file_path, from_index,
         to_index); a None bound is unbounded on that side, which is how a
-        whole-document context region is expressed. Returns (Learning,
-        chunk_index) rows ordered by (repo_name, file_path, chunk_index), so
-        the caller can group them per document without a second sort.
+        whole-document context region is expressed. Returns rows with
+        columns (repo_name, file_path, content, meta, chunk_index) ordered
+        by (repo_name, file_path, chunk_index), so the caller can group them
+        per document without a second sort.
 
         One query rather than one per hit: a search returns up to 50 results
         and a per-hit fetch would mean up to 50 round trips on one request
@@ -183,25 +283,25 @@ class LearningRepository:
         if not ranges:
             return []
 
-        disjuncts = []
-        for repo_name, file_path, from_index, to_index in ranges:
-            predicates = [
-                Learning.repo_name == repo_name,
-                Learning.file_path == file_path,
-            ]
-            # _CHUNK_INDEX evaluates to NULL for a row whose
-            # meta["chunk_index"] is missing or not an integer, so a bounded
-            # comparison against it is NULL and the row is simply not returned.
-            # A malformed row therefore degrades to "no context here" instead
-            # of erroring -- the same posture as the guard itself.
-            if from_index is not None:
-                predicates.append(_CHUNK_INDEX >= from_index)
-            if to_index is not None:
-                predicates.append(_CHUNK_INDEX <= to_index)
-            disjuncts.append(and_(*predicates))
+        disjuncts = _range_disjuncts(ranges)
 
         stmt = (
-            select(Learning, _CHUNK_INDEX)
+            # #48: selecting the whole Learning entity (as search() does)
+            # also loads the 1024-dim embedding, which this path never
+            # reads -- ~33x the payload this query actually needs. Explicit
+            # columns rather than load_only()/raiseload(): search() runs in
+            # the same transaction and has already put fully-loaded Learning
+            # instances into the session identity map, so a load-only
+            # option here would be silently overridden by the identity map
+            # (or, misconfigured, lazy-load the column once per row) instead
+            # of changing what is fetched.
+            select(
+                Learning.repo_name,
+                Learning.file_path,
+                Learning.content,
+                Learning.meta,
+                _CHUNK_INDEX,
+            )
             # The tenant boundary sits at the TOP level of the WHERE clause,
             # ANDed with the whole OR group, deliberately. Repeating
             # client_name inside each disjunct would make correctness depend on
@@ -218,5 +318,115 @@ class LearningRepository:
                 or_(*disjuncts),
             )
             .order_by(Learning.repo_name, Learning.file_path, _CHUNK_INDEX)
+        )
+        return self.db.execute(stmt).all()
+
+    def measure_ranges(
+        self, ranges: list[tuple[str, str, int | None, int | None]]
+    ) -> Sequence[Row[Any]]:
+        """Measure what `ranges` would cost to fetch, without fetching it.
+
+        One aggregate query returning, per range, columns (range_id, rows,
+        total_chars, recorded_step): `range_id` is the index into `ranges`,
+        `rows` and `total_chars` count each qualifying chunk_index ONCE (see
+        below), and `recorded_step` is the smallest chunking step any row of
+        the range records having been cut with (NULL when none of them record
+        one). Ranges with no matching rows are absent from the result.
+
+        Why measure before fetching (#48): `max_context_chars` is applied by
+        app/core/context.py's region builder, which can only run on rows that
+        have already been read -- so a `context: "document"` search over 50
+        arbitrarily large notes transfers all of them and then throws most of
+        them away. The aggregate reads the same rows but returns four numbers
+        per range instead of their text, which lets the caller spend the
+        character budget on the FETCH rather than only on the response.
+
+        Same shape of query as get_chunks_for_ranges deliberately: the same
+        shared `_range_disjuncts`, the same tenant filter at the TOP level of
+        the WHERE clause (see that method for why it does not go inside the
+        disjuncts), and no statement_timeout of its own -- it runs in the same
+        transaction as search(), whose SET LOCAL is still in force. Do not add
+        one here.
+        """
+        if not ranges:
+            return []
+
+        disjuncts = _range_disjuncts(ranges)
+
+        # Which range a row belongs to. A CASE takes the FIRST matching branch,
+        # which is exact here rather than merely convenient: plan_ranges merges
+        # overlapping and adjacent spans within a document before probing one
+        # chunk past the top, so the ranges it emits for one document are
+        # pairwise disjoint and no row can satisfy two of them.
+        range_id = case(
+            *[(disjunct, literal(index)) for index, disjunct in enumerate(disjuncts)],
+            else_=None,
+        ).label("range_id")
+
+        # `learnings` has no unique constraint over (client_name, repo_name,
+        # file_path, meta->chunk_index) -- see app/models/learning.py -- so two
+        # concurrent ingests of the same path can leave the same chunk_index
+        # stored twice. The region builder de-duplicates by chunk_index
+        # (content_by_index in app/core/context.py), so a row counted or summed
+        # per PHYSICAL row here -- rather than once per DISTINCT chunk_index --
+        # would charge a duplicated chunk's characters twice, inflate the
+        # estimate above the real region length, and wrongly skip a range the
+        # builder would have admitted. Grouping by (range_id, chunk_index)
+        # first, and taking min(char_length) of the duplicates, keeps the
+        # per-index contribution a floor rather than letting a longer duplicate
+        # inflate it -- consistent with the lower-bound requirement on the
+        # whole estimate (see _region_chars_lower_bound).
+        indexed = (
+            select(
+                range_id,
+                _CHUNK_INDEX.label("chunk_index"),
+                func.min(func.char_length(Learning.content)).label("chars"),
+            )
+            .where(
+                Learning.client_name == self.client_name,
+                or_(*disjuncts),
+                _CHUNK_INDEX_IS_INTEGER,
+            )
+            .group_by(range_id, _CHUNK_INDEX)
+            .subquery()
+        )
+        deduped = (
+            select(
+                indexed.c.range_id.label("range_id"),
+                func.count().label("rows"),
+                func.coalesce(func.sum(indexed.c.chars), 0).label("total_chars"),
+            )
+            .group_by(indexed.c.range_id)
+            .subquery()
+        )
+
+        stmt = (
+            select(
+                range_id,
+                # 0, not NULL, for a range whose rows all lack a usable
+                # chunk_index -- `deduped` has no group for it, same as before
+                # this de-duplication was added.
+                func.coalesce(deduped.c.rows, 0).label("rows"),
+                func.coalesce(deduped.c.total_chars, 0).label("total_chars"),
+                # min(), so a range whose rows disagree about their window is
+                # measured with the smallest step any of them claims. A smaller
+                # step means a smaller estimated region, which means the range
+                # is more likely to be admitted -- the safe direction, since
+                # the region builder remains the authority on the budget.
+                # Computed over EVERY matching row, not just the ones with a
+                # usable chunk_index: a row's recorded window is evidence about
+                # this document's ingestion regardless of whether that row's
+                # own chunk_index is usable, and narrowing this to valid-index
+                # rows could only raise the minimum, which is the unsafe
+                # direction for the estimate below.
+                func.min(_RECORDED_STEP).label("recorded_step"),
+            )
+            .select_from(Learning)
+            .outerjoin(deduped, deduped.c.range_id == range_id)
+            .where(
+                Learning.client_name == self.client_name,
+                or_(*disjuncts),
+            )
+            .group_by(range_id, deduped.c.rows, deduped.c.total_chars)
         )
         return self.db.execute(stmt).all()
