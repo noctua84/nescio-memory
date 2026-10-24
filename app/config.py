@@ -58,6 +58,15 @@ class Settings(BaseSettings):
     # at this corpus's average size.
     max_context_chars: int = 100_000
 
+    # How many distinct notes one /api/v1/search response may expand. The
+    # character budget above is spent after the rows are already in memory, so
+    # it alone does not bound the FETCH: `context: "document"` with top_k=50
+    # hits in 50 different notes asks the database for every chunk of all 50,
+    # however large they are, only to discard most of it (#48). This caps the
+    # documents, in rank order, before anything is fetched. 25 pairs with the
+    # 100,000-character budget above, which is roughly 25 notes' worth.
+    max_context_documents: int = 25
+
     # server
     host: str = "localhost"
     port: int = 8080
@@ -114,6 +123,24 @@ class Settings(BaseSettings):
                 f"{self.max_context_chars}; 0 does not shrink the context "
                 "budget, it disables context expansion while still accepting "
                 "requests that ask for it"
+            )
+        return self
+
+    # 0 fails for the same reason MAX_CONTEXT_CHARS=0 does, one step earlier in
+    # the pipeline: no document is planned, so `context: "neighbors"|"document"`
+    # returns an empty `contexts` list with every `context_ref` null and looks,
+    # to a caller, exactly like `context: "none"` or a broken service. Turning
+    # the feature off is a per-request decision ("none"), not a deployment-wide
+    # one that still accepts requests asking for it. Negative is the same
+    # mistake with a sign on it.
+    @model_validator(mode="after")
+    def _max_context_documents_must_be_positive(self) -> "Settings":
+        if self.max_context_documents <= 0:
+            raise ValueError(
+                "MAX_CONTEXT_DOCUMENTS must be > 0, got "
+                f"{self.max_context_documents}; 0 does not narrow context "
+                "expansion, it disables it while still accepting requests "
+                "that ask for it"
             )
         return self
 

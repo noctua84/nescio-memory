@@ -48,6 +48,37 @@ class ContextHit:
 
 
 @dataclass(frozen=True)
+class RangeSize:
+    """What one planned range would cost to fetch, measured before fetching it.
+
+    Mapped from a LearningRepository.measure_ranges row by the route, so this
+    module stays database-free. `rows` and `total_chars` cover only the rows
+    that could end up in a region; `recorded_step` is the smallest
+    chunk_size - chunk_overlap any row of the range records, or None when none
+    of them record a window.
+    """
+
+    rows: int
+    total_chars: int
+    recorded_step: int | None
+
+
+@dataclass(frozen=True)
+class FetchBounds:
+    """How many documents the two fetch bounds kept out of the expansion.
+
+    Carried into `build_regions` so the note explaining a null `context_ref`
+    is written in one place, next to the character-budget note that explains
+    the same symptom for a different reason. Both default to 0, which is the
+    "nothing was bounded" case and leaves the response exactly as it was
+    before the bounds existed.
+    """
+
+    documents_over_cap: int = 0
+    documents_over_budget: int = 0
+
+
+@dataclass(frozen=True)
 class FetchedChunk:
     """One row from LearningRepository.get_chunks_for_ranges, as a plain DTO.
 
@@ -86,6 +117,132 @@ def _planned_spans(
             for index in indices
         ]
     )
+
+
+def documents_within_cap(hits: list[ContextHit]) -> tuple[list[ContextHit], int]:
+    """Keep the hits belonging to the first `MAX_CONTEXT_DOCUMENTS` documents.
+
+    Returns `(kept, dropped_documents)`. `hits` arrives in rank order, so the
+    cap keeps the best-ranked documents and drops the tail; every hit of a kept
+    document is kept, because a document is expanded as a whole or not at all.
+
+    This runs BEFORE plan_ranges rather than inside it, which keeps that
+    function a pure statement of what the hits ask for: capping is a bound on
+    what the service is willing to fetch, not part of what a region covers.
+    Hits without a usable chunk_index cannot be placed in a document and are
+    never expanded (see plan_ranges), so they do not consume a slot.
+
+    The positions of the returned hits are NOT the positions build_regions
+    maps refs onto -- the route passes the FULL hit list there, so a hit whose
+    document was dropped here simply gets no region and `context_ref: null`.
+
+    settings is read at call time, not captured at import, so a reconfigured
+    service is seen and tests can monkeypatch it.
+    """
+    limit = settings.max_context_documents
+    kept_documents: list[tuple[str, str]] = []
+    dropped_documents: set[tuple[str, str]] = set()
+    for hit in hits:
+        if hit.chunk_index is None:
+            continue
+        document = (hit.repo_name, hit.file_path)
+        if document in kept_documents or document in dropped_documents:
+            continue
+        if len(kept_documents) < limit:
+            kept_documents.append(document)
+        else:
+            dropped_documents.add(document)
+
+    if not dropped_documents:
+        # Identity, not a filtered copy: the overwhelmingly common case is a
+        # search well inside the cap, and it must behave as if the cap were
+        # not there at all.
+        return hits, 0
+
+    allowed = set(kept_documents)
+    return (
+        [hit for hit in hits if (hit.repo_name, hit.file_path) in allowed],
+        len(dropped_documents),
+    )
+
+
+def _region_chars_lower_bound(size: RangeSize) -> int:
+    """A LOWER bound on the characters a range's regions could contribute.
+
+    Lower, deliberately: the pre-flight check must never withhold a region the
+    region builder would have admitted, so when the estimate is wrong it has
+    to be wrong by being too small. Over-admitting costs a fetch the builder
+    then discards -- which is exactly today's behaviour -- while
+    under-admitting would lose context that fits.
+
+    The arithmetic comes from join_chunk_run: a run of `m` chunks joined at
+    `step = chunk_size - chunk_overlap` is `len(last chunk) + (m - 1) * step`
+    characters long, because every seam drops the overlap the two chunks
+    share. So `(m - 1) * step` is a floor, and `m >= rows - 1`: at most one
+    fetched row is the tail probe plan_ranges asks for and the builder never
+    returns. `rows - 2` therefore floors the region's chunk count for a
+    bounded range and understates it by one for a whole-document range, which
+    carries no probe.
+
+    `step` is the smallest the rows admit to, falling back to the configured
+    window exactly where _resolve_window does, and never below 1 (a window
+    whose step is not positive cannot have produced these rows at all, and
+    app/config.py refuses to start with one).
+
+    `total_chars` caps the result because a region is built from the rows' own
+    text: no join can produce more characters than were stored.
+
+    Where this bound is NOT exact, and why that is accepted: a range whose
+    rows disagree about their window, or whose index sequence has a hole, or
+    whose overlaps do not verify, yields a shorter region than this -- or none
+    at all -- so the estimate can hold back a document that would in fact have
+    fitted. Those are the cases where the stored rows are already damaged, the
+    symptom is the one the feature is built to degrade to (no context for that
+    note, explained in a note on the last region), and pricing them correctly
+    would mean fetching the text to find out, which is the cost this check
+    exists to avoid.
+    """
+    step = settings.chunk_size - settings.chunk_overlap
+    if size.recorded_step is not None:
+        step = min(step, size.recorded_step)
+    step = max(1, step)
+    return min(size.total_chars, max(0, (size.rows - 2) * step))
+
+
+def admit_ranges(
+    ranges: list[ChunkRange], sizes: dict[int, RangeSize]
+) -> tuple[list[ChunkRange], int]:
+    """The ranges worth fetching under `MAX_CONTEXT_CHARS`, in rank order.
+
+    Returns `(admitted, skipped_documents)`, where `skipped_documents` counts
+    the distinct documents at least one of whose ranges was not admitted.
+    `sizes` maps a position in `ranges` to its measurement; a position that is
+    missing had no matching rows at all, costs nothing, and is admitted.
+
+    Unlike the builder's post-fetch budget, this does NOT stop at the first
+    range that does not fit -- it skips that one and goes on considering the
+    rest. The builder's "stop entirely" rule exists so that the regions it
+    returns are a rank-ordered prefix; here nothing is being returned to a
+    caller, the two orders are not identical (the builder ranks regions by
+    best similarity, this ranks documents by their best-ranked hit), and
+    stopping early could drop a range the builder would have admitted. Where
+    the two rules disagree, this one admits more and the builder decides.
+    """
+    budget = settings.max_context_chars
+    spent = 0
+    admitted: list[ChunkRange] = []
+    skipped_documents: set[tuple[str, str]] = set()
+
+    for position, chunk_range in enumerate(ranges):
+        size = sizes.get(position)
+        estimate = 0 if size is None else _region_chars_lower_bound(size)
+        if spent + estimate > budget:
+            skipped_documents.add((chunk_range[0], chunk_range[1]))
+            continue
+        spent += estimate
+        admitted.append(chunk_range)
+
+    return admitted, len(skipped_documents)
 
 
 def plan_ranges(
@@ -215,12 +372,19 @@ def build_regions(
     fetched: list[FetchedChunk],
     mode: ContextMode,
     context_chunks: int,
+    bounds: FetchBounds = FetchBounds(),
 ) -> tuple[list[ContextRegion], list[int | None]]:
     """Turn hits plus their fetched chunks into regions and per-hit refs.
 
     Returns `(contexts, refs)` where `refs[i]` is the `context_ref` for
     `hits[i]` -- an index into `contexts`, or None when no region covers that
     hit.
+
+    `hits` is the full, uncapped hit list even when `fetched` was bounded:
+    that is what makes a hit whose document was never fetched come back with
+    `context_ref: null` rather than silently shifting the refs of the others.
+    `bounds` says how many documents those bounds held back, so the note can
+    explain the nulls.
     """
     if mode == "none":
         return [], [None] * len(hits)
@@ -286,25 +450,42 @@ def build_regions(
         for position in candidate.hit_positions:
             refs[position] = len(contexts) - 1
 
-    if omitted and contexts:
-        # An omitted region is absent from `contexts` by contract, so it has
-        # nowhere of its own to carry a note -- yet a caller holding a null
-        # `context_ref` needs to know the difference between "that note could
-        # not be resolved" and "the response was already full". The last
-        # region that did fit is the only place adjacent to the cut, so the
-        # explanation goes there. When even the first region overruns the
-        # budget there is no such place: `contexts` is empty and every ref is
-        # null, which is the one case this cannot explain in-band.
-        last = contexts[-1]
-        budget_note = (
+    # Everything that was left out has no region of its own to carry a note --
+    # yet a caller holding a null `context_ref` needs to know the difference
+    # between "that note could not be resolved" and "the response, or the
+    # fetch behind it, was already full". The last region that did fit is the
+    # only place adjacent to the cut, so the explanations go there, in the
+    # order the pipeline applied them: the document cap first, then the
+    # pre-flight measurement, then the post-fetch budget. When no region fits
+    # at all there is no such place: `contexts` is empty and every ref is null,
+    # which is the one case this cannot explain in-band.
+    trailing_notes = []
+    if bounds.documents_over_cap:
+        trailing_notes.append(
+            f"{bounds.documents_over_cap} lower-ranked document(s) were not "
+            f"expanded because the {settings.max_context_documents}-document "
+            "limit (MAX_CONTEXT_DOCUMENTS) was reached, and the results "
+            "referencing them carry context_ref: null"
+        )
+    if bounds.documents_over_budget:
+        trailing_notes.append(
+            f"the {budget}-character context budget was reached before "
+            f"fetching: {bounds.documents_over_budget} document(s) were "
+            "measured as too large to fit and were not expanded, so the "
+            "results referencing them carry context_ref: null"
+        )
+    if omitted:
+        trailing_notes.append(
             f"the {budget}-character context budget was reached after this "
             f"region; {omitted} further region(s) were omitted and the "
             "results referencing them carry context_ref: null"
         )
+
+    if trailing_notes and contexts:
+        last = contexts[-1]
+        appended = "; ".join(trailing_notes)
         contexts[-1] = last.model_copy(
-            update={
-                "note": f"{last.note}; {budget_note}" if last.note else budget_note
-            }
+            update={"note": f"{last.note}; {appended}" if last.note else appended}
         )
 
     return contexts, refs

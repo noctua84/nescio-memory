@@ -8,6 +8,7 @@ from sqlalchemy import (
     case,
     cast,
     delete,
+    func,
     literal,
     or_,
     select,
@@ -42,6 +43,57 @@ _CHUNK_INDEX = case(
     (_CHUNK_INDEX_IS_INTEGER, cast(_CHUNK_INDEX_TEXT, BigInteger)),
     else_=None,
 ).label("chunk_index")
+
+# The chunking window this row records having been cut with, reduced to its
+# step (chunk_size - chunk_overlap). Guarded by the same regex-before-cast
+# reasoning as _CHUNK_INDEX above -- meta is free-form JSONB, so a bare cast
+# would turn a hand-edited row into a 500 -- and NULL whenever either key is
+# missing or not a plain non-negative integer. measure_ranges() takes the
+# minimum over a range's rows, so a NULL simply does not vote and the caller
+# falls back to the service's configured step.
+_CHUNK_SIZE_TEXT = Learning.meta["chunk_size"].astext
+_CHUNK_OVERLAP_TEXT = Learning.meta["chunk_overlap"].astext
+_RECORDED_STEP = case(
+    (
+        and_(
+            _CHUNK_SIZE_TEXT.op("~")(r"^\d{1,18}$"),
+            _CHUNK_OVERLAP_TEXT.op("~")(r"^\d{1,18}$"),
+        ),
+        cast(_CHUNK_SIZE_TEXT, BigInteger) - cast(_CHUNK_OVERLAP_TEXT, BigInteger),
+    ),
+    else_=None,
+)
+
+
+def _range_disjuncts(
+    ranges: list[tuple[str, str, int | None, int | None]],
+) -> list[Any]:
+    """One OR-able predicate per (repo_name, file_path, from_index, to_index).
+
+    Shared by get_chunks_for_ranges and measure_ranges so the rows that are
+    measured are exactly the rows that would be fetched -- a pre-flight
+    measurement over a different set of rows than the fetch is worse than no
+    measurement at all. Neither the tenant filter nor any ordering belongs
+    here: see get_chunks_for_ranges on why client_name stays at the top level
+    of the WHERE clause rather than inside these disjuncts.
+    """
+    disjuncts = []
+    for repo_name, file_path, from_index, to_index in ranges:
+        predicates = [
+            Learning.repo_name == repo_name,
+            Learning.file_path == file_path,
+        ]
+        # _CHUNK_INDEX evaluates to NULL for a row whose
+        # meta["chunk_index"] is missing or not an integer, so a bounded
+        # comparison against it is NULL and the row is simply not returned.
+        # A malformed row therefore degrades to "no context here" instead
+        # of erroring -- the same posture as the guard itself.
+        if from_index is not None:
+            predicates.append(_CHUNK_INDEX >= from_index)
+        if to_index is not None:
+            predicates.append(_CHUNK_INDEX <= to_index)
+        disjuncts.append(and_(*predicates))
+    return disjuncts
 
 
 class LearningRepository:
@@ -215,22 +267,7 @@ class LearningRepository:
         if not ranges:
             return []
 
-        disjuncts = []
-        for repo_name, file_path, from_index, to_index in ranges:
-            predicates = [
-                Learning.repo_name == repo_name,
-                Learning.file_path == file_path,
-            ]
-            # _CHUNK_INDEX evaluates to NULL for a row whose
-            # meta["chunk_index"] is missing or not an integer, so a bounded
-            # comparison against it is NULL and the row is simply not returned.
-            # A malformed row therefore degrades to "no context here" instead
-            # of erroring -- the same posture as the guard itself.
-            if from_index is not None:
-                predicates.append(_CHUNK_INDEX >= from_index)
-            if to_index is not None:
-                predicates.append(_CHUNK_INDEX <= to_index)
-            disjuncts.append(and_(*predicates))
+        disjuncts = _range_disjuncts(ranges)
 
         stmt = (
             # #48: selecting the whole Learning entity (as search() does)
@@ -265,5 +302,80 @@ class LearningRepository:
                 or_(*disjuncts),
             )
             .order_by(Learning.repo_name, Learning.file_path, _CHUNK_INDEX)
+        )
+        return self.db.execute(stmt).all()
+
+    def measure_ranges(
+        self, ranges: list[tuple[str, str, int | None, int | None]]
+    ) -> Sequence[Row[Any]]:
+        """Measure what `ranges` would cost to fetch, without fetching it.
+
+        One aggregate query returning, per range, columns (range_id, rows,
+        total_chars, recorded_step): `range_id` is the index into `ranges`,
+        `rows` and `total_chars` count only rows that could actually end up in
+        a region, and `recorded_step` is the smallest chunking step any row of
+        the range records having been cut with (NULL when none of them record
+        one). Ranges with no matching rows are absent from the result.
+
+        Why measure before fetching (#48): `max_context_chars` is applied by
+        app/core/context.py's region builder, which can only run on rows that
+        have already been read -- so a `context: "document"` search over 50
+        arbitrarily large notes transfers all of them and then throws most of
+        them away. The aggregate reads the same rows but returns four numbers
+        per range instead of their text, which lets the caller spend the
+        character budget on the FETCH rather than only on the response.
+
+        Same shape of query as get_chunks_for_ranges deliberately: the same
+        shared `_range_disjuncts`, the same tenant filter at the TOP level of
+        the WHERE clause (see that method for why it does not go inside the
+        disjuncts), and no statement_timeout of its own -- it runs in the same
+        transaction as search(), whose SET LOCAL is still in force. Do not add
+        one here.
+        """
+        if not ranges:
+            return []
+
+        disjuncts = _range_disjuncts(ranges)
+
+        # Which range a row belongs to. A CASE takes the FIRST matching branch,
+        # which is exact here rather than merely convenient: plan_ranges merges
+        # overlapping and adjacent spans within a document before probing one
+        # chunk past the top, so the ranges it emits for one document are
+        # pairwise disjoint and no row can satisfy two of them.
+        range_id = case(
+            *[(disjunct, literal(index)) for index, disjunct in enumerate(disjuncts)],
+            else_=None,
+        ).label("range_id")
+
+        stmt = (
+            select(
+                range_id,
+                # Counted and summed over rows with a usable chunk_index only.
+                # A row whose meta["chunk_index"] is missing or malformed is
+                # dropped by the region builder, so its characters are not part
+                # of any region and must not be charged to the budget -- an
+                # unbounded (whole-document) range matches such rows even
+                # though a bounded one cannot.
+                func.count()
+                .filter(_CHUNK_INDEX_IS_INTEGER)
+                .label("rows"),
+                func.coalesce(
+                    func.sum(func.char_length(Learning.content)).filter(
+                        _CHUNK_INDEX_IS_INTEGER
+                    ),
+                    0,
+                ).label("total_chars"),
+                # min(), so a range whose rows disagree about their window is
+                # measured with the smallest step any of them claims. A smaller
+                # step means a smaller estimated region, which means the range
+                # is more likely to be admitted -- the safe direction, since
+                # the region builder remains the authority on the budget.
+                func.min(_RECORDED_STEP).label("recorded_step"),
+            )
+            .where(
+                Learning.client_name == self.client_name,
+                or_(*disjuncts),
+            )
+            .group_by(range_id)
         )
         return self.db.execute(stmt).all()
