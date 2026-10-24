@@ -1,6 +1,18 @@
 from typing import Any, Sequence
 
-from sqlalchemy import BigInteger, Row, and_, case, cast, delete, or_, select, text
+from sqlalchemy import (
+    BigInteger,
+    Float,
+    Row,
+    and_,
+    case,
+    cast,
+    delete,
+    literal,
+    or_,
+    select,
+    text,
+)
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -136,7 +148,26 @@ class LearningRepository:
 
         stmt = (
             select(Learning, similarity)
-            .where(Learning.client_name == self.client_name)
+            .where(
+                Learning.client_name == self.client_name,
+                # #42: cosine distance is NaN whenever the STORED row is
+                # zero-norm, regardless of the query vector. _validated()
+                # rejects a zero-norm embedding before it is written, but
+                # pgvector's float4 column flattens a subnormal component --
+                # or one whose square underflows float32 -- differently from
+                # how Python's float64 evaluated it on the way in, so a row
+                # that looked fine to _validated() can still land as
+                # zero-norm once stored (confirmed against the real
+                # container: a stored all-subnormal or underflowing-norm
+                # vector's self cosine-distance comes back NaN). A NaN
+                # distance would otherwise serialize as `similarity: null`,
+                # violating SearchResult.similarity: float on an HTTP 200.
+                # Postgres defines NaN = NaN as TRUE, so `!= NaN` excludes
+                # exactly the NaN rows without excluding anything else; this
+                # is a post-index filter like client_name above it, not a
+                # change to ORDER BY/LIMIT.
+                distance != literal("NaN", Float),
+            )
             .order_by(distance)          # smaller distance = more similar
             .limit(top_k)
         )
