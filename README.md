@@ -342,11 +342,22 @@ no problem in it turns a successful search into a non-200:
 | ---------------------------------------------------------------- | --------------------------------------------- |
 | a chunk was dropped at ingest, leaving a hole in the index sequence | the region stops at the hole rather than splicing across it, and says so in `note` |
 | a note's rows disagree about the window they were cut with       | no region for that note; its results get `context_ref: null` |
+| more than `MAX_CONTEXT_DOCUMENTS` notes were matched            | only the best-ranked notes are expanded; the rest get `context_ref: null`, and the last included region's `note` says the limit was reached |
+| a note is measured as too large for `MAX_CONTEXT_CHARS`         | it is not fetched at all; its results get `context_ref: null`, and the last included region's `note` says the budget was reached before fetching |
 | the response's character budget (`MAX_CONTEXT_CHARS`) is reached | lower-ranked regions are omitted; their results get `context_ref: null`, and the last included region's `note` says the budget was reached |
 | anything else unexpected                                         | the search returns normally with `contexts: []` and every `context_ref: null` |
 
 Regions are built in descending order of the best similarity among the results referencing them,
 so the budget is spent on the context most likely to be wanted.
+
+**Both bounds apply before the rows are read.** `MAX_CONTEXT_CHARS` on its own is spent on text
+that has already been transferred, so `context: "document"` over 50 matched notes would fetch all
+of them whatever their size and then discard most of it. Expansion therefore first keeps the
+best-ranked `MAX_CONTEXT_DOCUMENTS` notes, then asks the database for the size of what it is about
+to read and admits notes against the same character budget — deliberately underestimating, so a
+note that would have fitted is never withheld. Whatever a bound held back is explained in the
+`note` of the last region that did fit, which is the only place adjacent to the cut; if nothing
+fits at all, `contexts` is empty and every `context_ref` is `null`.
 
 ## Configuration
 
@@ -371,6 +382,7 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `CHUNK_SIZE`          | `1000`                                      | characters per chunk                                 |
 | `CHUNK_OVERLAP`       | `200`                                      | overlap between chunks — must satisfy `0 <= CHUNK_OVERLAP < CHUNK_SIZE`, otherwise the app refuses to start |
 | `MAX_CONTEXT_CHARS`   | `100000`                                    | total characters of expanded context one search response may carry; a cap, not a target. Must be `> 0`, otherwise the app refuses to start |
+| `MAX_CONTEXT_DOCUMENTS` | `25`                                      | how many distinct notes one search response may expand, in rank order; bounds the context FETCH, which `MAX_CONTEXT_CHARS` alone cannot. Must be `> 0`, otherwise the app refuses to start |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
 
 ### Embedding backends
