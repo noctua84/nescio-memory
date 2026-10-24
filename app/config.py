@@ -158,20 +158,23 @@ class Settings(BaseSettings):
             )
         return self
 
-    # A non-positive value would disable the statement timeout in Postgres
-    # (0) or be rejected by set_config (negative), silently removing the cap
-    # that issue #17 added rather than failing loudly at startup. A value above
-    # 60000 is a misconfiguration guard: the ceiling prevents a typo from
-    # reinstating the unbounded search mentioned in #17 (closed); search and
-    # context expansion each get one statement, so 60 seconds per statement is
-    # the ceiling.
+    # 0 disables the timeout in Postgres entirely, and a negative value is
+    # rejected by set_config -- either way the cap that issue #17 added would
+    # be silently removed rather than failing loudly at startup. A value above
+    # 60000 is a misconfiguration guard: this is a PER-STATEMENT timeout, not
+    # per request -- a search with context runs up to three such statements
+    # (the vector search, the context measurement, the context fetch) -- so
+    # the ceiling prevents a typo from reinstating the unbounded search
+    # mentioned in #17 (closed) under a wall-clock worse than it looks.
     @model_validator(mode="after")
-    def _statement_timeout_must_be_positive(self) -> "Settings":
+    def _statement_timeout_must_be_in_range(self) -> "Settings":
         if not 1 <= self.statement_timeout_ms <= 60000:
             raise ValueError(
                 "STATEMENT_TIMEOUT_MS must be in range 1..60000, got "
-                f"{self.statement_timeout_ms}; per statement, not per request — "
-                "search and context expansion each get one"
+                f"{self.statement_timeout_ms}; 0 disables the timeout in "
+                "Postgres, and above 60000 risks reinstating the unbounded "
+                "search #17 closed -- a search with context runs up to three "
+                "statements under this ceiling, not one"
             )
         return self
 

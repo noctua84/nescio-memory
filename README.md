@@ -343,7 +343,7 @@ no problem in it turns a successful search into a non-200:
 | a chunk was dropped at ingest, leaving a hole in the index sequence | the region stops at the hole rather than splicing across it, and says so in `note` |
 | a note's rows disagree about the window they were cut with       | no region for that note; its results get `context_ref: null` |
 | more than `MAX_CONTEXT_DOCUMENTS` notes were matched            | only the best-ranked notes are expanded; the rest get `context_ref: null`, and the last included region's `note` says the limit was reached |
-| a note is measured as too large for `MAX_CONTEXT_CHARS`         | it is not fetched at all; its results get `context_ref: null`, and the last included region's `note` says the budget was reached before fetching |
+| a note's range is measured as too large for `MAX_CONTEXT_CHARS`  | that range is not fetched at all; the results referencing it get `context_ref: null`, and the last included region's `note` says the budget was reached before fetching — a note that also has another, smaller range admitted still gets context from that range |
 | the response's character budget (`MAX_CONTEXT_CHARS`) is reached | lower-ranked regions are omitted; their results get `context_ref: null`, and the last included region's `note` says the budget was reached |
 | anything else unexpected                                         | the search returns normally with `contexts: []` and every `context_ref: null` |
 
@@ -354,8 +354,11 @@ so the budget is spent on the context most likely to be wanted.
 that has already been transferred, so `context: "document"` over 50 matched notes would fetch all
 of them whatever their size and then discard most of it. Expansion therefore first keeps the
 best-ranked `MAX_CONTEXT_DOCUMENTS` notes, then asks the database for the size of what it is about
-to read and admits notes against the same character budget — deliberately underestimating, so a
-note that would have fitted is never withheld. Whatever a bound held back is explained in the
+to read and admits ranges against the same character budget — deliberately underestimating, so a
+range whose rows are intact is never withheld for having been under-estimated. A range whose rows
+disagree about their window, have a hole in their index sequence, or are stored twice under the
+same `chunk_index` can still lose context even though the real text would have fitted; the note on
+the last region says so when it does. Whatever a bound held back is explained in the
 `note` of the last region that did fit, which is the only place adjacent to the cut; if nothing
 fits at all, `contexts` is empty and every `context_ref` is `null`.
 
@@ -368,7 +371,7 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | --------------------- | ------------------------------------------ | ---------------------------------------------------- |
 | `DATABASE_URL`        | *required*                                 | PostgreSQL connection string; a plain `postgresql://` uses the bundled psycopg 3 driver |
 | `DB_CONNECT_TIMEOUT_S` | `10`                                       | seconds per connection attempt (applies per resolved address); with `pool_pre_ping` a dead database adds this inside a request; must be `>= 2`, otherwise the app refuses to start |
-| `STATEMENT_TIMEOUT_MS` | `5000`                                     | caps the vector-search statement only (not the whole request); must be `1..60000`; per statement, not per request — search and context expansion each get one; **breaking in 0.5.0**: values above 60000 now refuse to start |
+| `STATEMENT_TIMEOUT_MS` | `5000`                                     | caps each statement, not the whole request; must be `1..60000`; a search with context runs up to three such statements (the vector search, the context measurement, the context fetch), so the worst-case wall clock is up to three times this value; **breaking in 0.5.0**: values above 60000 now refuse to start |
 | `EMBEDDING_BACKEND`   | `ollama`                                    | `ollama` (HTTP) or `local` (in-process); any other value fails at startup |
 | `LOCAL_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2`  | model for the `local` backend only — see [Embedding backends](#embedding-backends) |
 | `OLLAMA_URL`          | `http://localhost:11434/api/embeddings`     | embedding endpoint (local or remote)                 |
