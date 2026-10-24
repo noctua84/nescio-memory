@@ -36,14 +36,14 @@ def _expand(
     ranges = plan_ranges(hits, request.context, request.context_chunks)
     fetched = [
         FetchedChunk(
-            repo_name=learning.repo_name,
-            file_path=learning.file_path,
-            chunk_index=chunk_index,
-            content=learning.content,
-            chunk_size=learning.meta.get("chunk_size"),
-            chunk_overlap=learning.meta.get("chunk_overlap"),
+            repo_name=row.repo_name,
+            file_path=row.file_path,
+            chunk_index=row.chunk_index,
+            content=row.content,
+            chunk_size=row.meta.get("chunk_size"),
+            chunk_overlap=row.meta.get("chunk_overlap"),
         )
-        for learning, chunk_index in repo.get_chunks_for_ranges(ranges)
+        for row in repo.get_chunks_for_ranges(ranges)
     ]
     return build_regions(hits, fetched, request.context, request.context_chunks)
 

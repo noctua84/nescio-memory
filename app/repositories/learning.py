@@ -184,9 +184,10 @@ class LearningRepository:
 
         Each element of `ranges` is (repo_name, file_path, from_index,
         to_index); a None bound is unbounded on that side, which is how a
-        whole-document context region is expressed. Returns (Learning,
-        chunk_index) rows ordered by (repo_name, file_path, chunk_index), so
-        the caller can group them per document without a second sort.
+        whole-document context region is expressed. Returns rows with
+        columns (repo_name, file_path, content, meta, chunk_index) ordered
+        by (repo_name, file_path, chunk_index), so the caller can group them
+        per document without a second sort.
 
         One query rather than one per hit: a search returns up to 50 results
         and a per-hit fetch would mean up to 50 round trips on one request
@@ -232,7 +233,22 @@ class LearningRepository:
             disjuncts.append(and_(*predicates))
 
         stmt = (
-            select(Learning, _CHUNK_INDEX)
+            # #48: selecting the whole Learning entity (as search() does)
+            # also loads the 1024-dim embedding, which this path never
+            # reads -- ~33x the payload this query actually needs. Explicit
+            # columns rather than load_only()/raiseload(): search() runs in
+            # the same transaction and has already put fully-loaded Learning
+            # instances into the session identity map, so a load-only
+            # option here would be silently overridden by the identity map
+            # (or, misconfigured, lazy-load the column once per row) instead
+            # of changing what is fetched.
+            select(
+                Learning.repo_name,
+                Learning.file_path,
+                Learning.content,
+                Learning.meta,
+                _CHUNK_INDEX,
+            )
             # The tenant boundary sits at the TOP level of the WHERE clause,
             # ANDed with the whole OR group, deliberately. Repeating
             # client_name inside each disjunct would make correctness depend on
