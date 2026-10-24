@@ -75,6 +75,70 @@ def test_importing_app_main_does_not_create_an_engine():
     )
 
 
+def test_the_engine_carries_the_configured_connect_timeout(monkeypatch):
+    """get_engine() must pass settings.db_connect_timeout_s to the driver.
+
+    Issue #30: without connect_timeout in connect_args, a request that hits an
+    unreachable Postgres hangs for the OS TCP timeout rather than the
+    configured bound. The spy records what create_engine was asked for without
+    opening a connection; create_engine() does not connect, so the real engine
+    is built too.
+    """
+    import app.core.db as db_module
+    from app.config import settings
+
+    calls = []
+    real_create_engine = db_module.create_engine
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_create_engine(*args, **kwargs)
+
+    monkeypatch.setattr(db_module, "create_engine", spy)
+
+    db_module.get_engine.cache_clear()
+    try:
+        db_module.get_engine()
+    finally:
+        db_module.get_engine.cache_clear()
+
+    assert len(calls) == 1, f"expected exactly one create_engine call, got {calls}"
+    _, kwargs = calls[0]
+    assert kwargs["connect_args"]["connect_timeout"] == settings.db_connect_timeout_s
+
+
+def test_the_engine_honours_a_changed_connect_timeout_setting(monkeypatch):
+    """The timeout is read from settings, not hardcoded.
+
+    A deployment that raises DB_CONNECT_TIMEOUT_S must get the raised value;
+    pinning the default alone would pass against a hardcoded 10.
+    """
+    import app.core.db as db_module
+    from app.config import settings
+
+    assert settings.db_connect_timeout_s != 23, (
+        "fixture value must differ from the default for this test to mean "
+        "anything"
+    )
+
+    calls = []
+    real_create_engine = db_module.create_engine
+    monkeypatch.setattr(
+        db_module,
+        "create_engine",
+        lambda *a, **kw: (calls.append(kw), real_create_engine(*a, **kw))[1],
+    )
+    monkeypatch.setattr(settings, "db_connect_timeout_s", 23)
+
+    db_module.get_engine.cache_clear()
+    try:
+        db_module.get_engine()
+    finally:
+        db_module.get_engine.cache_clear()
+
+    assert calls[0]["connect_args"]["connect_timeout"] == 23
+
+
 def test_get_engine_is_cached():
     """get_engine() must return the same Engine object on repeated calls.
 
