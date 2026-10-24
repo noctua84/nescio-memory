@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     # LearningRepository.search), not the whole request or connection. 0 would
     # disable the timeout in Postgres, which is never what we want here.
     statement_timeout_ms: int = 5000
+    # Connect timeout per resolved address in seconds. libpq silently raises any
+    # connect_timeout below 2 to 2 seconds, so a smaller value would claim a
+    # bound that is not applied; 0 would disable the timeout entirely.
+    db_connect_timeout_s: int = 10
 
     # Embeddings backend
     # "ollama" posts to an Ollama server over HTTP; "local" runs
@@ -113,15 +117,34 @@ class Settings(BaseSettings):
             )
         return self
 
+    # libpq silently raises any connect_timeout below 2 to 2 seconds, so a
+    # smaller value would claim a bound that is not actually applied; 0 would
+    # disable the timeout entirely. Reject smaller values to fail loudly at
+    # startup rather than silently applying a different timeout than configured.
+    @model_validator(mode="after")
+    def _db_connect_timeout_must_be_valid(self) -> "Settings":
+        if self.db_connect_timeout_s < 2:
+            raise ValueError(
+                "DB_CONNECT_TIMEOUT_S must be >= 2, got "
+                f"{self.db_connect_timeout_s}; libpq silently raises any "
+                "connect_timeout below 2 to 2 seconds"
+            )
+        return self
+
     # A non-positive value would disable the statement timeout in Postgres
     # (0) or be rejected by set_config (negative), silently removing the cap
-    # that issue #17 added rather than failing loudly at startup.
+    # that issue #17 added rather than failing loudly at startup. A value above
+    # 60000 is a misconfiguration guard: the ceiling prevents a typo from
+    # reinstating the unbounded search mentioned in #17 (closed); search and
+    # context expansion each get one statement, so 60 seconds per statement is
+    # the ceiling.
     @model_validator(mode="after")
     def _statement_timeout_must_be_positive(self) -> "Settings":
-        if self.statement_timeout_ms <= 0:
+        if not 1 <= self.statement_timeout_ms <= 60000:
             raise ValueError(
-                "STATEMENT_TIMEOUT_MS must be > 0, got "
-                f"{self.statement_timeout_ms}; 0 disables the timeout in Postgres"
+                "STATEMENT_TIMEOUT_MS must be in range 1..60000, got "
+                f"{self.statement_timeout_ms}; per statement, not per request — "
+                "search and context expansion each get one"
             )
         return self
 

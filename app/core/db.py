@@ -14,7 +14,14 @@ from app.config import settings
 # touches the database. Deferring to first use keeps import side-effect-free.
 @functools.lru_cache(maxsize=1)
 def get_engine() -> Engine:
-    return create_engine(settings.database_url, pool_pre_ping=True)
+    return create_engine(
+        settings.database_url,
+        pool_pre_ping=True,
+        # Issue #30: configurable connect timeout prevents hanging on unreachable
+        # Postgres instances. With pool_pre_ping, a dead database adds this
+        # timeout inside request processing.
+        connect_args={"connect_timeout": settings.db_connect_timeout_s},
+    )
 
 
 @functools.lru_cache(maxsize=1)
