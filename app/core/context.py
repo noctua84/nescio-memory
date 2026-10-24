@@ -3,8 +3,11 @@
 No DB access here deliberately, mirroring app/core/reassembly.py: this module
 takes the hits and the already-fetched chunks and returns regions, so the
 planning, hole-splitting, window-resolution, budget and mapping logic is all
-testable without a database container. The route owns the two I/O steps
-(embed + search, then one range fetch) and nothing else.
+testable without a database container. The route owns the THREE I/O steps
+(embed + search, then a pre-flight measurement, then one range fetch) and
+nothing else. This module decides what those bounds allow -- `documents_within_cap`
+and `admit_ranges` -- as well as what a region covers and contains; it just
+never talks to the database to do it.
 
 See docs/superpowers/specs/2026-10-03-search-context-expansion-design.md. The
 rule the whole feature is built to respect: content is reachable only through a
@@ -52,8 +55,12 @@ class RangeSize:
     """What one planned range would cost to fetch, measured before fetching it.
 
     Mapped from a LearningRepository.measure_ranges row by the route, so this
-    module stays database-free. `rows` and `total_chars` cover only the rows
-    that could end up in a region; `recorded_step` is the smallest
+    module stays database-free. `rows` and `total_chars` cover every row with
+    a usable chunk_index in the range, counted once each even if the row is
+    stored more than once -- INCLUDING the tail probe, which the region
+    builder fetches but never returns. `_region_chars_lower_bound`'s `- 2`
+    (rather than `- 1`) is what discounts that row out of the estimate;
+    `rows` itself still counts it. `recorded_step` is the smallest
     chunk_size - chunk_overlap any row of the range records, or None when none
     of them record a window.
     """
@@ -65,17 +72,23 @@ class RangeSize:
 
 @dataclass(frozen=True)
 class FetchBounds:
-    """How many documents the two fetch bounds kept out of the expansion.
+    """How much the two fetch bounds kept out of the expansion.
 
     Carried into `build_regions` so the note explaining a null `context_ref`
     is written in one place, next to the character-budget note that explains
     the same symptom for a different reason. Both default to 0, which is the
     "nothing was bounded" case and leaves the response exactly as it was
     before the bounds existed.
+
+    `documents_over_cap` counts whole documents (the cap really is applied per
+    document). `regions_over_budget` counts RANGES, not documents: in
+    `neighbors` mode one document can have several planned ranges, and the
+    pre-flight can skip one of them while admitting another -- so a document
+    is not necessarily "not expanded" just because one of its ranges was.
     """
 
     documents_over_cap: int = 0
-    documents_over_budget: int = 0
+    regions_over_budget: int = 0
 
 
 @dataclass(frozen=True)
@@ -269,12 +282,15 @@ def admit_ranges(
 ) -> tuple[list[ChunkRange], int]:
     """The ranges worth fetching under `MAX_CONTEXT_CHARS`.
 
-    Returns `(admitted, skipped_documents)`, where `admitted` keeps the order
-    of `ranges` (the fetch orders its rows in SQL anyway) and
-    `skipped_documents` counts the distinct documents at least one of whose
-    ranges was not admitted. `sizes` maps a position in `ranges` to its
-    measurement; a position that is missing had no matching rows at all, costs
-    nothing, and is admitted.
+    Returns `(admitted, skipped_ranges)`, where `admitted` keeps the order of
+    `ranges` (the fetch orders its rows in SQL anyway) and `skipped_ranges`
+    counts the RANGES that were not admitted -- not deduplicated by document,
+    because a document can have one range skipped here and another admitted
+    (neighbors mode plans several ranges per document), and the caller-visible
+    note built from this count must describe what was actually skipped rather
+    than imply the whole document was not expanded. `sizes` maps a position in
+    `ranges` to its measurement; a position that is missing had no matching
+    rows at all, costs nothing, and is admitted.
 
     The budget is spent in `_rank_key` order -- the SAME order `build_regions`
     ranks regions in -- and NOT in the order `plan_ranges` emits, which groups
@@ -310,25 +326,24 @@ def admit_ranges(
     budget = settings.max_context_chars
     spent = 0
     admitted_positions: list[int] = []
-    skipped_documents: set[tuple[str, str]] = set()
+    skipped_ranges = 0
 
     by_rank = sorted(
         range(len(ranges)),
         key=lambda position: _range_rank_key(ranges[position], hits),
     )
     for position in by_rank:
-        chunk_range = ranges[position]
         size = sizes.get(position)
         estimate = 0 if size is None else _region_chars_lower_bound(size)
         if spent + estimate > budget:
-            skipped_documents.add((chunk_range[0], chunk_range[1]))
+            skipped_ranges += 1
             continue
         spent += estimate
         admitted_positions.append(position)
 
     return (
         [ranges[position] for position in sorted(admitted_positions)],
-        len(skipped_documents),
+        skipped_ranges,
     )
 
 
@@ -470,7 +485,8 @@ def build_regions(
     `hits` is the full, uncapped hit list even when `fetched` was bounded:
     that is what makes a hit whose document was never fetched come back with
     `context_ref: null` rather than silently shifting the refs of the others.
-    `bounds` says how many documents those bounds held back, so the note can
+    `bounds` says how much those bounds held back -- `documents_over_cap` in
+    whole documents, `regions_over_budget` in ranges -- so the note can
     explain the nulls.
     """
     if mode == "none":
@@ -555,18 +571,18 @@ def build_regions(
     # same number is not quoted twice: it is one budget, spent once, first
     # against the measured size of what would be fetched and then against the
     # text that came back.
-    if bounds.documents_over_budget and omitted:
+    if bounds.regions_over_budget and omitted:
         trailing_notes.append(
             f"the {budget}-character context budget was reached: "
-            f"{bounds.documents_over_budget} document(s) were measured as too "
+            f"{bounds.regions_over_budget} region(s) were measured as too "
             f"large to fetch and {omitted} further region(s) were omitted "
             "after this one, so the results referencing them carry "
             "context_ref: null"
         )
-    elif bounds.documents_over_budget:
+    elif bounds.regions_over_budget:
         trailing_notes.append(
             f"the {budget}-character context budget was reached before "
-            f"fetching: {bounds.documents_over_budget} document(s) were "
+            f"fetching: {bounds.regions_over_budget} region(s) were "
             "measured as too large to fit and were not expanded, so the "
             "results referencing them carry context_ref: null"
         )

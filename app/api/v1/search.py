@@ -62,7 +62,7 @@ def _expand(
         )
         for row in repo.measure_ranges(ranges)
     }
-    admitted, documents_over_budget = admit_ranges(ranges, sizes, expandable)
+    admitted, regions_over_budget = admit_ranges(ranges, sizes, expandable)
 
     fetched = [
         FetchedChunk(
@@ -82,7 +82,7 @@ def _expand(
         request.context_chunks,
         bounds=FetchBounds(
             documents_over_cap=documents_over_cap,
-            documents_over_budget=documents_over_budget,
+            regions_over_budget=regions_over_budget,
         ),
     )
 

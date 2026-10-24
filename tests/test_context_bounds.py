@@ -566,7 +566,7 @@ def test_a_document_measured_as_too_large_says_so_before_fetching(
     assert len(body["contexts"]) == 1
     assert body["contexts"][-1]["note"] == (
         "the 5200-character context budget was reached before fetching: "
-        "1 document(s) were measured as too large to fit and were not "
+        "1 region(s) were measured as too large to fit and were not "
         "expanded, so the results referencing them carry context_ref: null"
     )
 
@@ -719,7 +719,7 @@ def test_both_bounds_firing_quote_the_budget_once(
     assert note.count("5200-character") == 1, note
     assert "context budget was reached" in note
     assert note == (
-        "the 5200-character context budget was reached: 1 document(s) were "
+        "the 5200-character context budget was reached: 2 region(s) were "
         "measured as too large to fetch and 1 further region(s) were omitted "
         "after this one, so the results referencing them carry "
         "context_ref: null"
@@ -891,7 +891,7 @@ def test_admit_ranges_never_withholds_a_range_the_builder_would_use(monkeypatch)
         for position, size in sizes.items():
             assert _region_chars_lower_bound(size) <= real_lengths[position]
 
-        admitted, skipped_documents = admit_ranges(ranges, sizes, hits)
+        admitted, skipped_ranges = admit_ranges(ranges, sizes, hits)
 
         needed = _greedy_with_real_lengths(ranges, real_lengths, budget, hits)
         admitted_positions = {
@@ -906,16 +906,17 @@ def test_admit_ranges_never_withholds_a_range_the_builder_would_use(monkeypatch)
         )
 
         # The returned order is the input's, and the skipped count is the
-        # number of distinct documents that lost a range.
+        # number of ranges that were not admitted (not deduplicated by
+        # document: a document can lose one range and keep another).
         assert admitted == [
             chunk_range
             for position, chunk_range in enumerate(ranges)
             if position in admitted_positions
         ]
-        assert skipped_documents == len(
-            {
-                (chunk_range[0], chunk_range[1])
+        assert skipped_ranges == len(
+            [
+                chunk_range
                 for position, chunk_range in enumerate(ranges)
                 if position not in admitted_positions
-            }
+            ]
         )
