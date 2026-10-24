@@ -864,6 +864,97 @@ def test_a_float32_overflowing_embedding_is_a_503_on_search_and_not_a_400(
     assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)
 
 
+def _zero_norm_vector() -> list[float]:
+    """A vector of exact zeros: right type, right width, unusable norm (#42).
+
+    The third sibling of `_vector_with_a_non_finite_component()` and
+    `_vector_with_a_float32_overflowing_component()`, and the one no
+    per-component rule could catch. Every component is a finite float inside
+    float32's range, so the list, length, type, finiteness AND range checks in
+    _validated() all pass; what is wrong is a property of the vector as a
+    whole, and only its norm check can see it.
+
+    Exactly zero rather than subnormal or underflowing, because this is the
+    shape that is degenerate at BOTH ends: _validated() refuses it on the way
+    in, and pgvector reports NaN for its distance against any query, which is
+    what made the pre-fix response an HTTP 200 carrying `"similarity": null`.
+    The subnormal and underflowing-norm spellings are covered where
+    _validated() is tested directly, in tests/test_embeddings.py.
+    """
+    return [0.0] * settings.embedding_dimension
+
+
+def test_a_zero_norm_embedding_is_a_503_on_search_and_not_a_200_with_a_null_score(
+    db_session, monkeypatch
+):
+    # #42 itself, at the boundary the issue was reported from. Cosine distance
+    # divides by the norm of both operands, so a zero-norm QUERY vector makes
+    # every comparison NaN -- and NaN is not an error in Postgres. The search
+    # succeeded, the ORDER BY sorted NaN last, and the route returned HTTP 200
+    # with `"similarity": null` for every row, violating
+    # SearchResult.similarity: float on a response the caller had no way to
+    # tell from a good one. Silently wrong rather than noisily broken, which is
+    # why the vector is refused before it reaches SQL at all.
+    #
+    # _fetch is patched rather than get_embedding, and search_module's
+    # get_embedding is left as the real function, for the reason the NaN and
+    # float32-overflow tests above give: patching get_embedding to raise would
+    # only re-test the handler mapping and would stay green with the norm check
+    # removed, making this worthless as a guard.
+    #
+    # A row is seeded deliberately. With an empty table the pre-fix path
+    # returns `{"results": []}` and a test asserting only the status would be
+    # satisfied by an empty 200; with a row in place, the unfixed service has
+    # something to report a null score for.
+    key = make_api_key(db_session, "acme")
+    make_learning(db_session, "acme", content=ORIGINAL_CONTENT)
+    monkeypatch.setattr(embeddings_module, "_fetch", lambda text: _zero_norm_vector())
+
+    with _client_that_reports_server_errors(db_session) as http:
+        response = http.post(
+            "/api/v1/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": key}
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": BAD_RESPONSE_DETAIL}
+    # Retry-After present is what separates a backend fault from a rejected
+    # request: the DataError path maps to 400 and carries none, so a test
+    # checking only the status and body could still be satisfied by a change
+    # that got the code right and the semantics wrong.
+    assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)
+    # And stated the other way round, because the status alone is not the
+    # contract that was broken: whatever else happens, no response may carry a
+    # result whose similarity is absent. Pre-fix this body was
+    # `{"results": [{..., "similarity": null, ...}], "contexts": []}`.
+    assert "results" not in response.json()
+
+
+def test_a_zero_norm_embedding_is_a_503_on_ingest_and_persists_nothing(
+    db_session, monkeypatch
+):
+    # The second route, for the reason the NUL-byte and NaN pairs cover two:
+    # the rejection has to be reachable from more than one call site. Ingest
+    # also adds the assertion search cannot make -- nothing may be persisted.
+    # A zero-norm row written before the guard existed is precisely what
+    # LearningRepository.search then has to filter out at read time
+    # (tests/test_search.py), so the cheapest place to stop it is here, at the
+    # write.
+    key = make_api_key(db_session, "acme")
+    monkeypatch.setattr(embeddings_module, "_fetch", lambda text: _zero_norm_vector())
+
+    with _client_that_reports_server_errors(db_session) as http:
+        response = http.post(
+            "/api/v1/ingest", data=INGEST_PAYLOAD, headers={"X-API-Key": key}
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": BAD_RESPONSE_DETAIL}
+    assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)
+
+    db_session.expire_all()
+    assert db_session.scalar(select(func.count()).select_from(Learning)) == 0
+
+
 # Each embedding-backend class with the level it must be logged at and the
 # response it must still produce, so the two are asserted together: a log line
 # added to a handler must not have moved anything the caller sees.

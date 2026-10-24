@@ -13,6 +13,7 @@ from app.config import settings
 from app.core import embeddings as embeddings_module
 from app.core.embeddings import (
     FLOAT32_MAX,
+    FLOAT32_MIN_NORMAL,
     _component_fault,
     _validated,
     get_embedding,
@@ -787,3 +788,252 @@ def test_the_agreement_cases_cover_both_verdicts():
         _component_fault(0, case.values[0]) is None for case in AGREEMENT_VALUES
     }
     assert verdicts == {True, False}
+
+
+# --- #42: the zero-norm vector, which no component check can catch ---
+
+# The wording _validated() uses for a vector whose components are each
+# perfectly storable and whose NORM is still zero once float32 has had its
+# say. Two separate substrings because the sentence has two jobs: naming the
+# fault, and telling the caller a retry is pointless. Matched on rather than
+# left implicit for the reason UNUSABLE_COMPONENT_MESSAGE is: _fetch() and the
+# component loop both raise this same exception class, so a bare
+# pytest.raises(EmbeddingBackendBadResponse) would be satisfied by a rejection
+# that never reached the norm check at all.
+ZERO_NORM_MESSAGE = "zero norm"
+ZERO_NORM_NO_RETRY_MESSAGE = "retrying with the same input will not help"
+
+# A magnitude comfortably inside float32's subnormal range: smaller than
+# FLOAT32_MIN_NORMAL, so pgvector contributes nothing from it to a norm, yet a
+# genuine nonzero float64 that round-trips through struct.pack unchanged.
+# Derived from the module's constant rather than written as a bare 1e-40 so it
+# stays subnormal if that constant is ever corrected.
+SUBNORMAL = FLOAT32_MIN_NORMAL / 1e3
+
+# Normal in float32 (well above FLOAT32_MIN_NORMAL) and yet zero-norm: 1e-25
+# squared is 1e-50, below float32's smallest subnormal (~1.4e-45), so every
+# square underflows to exactly 0 and the accumulated norm is 0 even though not
+# one component was individually objectionable. This is the case that makes
+# the rule a whole-vector rule: no per-component bound, however tight, could
+# reject it without also rejecting legitimate small components.
+UNDERFLOWING_NORMAL = 1e-25
+
+
+def _one_hot(index: int, value: float = 1.0) -> list[float]:
+    """A full-length vector of exact zeros with `value` at `index`.
+
+    Distinct from `_vector_with()`, which pads with 0.01 and therefore has a
+    comfortably nonzero norm whatever sits at `index`. Here 1023 of 1024
+    components really are zero, which is the shape a "contains zeros" rule
+    would wrongly reject -- so it belongs in the accepted cases below rather
+    than among the rejected ones.
+    """
+    vector = [0.0] * settings.embedding_dimension
+    vector[index] = value
+    return vector
+
+
+def _alternating(first: float, second: float) -> list[float]:
+    """A full-length vector alternating two values, sized from settings."""
+    return [
+        first if position % 2 == 0 else second
+        for position in range(settings.embedding_dimension)
+    ]
+
+
+ZERO_NORM_VECTORS = [
+    pytest.param([0.0] * settings.embedding_dimension, id="all-zero-floats"),
+    # The int spelling is a distinct case, not a cosmetic variant: JSON `0`
+    # decodes to a Python int, and the squares-and-sum path has to round ints
+    # through float32 too. A guard written against float literals alone would
+    # pass the case above and miss this one.
+    pytest.param([0] * settings.embedding_dimension, id="all-zero-ints"),
+    pytest.param([SUBNORMAL] * settings.embedding_dimension, id="all-subnormal"),
+    # The negative side as well, because the subnormal test in
+    # _float32_sum_of_squares compares abs(): a version that only flushed
+    # positive subnormals would pass the case above and fail this one.
+    pytest.param(
+        [-SUBNORMAL] * settings.embedding_dimension, id="all-subnormal-negative"
+    ),
+    pytest.param(
+        [UNDERFLOWING_NORMAL] * settings.embedding_dimension,
+        id="normal-components-underflowing-norm",
+    ),
+    pytest.param(
+        [-UNDERFLOWING_NORMAL] * settings.embedding_dimension,
+        id="normal-components-underflowing-norm-negative",
+    ),
+    # Mixed, so the total really is accumulated across both kinds rather than
+    # the vector being recognised by its first component or by its uniformity.
+    pytest.param(_alternating(0.0, SUBNORMAL), id="mixed-zero-and-subnormal"),
+    pytest.param(
+        _alternating(0.0, UNDERFLOWING_NORMAL), id="mixed-zero-and-underflowing"
+    ),
+]
+
+# Vectors that are small, or almost entirely zero, and still perfectly usable.
+# Without these, every case above would be satisfied by a guard that rejected
+# any vector containing a zero -- or any vector whose float64 norm was merely
+# small -- and the service would refuse legitimate embeddings while this file
+# stayed green. The one-hot vectors are the sharpest of them: 1023 of 1024
+# components are exactly zero and the norm is exactly 1.
+ACCEPTED_VECTORS = [
+    pytest.param([1e-3] * settings.embedding_dimension, id="small-but-valid"),
+    pytest.param([-1e-3] * settings.embedding_dimension, id="small-but-valid-negative"),
+    pytest.param(_one_hot(0), id="unit-vector-at-index-0"),
+    pytest.param(
+        _one_hot(settings.embedding_dimension - 1), id="unit-vector-at-last-index"
+    ),
+    pytest.param(_one_hot(0, 1e-3), id="one-small-component-among-zeros"),
+    pytest.param(
+        _one_hot(settings.embedding_dimension - 1, 1e-3),
+        id="one-small-component-among-zeros-at-last-index",
+    ),
+]
+
+
+@pytest.mark.parametrize("vector", ZERO_NORM_VECTORS)
+def test_a_zero_norm_embedding_is_rejected(vector):
+    """#42, from the side the service can still do something about.
+
+    Every component here passes every check above it: each is a real number,
+    each is finite, each is inside float32's range, and the vector is exactly
+    EMBEDDING_DIMENSION wide. What makes it unusable is a property of the
+    vector as a whole -- its norm is zero in the float32 arithmetic pgvector
+    performs -- and cosine distance divides by that norm, so every comparison
+    against it is NaN. A NaN distance becomes `similarity: null` in an HTTP
+    200, violating SearchResult.similarity: float, which is the defect this
+    rejection exists to prevent.
+    """
+    with pytest.raises(EmbeddingBackendBadResponse, match=ZERO_NORM_MESSAGE):
+        _validated(vector)
+
+
+@pytest.mark.parametrize("vector", ZERO_NORM_VECTORS)
+def test_a_zero_norm_embedding_is_rejected_through_the_whole_fetch_chain(
+    monkeypatch, vector
+):
+    # The same rule reached the way production reaches it: a backend response
+    # decoded by _fetch() and handed to _validated() by get_embedding(). The
+    # test above calls _validated() directly, which would stay green if the
+    # norm check were moved somewhere get_embedding() does not run.
+    _install(monkeypatch, lambda: _response({"embedding": vector}))
+    with pytest.raises(EmbeddingBackendBadResponse, match=ZERO_NORM_MESSAGE):
+        get_embedding("anything")
+
+
+@pytest.mark.parametrize("vector", ZERO_NORM_VECTORS)
+def test_the_zero_norm_rejection_is_a_backend_fault_not_a_request_error(vector):
+    # The alerting contract, pinned at the exception level rather than at the
+    # route (tests/test_error_responses.py covers that end). The class decides
+    # the status: EmbeddingBackendBadResponse is a 503 with Retry-After, which
+    # is the honest answer -- the backend returned something architecturally
+    # unusable and the caller's input was not at fault. Exact type as well as
+    # the base class, so a regression that raised the misconfiguration
+    # subclass (a 500 with no Retry-After) would still be caught.
+    with pytest.raises(EmbeddingBackendBadResponse) as excinfo:
+        _validated(vector)
+    assert type(excinfo.value) is EmbeddingBackendBadResponse
+    assert isinstance(excinfo.value, EmbeddingBackendError)
+
+
+def test_the_zero_norm_message_says_why_and_says_not_to_retry():
+    """The sentence is the contract: it is logged, and it is a 503's rationale.
+
+    "Zero norm" alone would read as transient flakiness to an operator holding
+    a retry budget, and this fault is the opposite -- the same input will
+    produce the same unusable vector forever. Both halves are asserted,
+    because a message trimmed to one of them would still satisfy a single
+    substring check.
+    """
+    with pytest.raises(EmbeddingBackendBadResponse) as excinfo:
+        _validated([0.0] * settings.embedding_dimension)
+
+    message = str(excinfo.value)
+    assert ZERO_NORM_MESSAGE in message
+    assert ZERO_NORM_NO_RETRY_MESSAGE in message
+    # And it describes the vector, not a component: the per-component wording
+    # would send an operator looking for a single bad float in a vector whose
+    # floats are all individually fine.
+    assert UNUSABLE_COMPONENT_MESSAGE not in message
+    assert UNEVALUABLE_COMPONENT_MESSAGE not in message
+
+
+def test_the_zero_norm_message_carries_no_caller_content(monkeypatch):
+    # The text being embedded is caller data -- a document chunk or a search
+    # query. It has no place in an exception that is logged and whose class
+    # determines a response, so the message must be derivable from the vector
+    # alone. Asserted here rather than only at the route, because the route
+    # substitutes a fixed detail string and would hide a leak into the log.
+    secret = "a9f3c1-caller-supplied-text-that-must-not-be-echoed"
+    _install(
+        monkeypatch,
+        lambda: _response({"embedding": [0.0] * settings.embedding_dimension}),
+    )
+
+    with pytest.raises(EmbeddingBackendBadResponse) as excinfo:
+        get_embedding(secret)
+    assert secret not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("vector", ACCEPTED_VECTORS)
+def test_a_small_but_nonzero_embedding_is_still_accepted(vector):
+    # The control for the whole section. Every other case here asserts a
+    # rejection, so a norm check with the comparison inverted -- or one that
+    # compared the float64 norm against a threshold instead of testing for an
+    # exact float32 zero -- would leave them all green while the service
+    # refused ordinary embeddings. The vector is returned unchanged, which is
+    # also pinned: the norm check must not normalise or rewrite it.
+    assert _validated(vector) == vector
+
+
+@pytest.mark.parametrize("vector", ACCEPTED_VECTORS)
+def test_a_small_but_nonzero_embedding_survives_the_whole_fetch_chain(
+    monkeypatch, vector
+):
+    _install(monkeypatch, lambda: _response({"embedding": vector}))
+    assert get_embedding("anything") == vector
+
+
+@pytest.mark.parametrize("vector", ZERO_NORM_VECTORS)
+def test_no_component_of_a_zero_norm_vector_is_individually_objectionable(vector):
+    """Why the guard cannot live in _component_fault(), stated as a test.
+
+    The zero-norm sibling of
+    test_component_fault_and_validated_never_disagree_about_a_value: that one
+    pins the two in step over single values, this one pins the one place they
+    must NOT be in step. _component_fault() judges a component against float4
+    and every component of these vectors passes -- a zero is a perfectly
+    storable float4 -- so a rule implemented per component could never reject
+    them, and one that could would also reject the legitimate one-hot vectors
+    above. The verdict therefore has to be taken over the whole vector, after
+    the loop, which is exactly where _validated() takes it. A refactor that
+    folded the norm check into the per-component rule fails here instead of
+    silently breaking one-hot embeddings.
+    """
+    faults = [
+        _component_fault(index, component) for index, component in enumerate(vector)
+    ]
+    assert faults == [None] * len(vector)
+    with pytest.raises(EmbeddingBackendBadResponse, match=ZERO_NORM_MESSAGE):
+        _validated(vector)
+
+
+@pytest.mark.parametrize("vector", ZERO_NORM_VECTORS)
+def test_the_zero_norm_cases_are_not_all_zero_norm_in_float64(vector):
+    """The premise the subnormal and underflow cases rest on, pinned.
+
+    Most of the shapes above would be uninteresting if Python agreed they were
+    zero: the rejection would then be obvious arithmetic rather than the
+    float32 observation #42 is about. This asserts the opposite -- Python's
+    own float64 sum of squares is nonzero for every case that contains a
+    nonzero component -- so the only reason _validated() rejects those is that
+    it deliberately evaluates the norm the way pgvector's float4 column does.
+    Without this, _float32_sum_of_squares could be replaced by a plain float64
+    sum and the all-zero case alone would keep this section looking covered.
+    """
+    float64_norm = sum(float(component) ** 2 for component in vector)
+    if any(component != 0 for component in vector):
+        assert float64_norm > 0.0
+    else:
+        assert float64_norm == 0.0
