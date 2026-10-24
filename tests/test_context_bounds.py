@@ -38,8 +38,10 @@ length or a `startswith`.
 import math
 import random
 
+import psycopg
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, func, select
+from sqlalchemy.exc import OperationalError
 
 from app.api.v1 import search as search_module
 from app.config import settings
@@ -50,6 +52,7 @@ from app.core.context import (
     _region_chars_lower_bound,
     admit_ranges,
 )
+from app.models.learning import Learning
 from app.repositories.learning import LearningRepository
 
 from tests.factories import make_api_key, make_learning
@@ -920,3 +923,298 @@ def test_admit_ranges_never_withholds_a_range_the_builder_would_use(monkeypatch)
                 if position not in admitted_positions
             ]
         )
+
+
+# ---------------------------------------------------------------------------
+# The pre-flight measurement is still only additive (#48)
+# ---------------------------------------------------------------------------
+
+
+# The three shapes a failed pre-flight can take, as the route sees them:
+# something unanticipated in the code, a driver-level database error, and the
+# cancellation a statement_timeout produces. All three must cost the context
+# and nothing else, so the route's blanket catch is asserted against the kind
+# of exception rather than against one representative of it.
+#
+# The cancellation case is CONSTRUCTED here rather than provoked with a real
+# tight `statement_timeout`: the timeout is set by `search()` for the whole
+# transaction, so a value small enough to cancel the measuring query cancels
+# the search in front of it, and a value that lands between the two is a race.
+# That Postgres really raises OperationalError wrapping a
+# psycopg.errors.QueryCanceled, and that the search transaction really carries
+# the timeout, is already asserted in tests/test_statement_timeout.py; what is
+# unproven, and asserted here, is what the ROUTE does with it.
+_PREFLIGHT_FAILURES = {
+    "unanticipated": lambda: RuntimeError(
+        "deliberate failure inside the pre-flight measurement"
+    ),
+    "driver_error": lambda: OperationalError(
+        "SELECT ...", {}, Exception("server closed the connection unexpectedly")
+    ),
+    "cancelled": lambda: OperationalError(
+        "SELECT ...",
+        {},
+        psycopg.errors.QueryCanceled("canceling statement due to statement timeout"),
+    ),
+}
+
+
+@pytest.mark.parametrize("failure", list(_PREFLIGHT_FAILURES))
+@pytest.mark.parametrize("context", ["neighbors", "document"])
+def test_a_failure_in_the_pre_flight_measurement_costs_only_the_context(
+    client, db_session, monkeypatch, fetched_ranges, context, failure
+):
+    """The measuring query is a THIRD piece of I/O, so it is a third way to fail.
+
+    `get_chunks_for_ranges` failing is covered in tests/test_search_context.py;
+    `measure_ranges` was added in front of it and is not. The guarantee is the
+    same, and it is the whole posture of the feature: the matched chunks are
+    the answer to the caller's query and they are already in hand, so a failure
+    in expansion degrades to that answer with no context -- never a non-200,
+    and never a fetch issued on the back of a measurement that did not happen.
+
+    Asserted against a `context: "none"` run of the same query rather than
+    against a hand-written result list: "the search is untouched" is the claim,
+    not "five results came back".
+    """
+    _query_vector_is_axis_0(monkeypatch)
+    key = make_api_key(db_session, "acme")
+    note = _note("preflight", 4400)
+    _seed_note(db_session, "acme", "docs/preflight.md", note, {1: 0.9, 3: 0.8})
+
+    baseline = _search(client, key, top_k=5, context="none")
+    assert baseline.status_code == 200, baseline.text
+    assert baseline.json()["contexts"] == []
+
+    # The control: with the measurement working, this query DOES produce a
+    # region and DOES fetch. Without it the assertions below would pass just as
+    # well against a query that never had any context to lose.
+    healthy = _search(client, key, top_k=5, context=context, context_chunks=1).json()
+    assert healthy["contexts"], healthy
+    assert any(result["context_ref"] is not None for result in healthy["results"])
+    assert len(fetched_ranges) == 1
+
+    def explode(self, ranges):
+        raise _PREFLIGHT_FAILURES[failure]()
+
+    monkeypatch.setattr(LearningRepository, "measure_ranges", explode)
+
+    response = _search(client, key, top_k=5, context=context, context_chunks=1)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["contexts"] == []
+    assert all(result["context_ref"] is None for result in body["results"])
+    # The primary answer, unchanged: content, metadata, similarity and order.
+    assert body["results"] == baseline.json()["results"]
+    assert any("NOTE-preflight" in result["content"] for result in body["results"])
+
+    # And nothing was fetched on the strength of a measurement that failed --
+    # still just the healthy run's one call.
+    assert len(fetched_ranges) == 1
+
+
+# ---------------------------------------------------------------------------
+# A chunk_index stored twice is measured once (audit finding 1)
+# ---------------------------------------------------------------------------
+#
+# `learnings` has no unique constraint over (client_name, repo_name, file_path,
+# meta->chunk_index), so two concurrent ingests of one path can leave every
+# chunk_index stored twice. The region builder de-duplicates by chunk_index, so
+# the region's LENGTH is unchanged by the duplication -- which means a
+# measurement counting physical rows would price the range at roughly double
+# what the builder would build, and withhold context that fits. That is the one
+# direction `_region_chars_lower_bound` is not allowed to be wrong in.
+
+
+def _seed_note_twice(
+    db, client_name: str, file_path: str, content: str, similarity_by_index=None
+) -> list[str]:
+    """Store `content` twice under the same client/repo/path, index for index.
+
+    What a double ingest of one path leaves behind: identical rows carrying
+    identical chunk_index values, with nothing to tell them apart. Returns the
+    chunk list once, since both copies are the same.
+    """
+    first = _seed_note(db, client_name, file_path, content, similarity_by_index)
+    second = _seed_note(db, client_name, file_path, content, similarity_by_index)
+    assert first == second, "both copies must be the same chunking of one note"
+    return first
+
+
+def _physical_rows(db, client_name: str, file_path: str) -> int:
+    return db.scalar(
+        select(func.count())
+        .select_from(Learning)
+        .where(
+            Learning.client_name == client_name,
+            Learning.repo_name == REPO,
+            Learning.file_path == file_path,
+        )
+    )
+
+
+def test_a_chunk_index_stored_twice_is_measured_once(db_session):
+    """`rows` and `total_chars` count chunk INDICES, not table rows.
+
+    Stated as "the duplicated note measures exactly what a single copy would",
+    with the doubled physical row count asserted alongside so the test cannot
+    pass by failing to see the duplicates at all.
+    """
+    note = _note("dup", 4400)
+    chunks = _seed_note_twice(db_session, "acme", "docs/dup.md", note)
+    assert _physical_rows(db_session, "acme", "docs/dup.md") == 2 * len(chunks)
+
+    rows = LearningRepository(db_session, client_name="acme").measure_ranges(
+        [(REPO, "docs/dup.md", None, None)]
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.range_id == 0
+    assert row.rows == len(chunks)
+    assert row.total_chars == sum(len(chunk) for chunk in chunks)
+    assert row.recorded_step == STEP
+
+
+def test_a_duplicated_note_is_still_expanded_inside_a_budget_that_fits_one_copy(
+    client, db_session, monkeypatch
+):
+    """End to end, at the budget where the difference decides the response.
+
+    The note is 4400 characters in 6 chunks of 5400 characters together, so one
+    copy is measured at 3200 (6 - 2 joins at a step of 800) and two copies at
+    8000. A 4500-character budget therefore admits the note if duplicates are
+    measured once and withholds it entirely if they are not -- and the region
+    built is the original note, byte for byte, because the builder was
+    de-duplicating all along.
+    """
+    _query_vector_is_axis_0(monkeypatch)
+    key = make_api_key(db_session, "acme")
+    note = _note("dup", 4400)
+    chunks = _seed_note_twice(db_session, "acme", "docs/dup.md", note, {0: 0.9})
+    # The arithmetic the budget below rests on, asserted rather than assumed.
+    assert len(chunks) == 6
+    assert sum(len(chunk) for chunk in chunks) == 5400
+    monkeypatch.setattr(settings, "max_context_chars", 4500)
+
+    response = _search(client, key, top_k=50, context="document")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(body["contexts"]) == 1
+    region = body["contexts"][0]
+    assert region["content"] == span(0, len(chunks) - 1, note) == note
+    assert region["exact"] is True
+    assert region["note"] is None, "nothing was bounded, so nothing is explained"
+    # Every hit -- both copies of every chunk -- is covered by the one region.
+    assert len(body["results"]) == 2 * len(chunks)
+    assert all(result["context_ref"] == 0 for result in body["results"])
+
+
+def test_duplicates_of_unequal_length_are_measured_at_the_shorter_copy(
+    client, db_session, monkeypatch
+):
+    """When the copies disagree, the measurement takes the floor.
+
+    A partial or interrupted re-ingest can leave two rows at one chunk_index
+    whose text differs. Which of them the region builder joins is not
+    determined -- they are indistinguishable rows -- so the only estimate that
+    is a lower bound on the region whichever it picks is the shorter copy's.
+    Asserted both as the measured number and as the property that number exists
+    for: the estimate does not exceed the region actually built.
+    """
+    _query_vector_is_axis_0(monkeypatch)
+    key = make_api_key(db_session, "acme")
+    note = _note("unequal", 4400)
+    chunks = _seed_note(db_session, "acme", "docs/unequal.md", note, {0: 0.9})
+    assert len(chunks[-1]) == 400
+
+    # The second copy, identical except that its last chunk is half as long --
+    # the one shape a shorter duplicate can take and still join (an interior
+    # chunk of the wrong length breaks overlap agreement, which is a different
+    # failure, covered in tests/test_search_context.py).
+    truncated = chunks[:-1] + [chunks[-1][:200]]
+    for index, chunk in enumerate(truncated):
+        make_learning(
+            db_session,
+            "acme",
+            repo_name=REPO,
+            file_path="docs/unequal.md",
+            content=chunk,
+            chunk_index=index,
+            embedding=_ranked_embedding(0.9 if index == 0 else 0.0, _FILLER_AXIS),
+        )
+    db_session.flush()
+    db_session.expire_all()
+
+    rows = LearningRepository(db_session, client_name="acme").measure_ranges(
+        [(REPO, "docs/unequal.md", None, None)]
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.rows == len(chunks)
+    assert row.total_chars == sum(len(chunk) for chunk in truncated)
+    # Not the longer copy's total, and nowhere near the sum of the two.
+    assert row.total_chars < sum(len(chunk) for chunk in chunks)
+
+    estimate = _region_chars_lower_bound(
+        RangeSize(
+            rows=row.rows,
+            total_chars=row.total_chars,
+            recorded_step=row.recorded_step,
+        )
+    )
+
+    body = _search(client, key, top_k=50, context="document").json()
+
+    assert len(body["contexts"]) == 1
+    content = body["contexts"][0]["content"]
+    # Either copy of the last chunk may have won; both are the real text.
+    assert content in (note, note[: len(note) - 200])
+    assert estimate <= len(content), (estimate, len(content))
+
+
+def test_the_de_duplicating_measurement_still_measures_only_the_callers_rows(
+    db_session,
+):
+    """The de-dup subquery is a second place `client_name` has to appear.
+
+    Grouping by (range_id, chunk_index) across tenants would be invisible in
+    the obvious version of this test: two tenants with equal-length notes
+    collapse onto each other's indices and the numbers come out right by
+    accident. So acme's copy of the path is deliberately asymmetric in BOTH
+    directions a leak could show -- it is far longer (a leak raises `rows`) and
+    it carries one tiny row at an index globex also has (a leak lowers
+    `total_chars`, because the minimum at that index would then be acme's).
+    """
+    path = "docs/shared_dup.md"
+    acme_note = _note("acmedup", 44600)
+    globex_chunks = _seed_note_twice(
+        db_session, "globex", path, _note("globexdup", 2600)
+    )
+    _seed_note_twice(db_session, "acme", path, acme_note)
+    make_learning(
+        db_session,
+        "acme",
+        repo_name=REPO,
+        file_path=path,
+        content="tiny",
+        chunk_index=0,
+    )
+    db_session.flush()
+    db_session.expire_all()
+
+    rows = LearningRepository(db_session, client_name="globex").measure_ranges(
+        [(REPO, path, None, None)]
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.rows == len(globex_chunks)
+    assert row.total_chars == sum(len(chunk) for chunk in globex_chunks)
+    # What a leak would have produced, so the two assertions above cannot pass
+    # by measuring nothing at all.
+    assert row.rows < len(chunk_text(acme_note, SIZE, OVERLAP))
+    assert row.total_chars > len("tiny")
