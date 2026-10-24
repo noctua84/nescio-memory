@@ -233,8 +233,8 @@ class LearningRepository:
             select(Learning, similarity)
             .where(
                 Learning.client_name == self.client_name,
-                self_distance != literal("NaN", Float),
-                distance != literal("NaN", Float),
+                self_distance != cast(literal(float("nan")), Float),
+                distance != cast(literal(float("nan")), Float),
             )
             .order_by(distance)          # smaller distance = more similar
             .limit(top_k)
