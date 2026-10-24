@@ -356,7 +356,8 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | Variable              | Default                                    | Description                                          |
 | --------------------- | ------------------------------------------ | ---------------------------------------------------- |
 | `DATABASE_URL`        | *required*                                 | PostgreSQL connection string; a plain `postgresql://` uses the bundled psycopg 3 driver |
-| `STATEMENT_TIMEOUT_MS` | `5000`                                     | caps the vector-search statement only (not the whole request); must be `> 0`, otherwise the app refuses to start |
+| `DB_CONNECT_TIMEOUT_S` | `10`                                       | seconds per connection attempt (applies per resolved address); with `pool_pre_ping` a dead database adds this inside a request; must be `>= 2`, otherwise the app refuses to start |
+| `STATEMENT_TIMEOUT_MS` | `5000`                                     | caps the vector-search statement only (not the whole request); must be `1..60000`; per statement, not per request — search and context expansion each get one; **breaking in 0.5.0**: values above 60000 now refuse to start |
 | `EMBEDDING_BACKEND`   | `ollama`                                    | `ollama` (HTTP) or `local` (in-process); any other value fails at startup |
 | `LOCAL_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2`  | model for the `local` backend only — see [Embedding backends](#embedding-backends) |
 | `OLLAMA_URL`          | `http://localhost:11434/api/embeddings`     | embedding endpoint (local or remote)                 |
