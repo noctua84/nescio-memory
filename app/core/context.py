@@ -209,40 +209,127 @@ def _region_chars_lower_bound(size: RangeSize) -> int:
     return min(size.total_chars, max(0, (size.rows - 2) * step))
 
 
+def _rank_key(
+    best_similarity: float, repo_name: str, file_path: str, chunk_index_from: int
+) -> tuple[float, str, str, int]:
+    """The order the character budget is spent in, wherever it is spent.
+
+    Descending best similarity among the hits a region covers, then the
+    document key and the region's lowest index so a response is reproducible
+    rather than dict-ordered. Shared by `admit_ranges` and `build_regions`
+    because the two MUST agree: budget spent in one order and then enforced in
+    another withholds regions the second order would have admitted (see
+    `admit_ranges`).
+    """
+    return (-best_similarity, repo_name, file_path, chunk_index_from)
+
+
+def _range_rank_key(
+    chunk_range: ChunkRange, hits: list[ContextHit]
+) -> tuple[float, str, str, int]:
+    """`_rank_key` for a range, computed from the hits instead of the rows.
+
+    The best similarity among the hits the range was planned FOR, which is the
+    best similarity of the best region that range can produce: a hit inside
+    the requested span lands in the piece of the span that contains its index,
+    so the strongest hit's piece is the range's strongest region and sorts
+    where the range does. The tail probe (`to_index`) is excluded -- it is a
+    row the builder never returns, and no hit lives there, since plan_ranges
+    derived the span from hit indices.
+
+    `from_index` stands in for the region's `chunk_index_from`, which is not
+    knowable before the rows are read (a hole can push a piece's start above
+    the span's). It only ever breaks a tie within one document, and a
+    whole-document range (`from_index is None`) is the only range of its
+    document, so 0 is as good as the real value there.
+    """
+    repo_name, file_path, from_index, to_index = chunk_range
+    similarities = [
+        hit.similarity
+        for hit in hits
+        if hit.repo_name == repo_name
+        and hit.file_path == file_path
+        and hit.chunk_index is not None
+        and (from_index is None or hit.chunk_index >= from_index)
+        and (to_index is None or hit.chunk_index <= to_index - 1)
+    ]
+    return _rank_key(
+        # Unreachable for a planned range -- every span contains the hit it
+        # was planned for -- so this is a floor rather than a policy: a range
+        # nobody asked about would be considered last.
+        max(similarities) if similarities else _LOWEST,
+        repo_name,
+        file_path,
+        0 if from_index is None else from_index,
+    )
+
+
 def admit_ranges(
-    ranges: list[ChunkRange], sizes: dict[int, RangeSize]
+    ranges: list[ChunkRange], sizes: dict[int, RangeSize], hits: list[ContextHit]
 ) -> tuple[list[ChunkRange], int]:
-    """The ranges worth fetching under `MAX_CONTEXT_CHARS`, in rank order.
+    """The ranges worth fetching under `MAX_CONTEXT_CHARS`.
 
-    Returns `(admitted, skipped_documents)`, where `skipped_documents` counts
-    the distinct documents at least one of whose ranges was not admitted.
-    `sizes` maps a position in `ranges` to its measurement; a position that is
-    missing had no matching rows at all, costs nothing, and is admitted.
+    Returns `(admitted, skipped_documents)`, where `admitted` keeps the order
+    of `ranges` (the fetch orders its rows in SQL anyway) and
+    `skipped_documents` counts the distinct documents at least one of whose
+    ranges was not admitted. `sizes` maps a position in `ranges` to its
+    measurement; a position that is missing had no matching rows at all, costs
+    nothing, and is admitted.
 
-    Unlike the builder's post-fetch budget, this does NOT stop at the first
-    range that does not fit -- it skips that one and goes on considering the
-    rest. The builder's "stop entirely" rule exists so that the regions it
-    returns are a rank-ordered prefix; here nothing is being returned to a
-    caller, the two orders are not identical (the builder ranks regions by
-    best similarity, this ranks documents by their best-ranked hit), and
-    stopping early could drop a range the builder would have admitted. Where
-    the two rules disagree, this one admits more and the builder decides.
+    The budget is spent in `_rank_key` order -- the SAME order `build_regions`
+    ranks regions in -- and NOT in the order `plan_ranges` emits, which groups
+    by document and sorts by index within it. That is the whole of what makes
+    this check safe, so the argument is worth spelling out.
+
+    With both walks in the same order, and each range's estimate no larger
+    than the text its regions really contribute, every region the builder
+    admits comes from a range this admitted: the builder admits a region only
+    when the real lengths of the regions up to and including it fit the
+    budget, and when this walk reaches that region's range it has spent at
+    most the estimates of the ranges ahead of it, each bounded by those same
+    real lengths. Spend the budget in a different order, as walking
+    plan_ranges' output does, and a lower-ranked region can consume it first:
+    hits ranked A@50, B@3, A@2 are planned as A[1..3], A[49..51], B[2..4], so
+    a tight budget would buy A's rank-3 region before B's rank-2 one and
+    withhold B entirely -- a region the builder would have admitted.
+
+    Skip-and-continue rather than the builder's stop-at-first-non-fitting:
+    either is safe now that the orders agree, and skipping only lowers
+    `spent`, which can only admit more. The builder stops because what it
+    returns must be a rank-ordered prefix; nothing here is returned to a
+    caller.
+
+    The guarantee is exact for a range that yields one region, which is every
+    range over undamaged rows. A range split into several pieces by a hole is
+    priced as a whole while its pieces rank separately, so part of its
+    estimate may belong to a region ranked below the one being decided -- the
+    same documented approximation as in `_region_chars_lower_bound`, with the
+    same consequence: context is withheld from a note whose stored rows are
+    already damaged, and the last region says so.
     """
     budget = settings.max_context_chars
     spent = 0
-    admitted: list[ChunkRange] = []
+    admitted_positions: list[int] = []
     skipped_documents: set[tuple[str, str]] = set()
 
-    for position, chunk_range in enumerate(ranges):
+    by_rank = sorted(
+        range(len(ranges)),
+        key=lambda position: _range_rank_key(ranges[position], hits),
+    )
+    for position in by_rank:
+        chunk_range = ranges[position]
         size = sizes.get(position)
         estimate = 0 if size is None else _region_chars_lower_bound(size)
         if spent + estimate > budget:
             skipped_documents.add((chunk_range[0], chunk_range[1]))
             continue
         spent += estimate
-        admitted.append(chunk_range)
+        admitted_positions.append(position)
 
-    return admitted, len(skipped_documents)
+    return (
+        [ranges[position] for position in sorted(admitted_positions)],
+        len(skipped_documents),
+    )
 
 
 def plan_ranges(
@@ -396,14 +483,11 @@ def build_regions(
         )
 
     # Rank order, not document order: the budget below is spent on the regions
-    # the caller is most likely to want. Ties fall back to the document key so
-    # a response is reproducible rather than dict-ordered.
+    # the caller is most likely to want. The same key `admit_ranges` spends the
+    # fetch budget in, deliberately shared -- see `_rank_key`.
     candidates.sort(
-        key=lambda c: (
-            -c.best_similarity,
-            c.repo_name,
-            c.file_path,
-            c.chunk_index_from,
+        key=lambda c: _rank_key(
+            c.best_similarity, c.repo_name, c.file_path, c.chunk_index_from
         )
     )
 
@@ -467,14 +551,26 @@ def build_regions(
             "limit (MAX_CONTEXT_DOCUMENTS) was reached, and the results "
             "referencing them carry context_ref: null"
         )
-    if bounds.documents_over_budget:
+    # One sentence for the character budget however many times it bit, so the
+    # same number is not quoted twice: it is one budget, spent once, first
+    # against the measured size of what would be fetched and then against the
+    # text that came back.
+    if bounds.documents_over_budget and omitted:
+        trailing_notes.append(
+            f"the {budget}-character context budget was reached: "
+            f"{bounds.documents_over_budget} document(s) were measured as too "
+            f"large to fetch and {omitted} further region(s) were omitted "
+            "after this one, so the results referencing them carry "
+            "context_ref: null"
+        )
+    elif bounds.documents_over_budget:
         trailing_notes.append(
             f"the {budget}-character context budget was reached before "
             f"fetching: {bounds.documents_over_budget} document(s) were "
             "measured as too large to fit and were not expanded, so the "
             "results referencing them carry context_ref: null"
         )
-    if omitted:
+    elif omitted:
         trailing_notes.append(
             f"the {budget}-character context budget was reached after this "
             f"region; {omitted} further region(s) were omitted and the "

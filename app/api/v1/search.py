@@ -62,7 +62,7 @@ def _expand(
         )
         for row in repo.measure_ranges(ranges)
     }
-    admitted, documents_over_budget = admit_ranges(ranges, sizes)
+    admitted, documents_over_budget = admit_ranges(ranges, sizes, expandable)
 
     fetched = [
         FetchedChunk(
