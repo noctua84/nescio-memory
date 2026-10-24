@@ -325,7 +325,12 @@ def test_a_full_length_vector_of_ints_still_passes(monkeypatch):
     # check's existing int acceptance. Pinned because a reordering that ran
     # isfinite before the type check, or one that narrowed it to floats, would
     # break integer vectors while every rejection case above stayed green.
-    vector = [0] * settings.embedding_dimension
+    #
+    # Nonzero (not [0] * N): an all-zero vector is zero-norm, which #42's
+    # guard in _validated() now rejects regardless of component type -- that
+    # rejection is covered separately below, and would otherwise make this
+    # int-handling test fail for an unrelated reason.
+    vector = [1] * settings.embedding_dimension
     _install(monkeypatch, lambda: _response({"embedding": vector}))
     assert get_embedding("anything") == vector
 
