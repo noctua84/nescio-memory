@@ -26,6 +26,21 @@ venv/
 # Plan-execution scratch (agent briefs/reports) - see docs/superpowers/README.md
 .superpowers/
 
+# Retrieval evaluation harness (eval/) - PRIVACY BOUNDARY, NOT CONVENIENCE.
+#
+# This repository is public. The real brain the harness is pointed at with
+# --corpus contains third-party client project names and internal detail, so
+# nothing derived from it may ever land in git: not a report, not a JSON
+# record, not a query set whose text quotes a note.
+#
+# eval/corpora/synthetic/ stays tracked -- it is the committed fixture corpus
+# that makes the harness reviewable by anyone. Only real-corpus material is
+# excluded here.
+eval-out/
+eval/private/
+eval/corpora/real/
+eval/**/*.local.yaml
+
 # OS
 .DS_Store
 Thumbs.db
