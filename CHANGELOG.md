@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.5.0](https://github.com/noctua84/nescio-memory/compare/v0.4.0...v0.5.0) (2026-10-24)
+
+
+### Features
+
+* [impl] expand search hits to their surrounding context ([400a531](https://github.com/noctua84/nescio-memory/commit/400a5313893afd063199ca99ee25c3b11f06eadf))
+* expand search hits to their surrounding context ([b04b807](https://github.com/noctua84/nescio-memory/commit/b04b8070171baadc879e832db2e42e06318f173e))
+
+
+### Bug Fixes
+
+* [impl] add configurable DB connect timeout and cap STATEMENT_TIMEOUT_MS at 60000 ([536b13c](https://github.com/noctua84/nescio-memory/commit/536b13c6b739d08c7969ce7f3e01a038336a4de0))
+* [impl] admit context ranges in region rank order ([#48](https://github.com/noctua84/nescio-memory/issues/48)) ([9f69c09](https://github.com/noctua84/nescio-memory/commit/9f69c0933337ef3dc7b2c69b34768bd6e8d72c2a))
+* [impl] attach traceback to the DataError warning log ([53aa640](https://github.com/noctua84/nescio-memory/commit/53aa64071936425fbd14867eba1a5ef2c5d6a315))
+* [impl] bind NaN as a float in the search filters ([#42](https://github.com/noctua84/nescio-memory/issues/42)) ([ab3a32b](https://github.com/noctua84/nescio-memory/commit/ab3a32b97f5a1eae18d6acdee59e24d9e58bf280))
+* [impl] bound the context-expansion fetch ([#48](https://github.com/noctua84/nescio-memory/issues/48)) ([db66e26](https://github.com/noctua84/nescio-memory/commit/db66e26c9eb22ba8f161938e9780dd08dc036f52))
+* [impl] compare the zero-norm sum with &lt;= instead of == (SonarCloud S1244) ([97b61ab](https://github.com/noctua84/nescio-memory/commit/97b61ab303f73eefdb6febfc93611d347db3250b))
+* [impl] count skipped regions truthfully in the budget note ([#48](https://github.com/noctua84/nescio-memory/issues/48)) ([30ee8fc](https://github.com/noctua84/nescio-memory/commit/30ee8fcafdc1914d98772e7f0d5295617c07e376))
+* [impl] exclude NaN cosine distance from search results ([#42](https://github.com/noctua84/nescio-memory/issues/42)) ([b6d8fd8](https://github.com/noctua84/nescio-memory/commit/b6d8fd8e6e2a884c45183a458ad965807f9f0511))
+* [impl] exclude stored zero-norm rows from search ([#42](https://github.com/noctua84/nescio-memory/issues/42)) ([1bad918](https://github.com/noctua84/nescio-memory/commit/1bad91888c9d0cf66f78b7ad9dd74f0bab1a99dc))
+* [impl] log embedding backend failures before responding ([c675e5f](https://github.com/noctua84/nescio-memory/commit/c675e5fd1a66bd2c267d95089c48cfb3236fd8ad))
+* [impl] map sqlalchemy.exc.DataError to a 400 client-error response ([449fbba](https://github.com/noctua84/nescio-memory/commit/449fbbacc6bf49efe62483af93ce051e5161a6b8))
+* [impl] measure each chunk index once in the context pre-flight ([#48](https://github.com/noctua84/nescio-memory/issues/48)) ([1a1361a](https://github.com/noctua84/nescio-memory/commit/1a1361a67d6b17b035a6431c0dc63be09ef6e2e5))
+* [impl] reject float32-overflowing and huge-int embedding components ([0a86667](https://github.com/noctua84/nescio-memory/commit/0a86667c3f44d555757b60897843c16255abceda))
+* [impl] reject non-finite embedding components in _validated() ([ec002c6](https://github.com/noctua84/nescio-memory/commit/ec002c69751882efe124aff32027aaecf651891a))
+* [impl] reject zero-norm embeddings in _validated ([#42](https://github.com/noctua84/nescio-memory/issues/42)) ([c12a612](https://github.com/noctua84/nescio-memory/commit/c12a612f95d2271aa889d62acdddddb591f4c1b3))
+* [impl] report a backend emitting unstorable embedding values ([8c94e93](https://github.com/noctua84/nescio-memory/commit/8c94e937f68725603eea7e08909938924cea9b00))
+* [impl] set the embedding dimension to the model's real width (1024) ([d8335a2](https://github.com/noctua84/nescio-memory/commit/d8335a2eaec629807d6b5951a369657f9ab1a469)), closes [#36](https://github.com/noctua84/nescio-memory/issues/36)
+* [impl] stop fetching embeddings on the context-expansion path ([#48](https://github.com/noctua84/nescio-memory/issues/48)) ([58f32c1](https://github.com/noctua84/nescio-memory/commit/58f32c1bca2aa050f15c736ed9f092eb059bd307))
+* map sqlalchemy.exc.DataError to a 400 instead of a bare 500 ([705e50c](https://github.com/noctua84/nescio-memory/commit/705e50c047827e192bc0f78a7c566bfefbe5348f))
+* pre-0.5.0 hardening — bound context expansion, reject zero-norm embeddings, DB timeouts ([df4389e](https://github.com/noctua84/nescio-memory/commit/df4389e9c1d5aca170523bdda4d916518668f81c))
+* reject embedding values pgvector cannot store, and make the failure visible ([8c0659b](https://github.com/noctua84/nescio-memory/commit/8c0659bef7ae0bb2cc082bdfc1289663af549ba5))
+* set the embedding dimension to the model's real width (1024) ([158cd05](https://github.com/noctua84/nescio-memory/commit/158cd057ff64ba3910306f6ae19d5670b551ab43))
+
+
+### Documentation
+
+* [docs] correct statement-timeout and fetch-bound wording ([1536109](https://github.com/noctua84/nescio-memory/commit/1536109c5a2ec6859cd61dccaabe60808f2cc010))
+* [docs] document DB_CONNECT_TIMEOUT_S and STATEMENT_TIMEOUT_MS ceiling ([a04ff05](https://github.com/noctua84/nescio-memory/commit/a04ff05bcc036ebd6ee0694cd9131d6fcf213937))
+* [docs] document MAX_CONTEXT_DOCUMENTS and the context fetch bounds ([4a39202](https://github.com/noctua84/nescio-memory/commit/4a392022951ab67e356800d095de591d7c885624))
+* [docs] narrow the unmapped-errors limitation for the DataError handler ([dfbb0d0](https://github.com/noctua84/nescio-memory/commit/dfbb0d02a98f4158ab11dbac346569045d582b2a))
+* [docs] QA audit report for the pre-0.5.0 hardening ([#48](https://github.com/noctua84/nescio-memory/issues/48), [#42](https://github.com/noctua84/nescio-memory/issues/42), [#30](https://github.com/noctua84/nescio-memory/issues/30)) ([feb829b](https://github.com/noctua84/nescio-memory/commit/feb829ba2f3d448beb7d92937a49c66102d0a90d))
+* [docs] specify context expansion in search ([b5eaad2](https://github.com/noctua84/nescio-memory/commit/b5eaad269319303534dc6d0c83d56b9e886091ad))
+* [docs] the guarantee is no enumeration, not no read-back ([4830753](https://github.com/noctua84/nescio-memory/commit/483075365167e5b52ba2624d6665aac66489e30c))
+* the guarantee is no enumeration, not no read-back ([fd46ba3](https://github.com/noctua84/nescio-memory/commit/fd46ba3768e5c19cd7e7712d692c162119364eda))
+
 ## [0.4.0](https://github.com/noctua84/nescio-memory/compare/v0.3.1...v0.4.0) (2026-10-02)
 
 
