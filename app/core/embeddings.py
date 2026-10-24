@@ -164,7 +164,10 @@ def _validated(vector: object) -> list[float]:
     # because the backend already returned something architecturally
     # unusable; retrying the same input will not help, so this is a 503
     # fault like the component checks above, not a request-shape error.
-    if _float32_sum_of_squares(vector) == 0.0:
+    # Use <= not == because _float32_sum_of_squares is always >= 0 (sum of
+    # squares) and cannot be NaN here (non-finite components are rejected
+    # above), so this catches the zero case without float equality comparison.
+    if _float32_sum_of_squares(vector) <= 0.0:
         raise EmbeddingBackendBadResponse(
             "embedding had zero norm once rounded to float32, so cosine "
             "distance against it is undefined; retrying with the same "
