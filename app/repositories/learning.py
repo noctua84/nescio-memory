@@ -198,26 +198,42 @@ class LearningRepository:
         distance = Learning.embedding.cosine_distance(embedding)  # the <=> operator
         similarity = (1 - distance).label("similarity")
 
+        # #42: a stored row's SELF cosine-distance -- Learning.embedding
+        # against itself, not against the query -- is NaN for every
+        # degenerate zero-norm shape pgvector's float4 arithmetic can
+        # produce: all-zero, all-subnormal, or a vector whose squared
+        # components underflow float32 before they are summed. That self-
+        # distance is pgvector's own definition of "this stored vector has
+        # zero norm," and it is unconditional: it does not depend on what is
+        # being searched for, so it is evaluated once per row regardless of
+        # query. _validated() rejects a zero-norm embedding in float64
+        # before it is written, but pgvector's float4 column can flatten a
+        # component differently than Python's float64 evaluated it on the
+        # way in -- a vector that looked fine to _validated() can still land
+        # zero-norm once stored. Excluding by self-distance is what catches
+        # that: a query-time `distance != NaN` only ever excludes a STORED
+        # all-zero row, because that is the one degenerate shape that stays
+        # NaN at query time too. The other degenerate shapes (all-subnormal,
+        # underflowing-norm) do NOT come back NaN against a real query
+        # vector -- pgvector clamps the resulting +-Inf similarity into
+        # [-1, 1], so the degenerate row's query-time distance lands at 0.0
+        # and it is reported as a perfect match instead of being excluded
+        # (confirmed against the real container). The query-time
+        # `distance != NaN` clause is kept anyway, purely as cheap defense:
+        # the query vector is already validated by _validated() before it
+        # reaches here, so this clause should never itself exclude a row,
+        # but it costs nothing extra once `distance` is already computed
+        # for ORDER BY. Postgres defines NaN = NaN as TRUE, so `!= NaN`
+        # excludes exactly the NaN rows (by either definition) without
+        # excluding anything else; both are post-index filters like
+        # client_name above them, not a change to ORDER BY/LIMIT.
+        self_distance = Learning.embedding.cosine_distance(Learning.embedding)
+
         stmt = (
             select(Learning, similarity)
             .where(
                 Learning.client_name == self.client_name,
-                # #42: cosine distance is NaN whenever the STORED row is
-                # zero-norm, regardless of the query vector. _validated()
-                # rejects a zero-norm embedding before it is written, but
-                # pgvector's float4 column flattens a subnormal component --
-                # or one whose square underflows float32 -- differently from
-                # how Python's float64 evaluated it on the way in, so a row
-                # that looked fine to _validated() can still land as
-                # zero-norm once stored (confirmed against the real
-                # container: a stored all-subnormal or underflowing-norm
-                # vector's self cosine-distance comes back NaN). A NaN
-                # distance would otherwise serialize as `similarity: null`,
-                # violating SearchResult.similarity: float on an HTTP 200.
-                # Postgres defines NaN = NaN as TRUE, so `!= NaN` excludes
-                # exactly the NaN rows without excluding anything else; this
-                # is a post-index filter like client_name above it, not a
-                # change to ORDER BY/LIMIT.
+                self_distance != literal("NaN", Float),
                 distance != literal("NaN", Float),
             )
             .order_by(distance)          # smaller distance = more similar
