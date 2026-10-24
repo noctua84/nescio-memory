@@ -328,8 +328,8 @@ class LearningRepository:
 
         One aggregate query returning, per range, columns (range_id, rows,
         total_chars, recorded_step): `range_id` is the index into `ranges`,
-        `rows` and `total_chars` count only rows that could actually end up in
-        a region, and `recorded_step` is the smallest chunking step any row of
+        `rows` and `total_chars` count each qualifying chunk_index ONCE (see
+        below), and `recorded_step` is the smallest chunking step any row of
         the range records having been cut with (NULL when none of them record
         one). Ranges with no matching rows are absent from the result.
 
@@ -363,35 +363,70 @@ class LearningRepository:
             else_=None,
         ).label("range_id")
 
+        # `learnings` has no unique constraint over (client_name, repo_name,
+        # file_path, meta->chunk_index) -- see app/models/learning.py -- so two
+        # concurrent ingests of the same path can leave the same chunk_index
+        # stored twice. The region builder de-duplicates by chunk_index
+        # (content_by_index in app/core/context.py), so a row counted or summed
+        # per PHYSICAL row here -- rather than once per DISTINCT chunk_index --
+        # would charge a duplicated chunk's characters twice, inflate the
+        # estimate above the real region length, and wrongly skip a range the
+        # builder would have admitted. Grouping by (range_id, chunk_index)
+        # first, and taking min(char_length) of the duplicates, keeps the
+        # per-index contribution a floor rather than letting a longer duplicate
+        # inflate it -- consistent with the lower-bound requirement on the
+        # whole estimate (see _region_chars_lower_bound).
+        indexed = (
+            select(
+                range_id,
+                _CHUNK_INDEX.label("chunk_index"),
+                func.min(func.char_length(Learning.content)).label("chars"),
+            )
+            .where(
+                Learning.client_name == self.client_name,
+                or_(*disjuncts),
+                _CHUNK_INDEX_IS_INTEGER,
+            )
+            .group_by(range_id, _CHUNK_INDEX)
+            .subquery()
+        )
+        deduped = (
+            select(
+                indexed.c.range_id.label("range_id"),
+                func.count().label("rows"),
+                func.coalesce(func.sum(indexed.c.chars), 0).label("total_chars"),
+            )
+            .group_by(indexed.c.range_id)
+            .subquery()
+        )
+
         stmt = (
             select(
                 range_id,
-                # Counted and summed over rows with a usable chunk_index only.
-                # A row whose meta["chunk_index"] is missing or malformed is
-                # dropped by the region builder, so its characters are not part
-                # of any region and must not be charged to the budget -- an
-                # unbounded (whole-document) range matches such rows even
-                # though a bounded one cannot.
-                func.count()
-                .filter(_CHUNK_INDEX_IS_INTEGER)
-                .label("rows"),
-                func.coalesce(
-                    func.sum(func.char_length(Learning.content)).filter(
-                        _CHUNK_INDEX_IS_INTEGER
-                    ),
-                    0,
-                ).label("total_chars"),
+                # 0, not NULL, for a range whose rows all lack a usable
+                # chunk_index -- `deduped` has no group for it, same as before
+                # this de-duplication was added.
+                func.coalesce(deduped.c.rows, 0).label("rows"),
+                func.coalesce(deduped.c.total_chars, 0).label("total_chars"),
                 # min(), so a range whose rows disagree about their window is
                 # measured with the smallest step any of them claims. A smaller
                 # step means a smaller estimated region, which means the range
                 # is more likely to be admitted -- the safe direction, since
                 # the region builder remains the authority on the budget.
+                # Computed over EVERY matching row, not just the ones with a
+                # usable chunk_index: a row's recorded window is evidence about
+                # this document's ingestion regardless of whether that row's
+                # own chunk_index is usable, and narrowing this to valid-index
+                # rows could only raise the minimum, which is the unsafe
+                # direction for the estimate below.
                 func.min(_RECORDED_STEP).label("recorded_step"),
             )
+            .select_from(Learning)
+            .outerjoin(deduped, deduped.c.range_id == range_id)
             .where(
                 Learning.client_name == self.client_name,
                 or_(*disjuncts),
             )
-            .group_by(range_id)
+            .group_by(range_id, deduped.c.rows, deduped.c.total_chars)
         )
         return self.db.execute(stmt).all()
