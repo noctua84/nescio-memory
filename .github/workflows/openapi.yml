@@ -59,16 +59,31 @@ jobs:
         run: uv run --locked --no-build openapi-spec-validator openapi.json
 
       # 2. Drift detection — does the committed spec match the code?
+      # release-please re-serializes openapi.yaml with a different YAML emitter
+      # (folded >- scalars for long strings), so a byte diff fails on every
+      # release PR even though the content is identical; JSON serializers agree,
+      # so JSON stays byte-exact. openapi.yaml is compared by parsed content.
       - name: Check for spec drift
         run: |
-          if git diff --exit-code openapi.json openapi.yaml; then
-            echo "✅ OpenAPI spec is up to date with the code."
-          else
-            echo "::error::OpenAPI spec is out of date!"
+          json_ok=true
+          yaml_ok=true
+
+          # Check openapi.json byte-exact
+          if ! git diff --exit-code openapi.json; then
+            echo "::error::openapi.json is out of date!"
             echo "Run 'uv run python export_openapi.py' locally and commit the result."
-            git diff openapi.json openapi.yaml
+            json_ok=false
+          fi
+
+          # Check openapi.yaml by parsed content
+          uv run --locked --no-build python scripts/check_openapi_yaml_drift.py || yaml_ok=false
+
+          # Fail if either check failed
+          if [ "$json_ok" = false ] || [ "$yaml_ok" = false ]; then
             exit 1
           fi
+
+          echo "✅ OpenAPI spec is up to date with the code."
 
       # 3. Spectral linting — is this a *good* spec by our conventions?
       - name: Set up Node.js
