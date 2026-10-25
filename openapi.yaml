@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Nescio Semantic Memory API
   description: NescioAI semantic memory core.
-  version: 0.4.0
+  version: 0.5.0
 paths:
   /api/v1/search:
     post:
@@ -109,8 +109,9 @@ components:
             - type: string
             - type: 'null'
           title: Content
-          description: The expanded text, with the chunks' shared overlap stripped
-            at each join. Null when the stored chunks admit no safe join (see `note`).
+          description: >-
+            The expanded text, with the chunks' shared overlap stripped at each
+            join. Null when the stored chunks admit no safe join (see `note`).
         chunk_index_from:
           type: integer
           title: Chunk Index From
@@ -122,21 +123,24 @@ components:
         covers:
           type: string
           title: Covers
-          description: 'The `context` mode this region was requested under: "neighbors"
-            or "document".'
+          description: >-
+            The `context` mode this region was requested under: "neighbors" or
+            "document".
         exact:
           type: boolean
           title: Exact
-          description: Whether this region provably reproduces the corresponding span
-            of the original note. False means the text is best-effort and `note` says
-            why.
+          description: >-
+            Whether this region provably reproduces the corresponding span of
+            the original note. False means the text is best-effort and `note`
+            says why.
         note:
           anyOf:
             - type: string
             - type: 'null'
           title: Note
-          description: Why the region is not exactly what was asked for -- truncated
-            at a dropped chunk, or joined under an unverifiable window. Null when
+          description: >-
+            Why the region is not exactly what was asked for -- truncated at a
+            dropped chunk, or joined under an unverifiable window. Null when
             there is nothing to report.
       type: object
       required:
@@ -208,19 +212,21 @@ components:
             - neighbors
             - document
           title: Context
-          description: How much surrounding text to return alongside each matched
-            chunk. "none" (the default) returns matched chunks only and runs no extra
-            query. "neighbors" expands each hit by `context_chunks` chunks either
-            side. "document" expands to the whole note the hit came from. Expanded
-            text is returned in the response's `contexts` list, not inline, so two
-            hits in the same note share one region.
+          description: >-
+            How much surrounding text to return alongside each matched chunk.
+            "none" (the default) returns matched chunks only and runs no extra
+            query. "neighbors" expands each hit by `context_chunks` chunks
+            either side. "document" expands to the whole note the hit came from.
+            Expanded text is returned in the response's `contexts` list, not
+            inline, so two hits in the same note share one region.
           default: none
         context_chunks:
           type: integer
           maximum: 5
           minimum: 1
           title: Context Chunks
-          description: Chunks to include either side of a hit. Only meaningful when
+          description: >-
+            Chunks to include either side of a hit. Only meaningful when
             `context` is "neighbors" -- ignored for "none" and "document".
           default: 1
       type: object
@@ -239,10 +245,11 @@ components:
             $ref: '#/components/schemas/ContextRegion'
           type: array
           title: Contexts
-          description: 'Expanded regions referenced by the results'' `context_ref`.
-            Deduplicated and merged: two hits in the same note share one region rather
-            than repeating its text. Empty when `context` is "none" or when expansion
-            produced nothing.'
+          description: >-
+            Expanded regions referenced by the results' `context_ref`.
+            Deduplicated and merged: two hits in the same note share one region
+            rather than repeating its text. Empty when `context` is "none" or
+            when expansion produced nothing.
       type: object
       required:
         - results
@@ -267,10 +274,11 @@ components:
             - type: integer
             - type: 'null'
           title: Context Ref
-          description: Index into the response's `contexts` list of the region containing
-            this chunk. Null when no region was built for it -- `context` was "none",
-            the note's chunks could not be resolved, or the region did not fit the
-            response's character budget.
+          description: >-
+            Index into the response's `contexts` list of the region containing
+            this chunk. Null when no region was built for it -- `context` was
+            "none", the note's chunks could not be resolved, or the region did
+            not fit the response's character budget.
       type: object
       required:
         - content
