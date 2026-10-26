@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, Index, Text, func
+from sqlalchemy import Boolean, Computed, DateTime, Index, Integer, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -46,6 +46,23 @@ class Learning(Base):
     # `metadata` is reserved on DeclarativeBase, so the Python attribute must be named differently
     meta: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dimension), nullable=False)
+
+    # Computed by Postgres from the STORED vector, never by application code:
+    # pgvector's float4 storage can turn a vector Python's own validation
+    # accepted into a zero-norm vector once written (#42/#53). SQLAlchemy's
+    # Computed() tells the ORM never to try to write this column itself.
+    embedding_degenerate: Mapped[bool] = mapped_column(
+        Boolean,
+        Computed("((embedding <=> embedding) = 'NaN'::float8)", persisted=True),
+        nullable=False,
+    )
+    # Computed by Postgres so measure_ranges() can sum chunk length without
+    # reading `content` (and its TOAST storage) at query time (#54).
+    content_chars: Mapped[int] = mapped_column(
+        Integer,
+        Computed("char_length(content)", persisted=True),
+        nullable=False,
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
