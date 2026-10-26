@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SearchRequest(BaseModel):
@@ -10,6 +10,19 @@ class SearchRequest(BaseModel):
         examples=["How do we handle API authentication across repos?"],
         validation_alias="query",
     )
+
+    @field_validator("query")
+    @classmethod
+    def _validate_query_not_blank(cls, value: str) -> str:
+        # #56: a blank query carries no meaning to search for, and if the
+        # embedding backend answers it with a zero-norm vector, _validated()
+        # turns that into a 503 with Retry-After -- a retry no client can ever
+        # make succeed. Reject it here as a 422 instead: the request is
+        # invalid, the backend is fine. Non-blank queries pass through
+        # unchanged (no stripping).
+        if value.strip() == "":
+            raise ValueError("query must contain non-whitespace characters")
+        return value
     top_k: int = Field(5, ge=1, le=50, description="Max chunks to return.")
     repo_filter: str | None = Field(
         None,
