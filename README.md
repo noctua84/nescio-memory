@@ -350,6 +350,18 @@ no problem in it turns a successful search into a non-200:
 Regions are built in descending order of the best similarity among the results referencing them,
 so the budget is spent on the context most likely to be wanted.
 
+**The response never exceeds `MAX_CONTEXT_CHARS`; the database fetch behind it can.** Admitting a
+range for fetch relies on a deliberately conservative LOWER bound of what it would cost — the same
+"never withhold what the builder would admit" trade-off described above — so a range can be fetched
+and then have most of what it returned discarded by `build_regions`. The slack is roughly additive
+per admitted range: about two chunks' worth of characters (`CHUNK_SIZE`) each, one from the
+estimate's own margin and one from a tail-probe chunk every range fetches just past its boundary
+and the builder never returns — up to `MAX_CONTEXT_DOCUMENTS` ranges in total. The smaller the
+regions, the larger this looks as a ratio; `CHUNK_SIZE / (CHUNK_SIZE - CHUNK_OVERLAP)` (the default
+1000/200 gives 1.25×) only bounds the large-region limit, not this overshoot. Size memory and
+statement timeouts for the fetch, not just the response, and lower `MAX_CONTEXT_DOCUMENTS` to
+tighten it.
+
 **Both bounds apply before the rows are read.** `MAX_CONTEXT_CHARS` on its own is spent on text
 that has already been transferred, so `context: "document"` over 50 matched notes would fetch all
 of them whatever their size and then discard most of it. Expansion therefore first keeps the
@@ -384,8 +396,8 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `LOG_LEVEL`           | `INFO`                                      | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL` |
 | `CHUNK_SIZE`          | `1000`                                      | characters per chunk                                 |
 | `CHUNK_OVERLAP`       | `200`                                      | overlap between chunks — must satisfy `0 <= CHUNK_OVERLAP < CHUNK_SIZE`, otherwise the app refuses to start |
-| `MAX_CONTEXT_CHARS`   | `100000`                                    | total characters of expanded context one search response may carry; a cap, not a target. Must be `> 0`, otherwise the app refuses to start |
-| `MAX_CONTEXT_DOCUMENTS` | `25`                                      | how many distinct notes one search response may expand, in rank order; bounds the context FETCH, which `MAX_CONTEXT_CHARS` alone cannot. Must be `> 0`, otherwise the app refuses to start |
+| `MAX_CONTEXT_CHARS`   | `100000`                                    | total characters of expanded context one search response may carry; a cap, not a target. The database FETCH behind a response can still run over this, by roughly two `CHUNK_SIZE`s per admitted range — see [Context expansion](#context-expansion). Must be `> 0`, otherwise the app refuses to start |
+| `MAX_CONTEXT_DOCUMENTS` | `25`                                      | how many distinct notes one search response may expand, in rank order; bounds the context FETCH, which `MAX_CONTEXT_CHARS` alone cannot — though the fetch can still exceed `MAX_CONTEXT_CHARS` itself, see above; lowering this tightens that slack. Must be `> 0`, otherwise the app refuses to start |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
 
 ### Embedding backends
