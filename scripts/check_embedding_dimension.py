@@ -21,7 +21,9 @@ puts scripts/ on sys.path instead of the repository root, so `import app`
 fails.
 
 Exit codes: 0 match, 1 mismatch, 2 backend unreachable or misconfigured,
-3 values pgvector cannot store (reported ahead of a mismatch).
+3 values pgvector cannot store (reported ahead of a mismatch), 64 bad
+command-line usage (argparse's own EX_USAGE, deliberately not 2 -- see
+EXIT_USAGE below).
 
 Additional flags:
   --degenerate  Report the norm and _validated() verdict for degenerate inputs
@@ -37,6 +39,7 @@ import sys
 
 from app.config import settings
 from app.core.embeddings import (
+    _component_fault,
     _fetch,
     _float32_sum_of_squares,
     _validated,
@@ -48,6 +51,28 @@ EXIT_OK = 0
 EXIT_MISMATCH = 1
 EXIT_UNREACHABLE = 2
 EXIT_UNUSABLE = 3
+# argparse's own usage-error exit code, which would otherwise collide with
+# EXIT_UNREACHABLE above: argparse.ArgumentParser.error() calls
+# sys.exit(2) by default, so "unknown flag" and "backend unreachable" would
+# be indistinguishable to a pipeline reading the exit code alone. 64 is
+# EX_USAGE from BSD sysexits.h, the conventional code for "the command was
+# invoked wrong".
+EXIT_USAGE = 64
+
+
+class _UsageErrorExitCode(argparse.ArgumentParser):
+    """ArgumentParser that exits EXIT_USAGE instead of argparse's default 2.
+
+    Overriding error() rather than catching SystemExit around parse_args():
+    the default implementation already prints the usage message and the
+    error to stderr before exiting, and this keeps that behaviour -- only
+    the exit code changes.
+    """
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
+
 
 # A backend that emits one unusable component is usually emitting nothing else,
 # so listing every fault would be a thousand near-identical lines with the
@@ -90,10 +115,25 @@ def _test_degenerate_inputs() -> None:
             print(f"  {text!r:20} -> backend error: {exc}")
             continue
 
-        if not isinstance(vector, list) or not all(
-            isinstance(x, (int, float)) for x in vector
-        ):
+        if not isinstance(vector, list):
             print(f"  {text!r:20} -> not a list of numbers")
+            continue
+
+        # Judge every component with the same rule _validated() uses, and
+        # before computing any norm: an unbounded int (valid JSON; the stdlib
+        # json module decodes a huge integer literal into a Python int of
+        # arbitrary size) or a non-finite float makes math.isfinite raise
+        # OverflowError rather than return a verdict (app/core/embeddings.py
+        # :76-78), and the same value would make math.sqrt below and
+        # struct.pack inside _float32_sum_of_squares raise too. Checking the
+        # shape first turns that crash into a reported verdict line instead.
+        faults = [
+            fault
+            for index, component in enumerate(vector)
+            if (fault := _component_fault(index, component)) is not None
+        ]
+        if faults:
+            print(f"  {text!r:20} -> {faults[0].message}")
             continue
 
         # L2 norm in float64
@@ -121,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     # The console is cp1252 on Windows and the backend name may not be ASCII.
     sys.stdout.reconfigure(encoding="utf-8")
 
-    parser = argparse.ArgumentParser(
+    parser = _UsageErrorExitCode(
         description="Check embedding dimension and backend configuration"
     )
     parser.add_argument(

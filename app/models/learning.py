@@ -51,6 +51,13 @@ class Learning(Base):
     # pgvector's float4 storage can turn a vector Python's own validation
     # accepted into a zero-norm vector once written (#42/#53). SQLAlchemy's
     # Computed() tells the ORM never to try to write this column itself.
+    #
+    # WIDTH CHANGE WARNING: because this column reads `embedding`, Postgres
+    # refuses `ALTER COLUMN embedding TYPE vector(N)` while it exists. A
+    # future vector-width migration (see 57cfbdfa0d6a, 58f3ecef1edf) must
+    # DROP this column first, alter embedding's type, then re-add this
+    # column with the same generation expression -- see
+    # alembic/versions/9439c6362bb3_add_stored_chunk_stats.py.
     embedding_degenerate: Mapped[bool] = mapped_column(
         Boolean,
         Computed("((embedding <=> embedding) = 'NaN'::float8)", persisted=True),

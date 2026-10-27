@@ -8,7 +8,6 @@ Create Date: 2026-10-26 00:00:00.000000
 from typing import Sequence, Union
 
 from alembic import op
-import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
@@ -27,36 +26,52 @@ def upgrade() -> None:
     # char_length are both IMMUTABLE (verified in Wave 0), which is required
     # for a STORED generated column.
     #
-    # ADD COLUMN ... STORED rewrites the whole table once under an
-    # ACCESS EXCLUSIVE lock (every row's vector is detoasted once to compute
-    # the flag). That is acceptable at self-hosted sizes; on a very large
+    # A single ALTER TABLE with two ADD COLUMNs, issued as one statement
+    # rather than as two op.add_column() calls. Each ADD COLUMN ... STORED
+    # rewrites the whole table under an ACCESS EXCLUSIVE lock -- every row is
+    # read and rewritten to compute the new column -- and, because this table
+    # also carries the HNSW index `learnings_embedding_idx`, that rewrite
+    # rebuilds every index on the table too (confirmed by relfilenode
+    # tracking: both the heap and the HNSW index get a new filenode). The
+    # index rebuild is the dominant cost here, not the column computation --
+    # an HNSW build is far more expensive per row than evaluating `<=>` or
+    # char_length. Two separate op.add_column() calls would rewrite the heap
+    # and rebuild the index twice instead of once, doubling the lock time for
+    # no benefit, so both columns are added in the same ALTER TABLE
+    # statement. That is acceptable at self-hosted sizes; on a very large
     # table, run this during a maintenance window.
-    op.add_column(
-        "learnings",
-        sa.Column(
-            "embedding_degenerate",
-            sa.Boolean(),
-            sa.Computed(
-                "((embedding <=> embedding) = 'NaN'::float8)",
-                persisted=True,
-            ),
-            nullable=False,
-        ),
-    )
-    op.add_column(
-        "learnings",
-        sa.Column(
-            "content_chars",
-            sa.Integer(),
-            sa.Computed(
-                "char_length(content)",
-                persisted=True,
-            ),
-            nullable=False,
-        ),
+    #
+    # WIDTH CHANGE WARNING: a future migration that changes embedding's
+    # vector width (as 57cfbdfa0d6a and 58f3ecef1edf did) cannot run
+    # `ALTER COLUMN embedding TYPE vector(N)` while embedding_degenerate
+    # exists -- Postgres refuses to alter the type of a column a generated
+    # column reads. Such a migration must DROP embedding_degenerate first,
+    # alter embedding's type, then re-add embedding_degenerate with this same
+    # generation expression.
+    op.execute(
+        """
+        ALTER TABLE learnings
+            ADD COLUMN embedding_degenerate boolean
+                GENERATED ALWAYS AS (((embedding <=> embedding) = 'NaN'::float8)) STORED
+                NOT NULL,
+            ADD COLUMN content_chars integer
+                GENERATED ALWAYS AS (char_length(content)) STORED
+                NOT NULL
+        """
     )
 
 
 def downgrade() -> None:
-    op.drop_column("learnings", "content_chars")
-    op.drop_column("learnings", "embedding_degenerate")
+    # Also a single ALTER TABLE: unlike ADD COLUMN ... STORED, DROP COLUMN
+    # does not rewrite the table (it just marks the column dropped in the
+    # catalog and leaves the on-disk data to be reclaimed by VACUUM), so
+    # there is no rewrite cost to double here. Combined into one statement
+    # anyway, for symmetry with upgrade() and to hold the lock once rather
+    # than twice.
+    op.execute(
+        """
+        ALTER TABLE learnings
+            DROP COLUMN content_chars,
+            DROP COLUMN embedding_degenerate
+        """
+    )
