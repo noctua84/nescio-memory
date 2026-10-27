@@ -7,11 +7,13 @@ is 1.0, and similarity is reported as 1 - distance.
 import math
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import text
 
 from app.api.v1 import search as search_module
 from app.config import settings
 from app.repositories.learning import LearningRepository
+from app.schemas.search import SearchRequest
 from tests.factories import make_api_key, make_learning
 from tests.fakes import fake_embedding, unit_vector
 
@@ -155,6 +157,184 @@ def test_top_k_above_the_schema_maximum_is_rejected(client, db_session):
     )
 
     assert response.status_code == 422
+
+
+# --- #56: a blank query is the caller's error, not the backend's ---
+#
+# A query of only whitespace carries nothing to search for, and it used to be
+# handed straight to the embedding backend. When that backend answers with a
+# zero-norm vector, _validated() (app/core/embeddings.py) reports 503 with a
+# Retry-After -- telling the caller the service is temporarily unwell and
+# inviting a retry that cannot ever succeed, because the request itself is what
+# is wrong. SearchRequest.query therefore rejects a blank query at validation
+# time, which FastAPI renders as a 422, and the embedder is never reached.
+#
+# Two halves to the contract, and both matter: the 422 (what the caller is
+# told) and the un-called embedder (that no network request is made and no 503
+# can be produced). A test asserting only the status code would pass for an
+# implementation that embedded first and mapped the failure to 422 afterwards.
+
+# Every one of these is "" after str.strip(). The non-breaking space is in the
+# list on purpose and was checked against CPython rather than assumed:
+# " ".strip() == "", because str.strip() with no argument strips by
+# str.isspace() and U+00A0 is whitespace there -- unlike bytes.strip() or a
+# C-locale isspace, which would leave it. So it is blank by this validator's
+# own rule and must be refused like any other blank. U+200B (zero-width space)
+# is deliberately NOT here: str.strip() does not remove it, so it is a
+# non-blank query by the same rule and belongs with " a " below.
+BLANK_QUERIES = [
+    pytest.param("", id="empty"),
+    pytest.param(" ", id="one-space"),
+    pytest.param("   ", id="several-spaces"),
+    pytest.param("\n\t", id="newline-and-tab"),
+    pytest.param("\r\f\v", id="carriage-return-formfeed-vtab"),
+    pytest.param(" ", id="non-breaking-space"),
+    pytest.param(" \t\n  ", id="mixed-whitespace"),
+]
+
+
+@pytest.fixture
+def recorded_embedder(client, monkeypatch):
+    """The query embedder, replaced by one that records what it is asked for.
+
+    Depends on `client` so this patch lands AFTER the client fixture's own
+    monkeypatch of the same attribute -- otherwise the fake would overwrite the
+    recorder and the call list would stay empty no matter what happened, which
+    is a test that can only pass. Returns the list of query strings, in order,
+    so a test can assert both that it stayed empty and what it received.
+    """
+    calls: list[str] = []
+
+    def _record(text: str) -> list[float]:
+        calls.append(text)
+        return fake_embedding(text)
+
+    monkeypatch.setattr(search_module, "get_embedding", _record)
+    return calls
+
+
+def _query_errors(response) -> list[dict]:
+    """The validation errors FastAPI reported against the `query` field.
+
+    Selected by loc rather than by position, because the 422 body is a list and
+    nothing promises this field's error is first in it.
+    """
+    return [
+        error
+        for error in response.json()["detail"]
+        if error.get("loc") and error["loc"][-1] == "query"
+    ]
+
+
+@pytest.mark.parametrize("query", BLANK_QUERIES)
+def test_a_blank_query_is_rejected_as_a_validation_error(client, db_session, query):
+    # 422, and an error the caller can act on: located at `query`, so a client
+    # library can point at the offending field, and saying what is wrong with
+    # it. The message is matched on "non-whitespace" rather than compared whole
+    # -- pydantic prefixes its own "Value error, " and that prefix is pydantic's
+    # to change, while the substance of the sentence is this project's.
+    key = make_api_key(db_session, "acme")
+
+    response = client.post(
+        "/api/v1/search",
+        json={"query": query, "top_k": 5},
+        headers={"X-API-Key": key},
+    )
+
+    assert response.status_code == 422
+    errors = _query_errors(response)
+    assert len(errors) == 1
+    assert "non-whitespace characters" in errors[0]["msg"]
+
+
+@pytest.mark.parametrize("query", BLANK_QUERIES)
+def test_a_blank_query_never_reaches_the_embedder(
+    client, db_session, recorded_embedder, query
+):
+    # The half of #56 that the status code cannot show. The 503-with-Retry-After
+    # this issue is about is produced by the embedding path, so the fix is only
+    # a fix if that path is not entered at all: no network request, no
+    # zero-norm vector, nothing for _validated() to refuse. Asserted as an
+    # empty call list rather than as "not called with this query", because an
+    # implementation that embedded a stripped or substituted string would still
+    # be making the request this test exists to prevent.
+    key = make_api_key(db_session, "acme")
+
+    response = client.post(
+        "/api/v1/search",
+        json={"query": query, "top_k": 5},
+        headers={"X-API-Key": key},
+    )
+
+    assert response.status_code == 422
+    assert recorded_embedder == []
+
+
+def test_a_non_blank_query_keeps_its_surrounding_whitespace(
+    client, db_session, recorded_embedder
+):
+    """The validator rejects; it does not normalise.
+
+    `" a "` has a non-empty strip() and so is a legitimate query, and what the
+    embedder receives must be the caller's own string -- not the stripped one.
+    The temptation when writing this validator is to `return value.strip()`,
+    which would pass every blank-rejection test above while silently rewriting
+    every other query in the system; the embedding of " a " is a different
+    vector from the embedding of "a", so that rewrite changes which rows a
+    caller gets back. This is the test that distinguishes the two, and it is
+    why the validator's own comment says "no stripping".
+    """
+    key = make_api_key(db_session, "acme")
+
+    response = client.post(
+        "/api/v1/search",
+        json={"query": " a ", "top_k": 5},
+        headers={"X-API-Key": key},
+    )
+
+    assert response.status_code == 200
+    assert recorded_embedder == [" a "]
+
+
+def test_a_zero_width_space_is_not_whitespace_to_strip(
+    client, db_session, recorded_embedder
+):
+    # The boundary of the rule, from the other side. str.strip() does not
+    # remove U+200B, so this query is non-blank under the validator's own
+    # definition and must be accepted and forwarded unchanged. Here to pin the
+    # rule as "str.strip() is empty" rather than some wider notion of
+    # "looks blank", which would be a different (and unimplemented) contract.
+    key = make_api_key(db_session, "acme")
+
+    response = client.post(
+        "/api/v1/search",
+        json={"query": "​", "top_k": 5},
+        headers={"X-API-Key": key},
+    )
+
+    assert response.status_code == 200
+    assert recorded_embedder == ["​"]
+
+
+@pytest.mark.parametrize("query", BLANK_QUERIES)
+def test_the_schema_itself_rejects_a_blank_query(query):
+    # The same guard at the layer that owns it, with no app, no database and no
+    # API key in the way. The endpoint tests above would also pass if the
+    # rejection came from a route-level check; asserting on SearchRequest says
+    # the rule travels with the schema, so any other caller of it -- a future
+    # endpoint, a background job -- gets it too.
+    with pytest.raises(ValidationError) as caught:
+        SearchRequest(query=query)
+
+    errors = caught.value.errors()
+    assert [error["loc"] for error in errors] == [("query",)]
+    assert "non-whitespace characters" in errors[0]["msg"]
+
+
+def test_the_schema_accepts_a_query_that_is_only_padded():
+    # And the accepted case at the same layer, unstripped. Without this, every
+    # assertion above is satisfied by a validator that rejects everything.
+    assert SearchRequest(query=" a ").query == " a "
 
 
 # --- #42 self-distance: what pgvector really does with a zero-norm vector ---
