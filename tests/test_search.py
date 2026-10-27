@@ -349,16 +349,20 @@ def test_the_schema_accepts_a_query_that_is_only_padded():
 #
 #   1. a vector whose float4 norm is zero has an UNDEFINED cosine distance,
 #      reported as NaN, even against ITSELF. That self-distance is pgvector's
-#      own definition of "this stored vector has zero norm", and it is what
-#      search()'s `self_distance != NaN` clause keys off.
+#      own definition of "this stored vector has zero norm", and it is the
+#      expression the STORED generated column `embedding_degenerate`
+#      (`(embedding <=> embedding) = 'NaN'`) is computed with -- which is
+#      what search()'s `embedding_degenerate IS false` clause reads. The
+#      question is the same one; #53 only moved it from once per candidate
+#      per query to once per row at write time.
 #   2. against an ordinary QUERY vector, only the all-zero shape stays NaN.
 #      The others produce an infinite similarity, which pgvector clamps into
 #      [-1, 1] -- so their query-time distance lands at a perfectly finite
 #      0.0 or 2.0 and a query-time `distance != NaN` clause cannot see them.
 #
-# Claim 2 is the reason the self-distance clause exists at all. If a future
-# pgvector stopped clamping, or returned 0 for claim 1, these tests are what
-# would say so rather than leaving a filter quietly matching nothing.
+# Claim 2 is the reason the stored flag exists at all. If a future pgvector
+# stopped clamping, or returned 0 for claim 1, these tests are what would say
+# so rather than leaving a filter quietly matching nothing.
 
 # Subnormal in float4 (below FLOAT32_MIN_NORMAL, 1.17549435e-38) and a
 # perfectly ordinary nonzero float64.
@@ -428,14 +432,16 @@ def _cosine_distance(connection, left: list[float], right: list[float]) -> float
 
 @pytest.mark.parametrize("vector", ZERO_NORM_STORED_VECTORS)
 def test_42_self_distance_of_a_zero_norm_vector_is_nan(connection, vector):
-    # Claim 1, and the clause it justifies: `v <=> v` is the friendliest
+    # Claim 1, and the generated column it justifies: `v <=> v` is the friendliest
     # question that can be asked of a vector -- identical operands, so any
     # nonzero norm gives exactly 0 -- and every one of these answers NaN,
     # because cosine distance divides by a norm that float4 evaluates as zero.
-    # That is why search() can ask the question of the STORED column alone,
-    # without reference to the query. Asserted as a float that is NaN rather
-    # than merely "not 0": a NULL or a raised error would be a different
-    # defect with different handling, and `!= 0` would admit both.
+    # That is why the question can be settled from the STORED column alone,
+    # without reference to the query, and so can be frozen into the generated
+    # `embedding_degenerate` column that search() filters on. Asserted as a
+    # float that is NaN rather than merely "not 0": a NULL or a raised error
+    # would be a different defect with different handling, and `!= 0` would
+    # admit both.
     distance = _cosine_distance(connection, vector, vector)
     assert isinstance(distance, float)
     assert math.isnan(distance)
@@ -469,7 +475,7 @@ def test_42_a_stored_all_zero_vector_is_nan_against_any_query(connection, query)
 def test_42_a_stored_zero_norm_vector_is_not_nan_against_an_ordinary_query(
     connection, vector
 ):
-    """Claim 2: why the self-distance clause is not redundant.
+    """Claim 2: why the stored degenerate flag is not redundant.
 
     These three shapes have a zero float4 norm -- the self-distance test above
     says so -- and yet their distance against an ordinary query is NOT NaN.
@@ -480,12 +486,13 @@ def test_42_a_stored_zero_norm_vector_is_not_nan_against_an_ordinary_query(
     reads as a PERFECT MATCH, and 2.0 for a negative one.
 
     This is measured rather than reasoned about, and it is the premise the
-    clause rests on: a query-time `distance != NaN` filter cannot see any of
-    these rows, so without the stored-row self-distance clause they would be
-    returned and ranked first. Pinned exactly (0.0 and 2.0, not merely "not
-    NaN") because the clamping is what produces those two values; a pgvector
-    that stopped clamping would hand back +-Inf, which is a different
-    serialisation problem and should fail here rather than pass quietly.
+    flag rests on: a query-time `distance != NaN` filter cannot see any of
+    these rows, so without the stored `embedding_degenerate` clause they
+    would be returned and ranked first. Pinned exactly (0.0 and 2.0, not
+    merely "not NaN") because the clamping is what produces those two
+    values; a pgvector that stopped clamping would hand back +-Inf, which is
+    a different serialisation problem and should fail here rather than pass
+    quietly.
     """
     positive = [0.01] * settings.embedding_dimension
     negative = [-0.01] * settings.embedding_dimension
@@ -501,9 +508,10 @@ def test_42_a_stored_zero_norm_vector_is_not_nan_against_an_ordinary_query(
 
 def test_42_self_distance_of_an_ordinary_vector_is_zero(connection):
     # The control, without which every assertion above would be satisfied by a
-    # pgvector that returned NaN for everything -- and the `!= NaN` filter in
-    # search() would then be excluding every row in the table while the
-    # premise tests stayed green. Exact rather than approximate: identical
+    # pgvector that returned NaN for everything -- `embedding_degenerate`
+    # would then be true for every row in the table, and search()'s
+    # `embedding_degenerate IS false` clause would exclude all of them while
+    # the premise tests stayed green. Exact rather than approximate: identical
     # operands of nonzero norm are distance 0, and orthogonal unit vectors are
     # distance 1, which is the arithmetic the ranking tests above rely on.
     assert _cosine_distance(connection, unit_vector(0), unit_vector(0)) == 0.0
@@ -515,11 +523,12 @@ def test_42_self_distance_of_an_ordinary_vector_is_zero(connection):
 # _validated() refuses to let one in through ingest, but rows predating that
 # check -- or written by any other path -- are already in the table, and
 # float4 can flatten a vector that looked fine in float64 on the way in. So
-# search() carries its own guard on the stored row's self-distance. These
-# tests seed such a row directly through the factory, which bypasses
-# _validated() exactly as a pre-existing row does, and they cover every
-# degenerate shape: the all-zero one, which is NaN at query time too, and the
-# three that are not and therefore need the self-distance clause.
+# search() carries its own guard on the stored row: `embedding_degenerate IS
+# false`, reading the generated column that froze the row's self-distance at
+# write time (#53). These tests seed such a row directly through the factory,
+# which bypasses _validated() exactly as a pre-existing row does, and they
+# cover every degenerate shape: the all-zero one, which is NaN at query time
+# too, and the three that are not and therefore need the stored flag.
 
 
 def _zero_norm_row(
@@ -711,7 +720,7 @@ OFF_AXIS_UNIT_VECTOR = [
 def test_a_stored_zero_norm_row_does_not_outrank_a_genuinely_relevant_one(
     client, db_session, query_on_axis, vector
 ):
-    """The harm the self-distance clause actually prevents, stated as ranking.
+    """The harm the degenerate-flag clause actually prevents, as ranking.
 
     This is the case a query-time `distance != NaN` filter could not see at
     all. These stored shapes have a zero float4 norm and a NONZERO dot product

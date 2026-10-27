@@ -519,6 +519,71 @@ def _upgrade(engine, revision: str) -> None:
         command.upgrade(config, revision)
 
 
+def _downgrade(engine, revision: str) -> None:
+    """Run downgrades back to `revision`, the same way as _upgrade.
+
+    ONLY ever called against a throwaway database. 9439c6362bb3 is head, so a
+    downgrade to 57cfbdfa0d6a runs that one revision's downgrade() and no
+    other -- 57cfbdfa0d6a's own downgrade, which truncates `learnings`, is not
+    reached. Pointing this at the shared engine would still be destructive,
+    because the dropped columns are what every test above reads.
+    """
+    config = Config(str(ALEMBIC_INI))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, revision)
+
+
+def _current_revision(engine) -> str:
+    with engine.connect() as conn:
+        return conn.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one()
+
+
+def _columns(engine) -> set[str]:
+    with engine.connect() as conn:
+        return {column["name"] for column in inspect(conn).get_columns("learnings")}
+
+
+def _seed_row(engine, file_path: str, content: str, vector: list[float]) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO learnings "
+                "(repo_name, client_name, file_path, content, metadata, embedding) "
+                "VALUES (:repo, :client, :path, :content, "
+                "CAST(:meta AS jsonb), CAST(:embedding AS vector))"
+            ),
+            {
+                "repo": "repo_a",
+                "client": "acme",
+                "path": file_path,
+                "content": content,
+                "meta": '{"chunk_index": 0}',
+                "embedding": _vector_literal(vector),
+            },
+        )
+
+
+# Everything about a row that the ALTER TABLE must leave untouched. `embedding`
+# is read as text rather than as a vector so the comparison is over Postgres'
+# own rendering of the stored float4s on both sides of the downgrade, with no
+# driver conversion in between -- a rewrite that lost precision would show up
+# here. CAST(... AS text) rather than `::text`, because text() reads a colon as
+# a bind-parameter marker.
+_SURVIVING_COLUMNS = text(
+    "SELECT file_path, content, CAST(metadata AS text) AS metadata, "
+    "CAST(embedding AS text) AS embedding, created_at, updated_at "
+    "FROM learnings ORDER BY file_path"
+)
+
+
+def _surviving_rows(engine) -> list[tuple]:
+    with engine.connect() as conn:
+        return [tuple(row) for row in conn.execute(_SURVIVING_COLUMNS)]
+
+
 def test_the_migration_backfills_rows_that_predate_it(throwaway_database):
     """A row written before 9439c6362bb3 gets correct stored values.
 
@@ -575,3 +640,92 @@ def test_the_migration_backfills_rows_that_predate_it(throwaway_database):
         file_path: (chars, degenerate)
         for file_path, (_, _, chars, degenerate) in seeded.items()
     }
+
+
+# ---------------------------------------------------------------------------
+# ... and can be taken back off again without taking the rows with it
+# ---------------------------------------------------------------------------
+
+# The rows the round trip is measured over: one healthy, one whose float4 norm
+# is zero, and one empty-content row, so both values of each generated column
+# are exercised on the way back up rather than only the common case.
+ROUND_TRIP_ROWS = [
+    ("healthy.md", "aü\U0001f642", unit_vector(0), 3, False),
+    ("degenerate.md", "legacy degenerate row", ALL_SUBNORMAL, 21, True),
+    ("empty.md", "", ALL_ZERO, 0, True),
+]
+
+
+def test_the_migration_downgrades_without_losing_the_rows(throwaway_database):
+    """downgrade() drops both columns and nothing else (#53/#54).
+
+    This is the only test that runs this revision's downgrade at all, and it
+    has to be run somewhere: a downgrade is what an operator reaches for when
+    a deploy goes wrong, and a `DROP COLUMN` typo -- dropping `content`
+    instead of `content_chars`, say, which is one missing suffix away -- would
+    destroy the table while every other test in the suite stayed green,
+    because none of them ever goes back down.
+
+    On a throwaway database for the reason given on the fixture: downgrading
+    the shared engine would drop the columns the rest of this file reads.
+
+    Asserted as a full round trip rather than just as a downgrade, because
+    half of what a downgrade is for is being able to go forward again
+    afterwards -- and the second upgrade also re-exercises the backfill over
+    rows that were written while the columns existed.
+    """
+    _upgrade(throwaway_database, STORED_CHUNK_STATS)
+    for file_path, content, vector, _, _ in ROUND_TRIP_ROWS:
+        _seed_row(throwaway_database, file_path, content, vector)
+
+    expected_generated = {
+        file_path: (chars, degenerate)
+        for file_path, _, _, chars, degenerate in ROUND_TRIP_ROWS
+    }
+
+    def _generated() -> dict:
+        with throwaway_database.connect() as conn:
+            return {
+                row.file_path: (row.content_chars, row.embedding_degenerate)
+                for row in conn.execute(
+                    text(
+                        "SELECT file_path, content_chars, embedding_degenerate "
+                        "FROM learnings"
+                    )
+                )
+            }
+
+    assert _generated() == expected_generated
+    # Captured while the columns exist, and compared byte for byte afterwards.
+    before = _surviving_rows(throwaway_database)
+    assert len(before) == len(ROUND_TRIP_ROWS)
+
+    _downgrade(throwaway_database, BEFORE_STORED_CHUNK_STATS)
+
+    # The revision really moved: without this, a downgrade() that did nothing
+    # at all would satisfy "the rows survived" perfectly.
+    assert _current_revision(throwaway_database) == BEFORE_STORED_CHUNK_STATS
+    columns = _columns(throwaway_database)
+    assert "content_chars" not in columns
+    assert "embedding_degenerate" not in columns
+    # The columns the generation expressions READ are the ones a mistyped DROP
+    # would have taken, so they are named explicitly rather than left to the
+    # row comparison below.
+    assert "content" in columns
+    assert "embedding" in columns
+
+    # Every row, and every other value in it, unchanged -- including the
+    # embeddings, which the ADD COLUMN ... STORED rewrite had already copied
+    # once and the DROP COLUMN must not touch again.
+    assert _surviving_rows(throwaway_database) == before
+
+    _upgrade(throwaway_database, STORED_CHUNK_STATS)
+
+    assert _current_revision(throwaway_database) == STORED_CHUNK_STATS
+    columns = _columns(throwaway_database)
+    assert {"content_chars", "embedding_degenerate"} <= columns
+    # Recomputed from what is on disk, so the values have to come back
+    # identical -- a downgrade/upgrade cycle that lost a flag would leave a
+    # degenerate row visible to search() for as long as nobody rewrote it.
+    assert _generated() == expected_generated
+    assert _surviving_rows(throwaway_database) == before
