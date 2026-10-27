@@ -17,6 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.models import Learning
 from app.models.learning import Learning
 
 # meta["chunk_index"] is a JSONB path expression; .astext renders it as text so
@@ -120,7 +121,7 @@ class LearningRepository:
         embedding: list[float],
         top_k: int,
         repo_filter: str | None = None,
-    ) -> Sequence[Row[Any]]:
+    ) -> Sequence[Row[Learning, Any]]:
         # HNSW is approximate and post-filtered: client_name is applied after the
         # index produces its candidate window, roughly 391 tuples at the default
         # ef_search=40. A client holding a small share of the table could have
@@ -247,7 +248,7 @@ class LearningRepository:
 
     def get_chunks_for_ranges(
         self, ranges: list[tuple[str, str, int | None, int | None]]
-    ) -> Sequence[Row[Any]]:
+    ) -> list[Any] | Sequence[Row[Learning, Any]]:
         """Fetch the chunks covering several index ranges in ONE query.
 
         Each element of `ranges` is (repo_name, file_path, from_index,

@@ -11,7 +11,7 @@ from app.config import settings
 # Lazy on purpose (issue #16): create_engine() imports the DBAPI driver module,
 # so building the engine at import time means a bad DATABASE_URL/driver crashes
 # every entry point at import, including export_openapi.py, which never
-# touches the database. Deferring to first use keeps import side-effect-free.
+# touches the database. Deferring to the first use keeps import side-effect-free.
 @functools.lru_cache(maxsize=1)
 def get_engine() -> Engine:
     return create_engine(
