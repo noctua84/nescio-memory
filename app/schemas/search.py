@@ -6,7 +6,11 @@ from pydantic import BaseModel, Field, field_validator
 class SearchRequest(BaseModel):
     query: str = Field(
         ...,
-        description="The natural language search query.",
+        description=(
+            "The natural language search query. Rejected with 422 if it is "
+            "blank or whitespace-only after stripping; otherwise forwarded "
+            "unchanged, surrounding whitespace included."
+        ),
         examples=["How do we handle API authentication across repos?"],
         validation_alias="query",
     )

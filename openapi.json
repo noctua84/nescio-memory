@@ -263,7 +263,7 @@
           "query": {
             "type": "string",
             "title": "Query",
-            "description": "The natural language search query.",
+            "description": "The natural language search query. Rejected with 422 if it is blank or whitespace-only after stripping; otherwise forwarded unchanged, surrounding whitespace included.",
             "examples": [
               "How do we handle API authentication across repos?"
             ]
