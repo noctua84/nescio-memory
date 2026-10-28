@@ -287,7 +287,8 @@ def test_search_leaves_a_stored_degenerate_row_out_of_the_response(
     ]
     for result in results:
         similarity = result["similarity"]
-        assert isinstance(similarity, float) and math.isfinite(similarity), result
+        assert isinstance(similarity, float), result
+        assert math.isfinite(similarity), result
 
 
 @pytest.mark.parametrize("vector", DEGENERATE_VECTORS)
