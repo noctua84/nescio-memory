@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.6.0](https://github.com/noctua84/nescio-memory/compare/v0.5.0...v0.6.0) (2026-10-29)
+
+
+### Features
+
+* [impl] add stored generated columns embedding_degenerate and content_chars ([76e750a](https://github.com/noctua84/nescio-memory/commit/76e750a909fc54125a5e5b3088377289d0cac304))
+* [impl] read the stored chunk stats in search and the context pre-flight ([3b2369e](https://github.com/noctua84/nescio-memory/commit/3b2369e7cbdeb7c68ec0b9b952e93f76ee555de8)), closes [#53](https://github.com/noctua84/nescio-memory/issues/53) [#54](https://github.com/noctua84/nescio-memory/issues/54)
+* [impl] reject blank search queries with 422 and add a degenerate-input probe ([#56](https://github.com/noctua84/nescio-memory/issues/56)) ([c0e4b87](https://github.com/noctua84/nescio-memory/commit/c0e4b877cf79bea460510cda52be531f421cdc81))
+* store chunk stats as generated columns, reject blank search queries ([84670e8](https://github.com/noctua84/nescio-memory/commit/84670e87eb396cda3b6a57d3d90d8444c28782dc))
+
+
+### Bug Fixes
+
+* [fix] add the chunk stats columns in one table rewrite and harden the degenerate probe ([0f0b497](https://github.com/noctua84/nescio-memory/commit/0f0b497b1278b4b2f3a1a1a2cf3b0ab8f7bb4080))
+
+
+### Documentation
+
+* [docs] correct the context fetch bound and document blank-query 422 and width changes ([5eab006](https://github.com/noctua84/nescio-memory/commit/5eab006576155b30b530522af084184952971e54))
+* [docs] document that the context fetch can exceed MAX_CONTEXT_CHARS ([#55](https://github.com/noctua84/nescio-memory/issues/55)) ([00964ad](https://github.com/noctua84/nescio-memory/commit/00964ad1db7dff0fa4db51988a8ae237cc4c3232))
+
 ## [0.5.0](https://github.com/noctua84/nescio-memory/compare/v0.4.0...v0.5.0) (2026-10-25)
 
 
