@@ -254,7 +254,7 @@ curl -X POST http://localhost:8000/api/v1/search \
 
 | Field            | Type             | Default  | Description                            |
 | ---------------- | ---------------- | -------- | -------------------------------------- |
-| `query`          | string           | —        | text to search for (required)          |
+| `query`          | string           | —        | text to search for (required); blank or whitespace-only after stripping is rejected with `422` -- surrounding whitespace is otherwise kept and forwarded unchanged |
 | `top_k`          | int              | `5`      | maximum number of results; must be between 1 and 50, otherwise `422` |
 | `repo_filter`    | string \| `null` | `null`   | restrict results to one `repo_name`    |
 | `context`        | string           | `"none"` | `"none"`, `"neighbors"` or `"document"` — how much surrounding text to return |
@@ -350,6 +350,20 @@ no problem in it turns a successful search into a non-200:
 Regions are built in descending order of the best similarity among the results referencing them,
 so the budget is spent on the context most likely to be wanted.
 
+**The response never exceeds `MAX_CONTEXT_CHARS`; the database fetch behind it can, by design.**
+Each stored chunk is a full `CHUNK_SIZE` window on disk, but the pre-flight (`admit_ranges` /
+`_region_chars_lower_bound` in `app/core/context.py`) charges only about one step
+(`CHUNK_SIZE - CHUNK_OVERLAP`) per chunk against the budget — a deliberately conservative LOWER
+bound, so the check never withholds a region `build_regions` would in fact have admitted. The
+fetch can therefore approach `MAX_CONTEXT_CHARS * CHUNK_SIZE / (CHUNK_SIZE - CHUNK_OVERLAP)`, plus
+a couple of `CHUNK_SIZE`s per admitted range (the estimate's own margin and a tail-probe chunk
+every range fetches just past its boundary and the builder never returns) and the tail-probe
+rows themselves — about 1.25× the response budget at the defaults (1000/200), and as much as 10×
+at 1000/900. The number of admitted ranges is bounded by how many hits were matched (`top_k`), not
+by `MAX_CONTEXT_DOCUMENTS` — in `neighbors` mode one document can contribute several ranges.
+Worked example: a 100-chunk note at the defaults charges the budget 78,400 characters but fetches
+100,000. Size memory and statement timeouts for the fetch, not just the response.
+
 **Both bounds apply before the rows are read.** `MAX_CONTEXT_CHARS` on its own is spent on text
 that has already been transferred, so `context: "document"` over 50 matched notes would fetch all
 of them whatever their size and then discard most of it. Expansion therefore first keeps the
@@ -383,9 +397,9 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `APP_NAME`            | `Nescio Semantic Memory API`                | title shown in the OpenAPI docs                      |
 | `LOG_LEVEL`           | `INFO`                                      | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL` |
 | `CHUNK_SIZE`          | `1000`                                      | characters per chunk                                 |
-| `CHUNK_OVERLAP`       | `200`                                      | overlap between chunks — must satisfy `0 <= CHUNK_OVERLAP < CHUNK_SIZE`, otherwise the app refuses to start |
-| `MAX_CONTEXT_CHARS`   | `100000`                                    | total characters of expanded context one search response may carry; a cap, not a target. Must be `> 0`, otherwise the app refuses to start |
-| `MAX_CONTEXT_DOCUMENTS` | `25`                                      | how many distinct notes one search response may expand, in rank order; bounds the context FETCH, which `MAX_CONTEXT_CHARS` alone cannot. Must be `> 0`, otherwise the app refuses to start |
+| `CHUNK_OVERLAP`       | `200`                                      | overlap between chunks — must satisfy `0 <= CHUNK_OVERLAP < CHUNK_SIZE`, otherwise the app refuses to start; the closer this is to `CHUNK_SIZE`, the larger the database FETCH behind a search response can run over `MAX_CONTEXT_CHARS` — see [Context expansion](#context-expansion) |
+| `MAX_CONTEXT_CHARS`   | `100000`                                    | total characters of expanded context one search response may carry; a cap, not a target. The database FETCH behind a response can run well over this — up to roughly `MAX_CONTEXT_CHARS * CHUNK_SIZE / (CHUNK_SIZE - CHUNK_OVERLAP)` plus a couple of `CHUNK_SIZE`s per admitted range — see [Context expansion](#context-expansion). Must be `> 0`, otherwise the app refuses to start |
+| `MAX_CONTEXT_DOCUMENTS` | `25`                                      | how many distinct notes one search response may expand, in rank order; does NOT bound the number of admitted ranges in `neighbors` mode, which is bounded by the number of matched hits instead — see [Context expansion](#context-expansion). Must be `> 0`, otherwise the app refuses to start |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
 
 ### Embedding backends
@@ -424,15 +438,28 @@ EMBEDDING_DIMENSION=384                   # in .env
 uv run alembic upgrade 3d80eb22a17d       # NOT `head` — head is vector(1024)
 ```
 
-`3d80eb22a17d` is the last revision before the column widened to 1024, and
-`alembic downgrade -1` from head lands there. With the stock `EMBEDDING_DIMENSION=1024` the
-`local` backend fails every embedding call, loudly, on the dimension check — the mirror image of
-the defect in #36.
+`3d80eb22a17d` is the last revision with the 384-dim schema — `uv run alembic history` confirms
+the chain is `3d80eb22a17d -> 57cfbdfa0d6a` (restores 1024) `-> 9439c6362bb3` (adds stored chunk
+stats) `(head)`. Name the target revision explicitly, as above; do not use `alembic downgrade -1`
+or any other relative offset from `head` — later migrations land between `3d80eb22a17d` and
+`head`, so `-1` stops at the wrong place as soon as the chain grows. With the stock
+`EMBEDDING_DIMENSION=1024` the `local` backend fails every embedding call, loudly, on the
+dimension check — the mirror image of the defect in #36.
 
 Pointing `LOCAL_EMBEDDING_MODEL` at a genuinely 1024-dimensional sentence-transformers model
 would make one schema serve both, and is the obvious next step; it is not taken here because
 nobody has run it. An unexecuted dimension claim in this file is what caused #36 in the first
 place.
+
+#### Changing the embedding width is blocked by the stored generated column
+
+`learnings.embedding_degenerate` is a `STORED GENERATED` column computed as
+`(embedding <=> embedding) = 'NaN'::float8` (added in `9439c6362bb3`). Postgres refuses
+`ALTER COLUMN embedding TYPE vector(N)` while any generated column reads `embedding` — the
+column's expression is bound to the old type. A width-change migration must, in order: drop
+`embedding_degenerate`, run the `ALTER COLUMN ... TYPE vector(N)`, then re-add
+`embedding_degenerate` with the same expression (`GENERATED ALWAYS AS ((embedding <=> embedding)
+= 'NaN'::float8) STORED`).
 
 ### Ollama models
 

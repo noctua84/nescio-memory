@@ -198,20 +198,26 @@ class LearningRepository:
         distance = Learning.embedding.cosine_distance(embedding)  # the <=> operator
         similarity = (1 - distance).label("similarity")
 
-        # #42: a stored row's SELF cosine-distance -- Learning.embedding
+        # #42/#53: a stored row's SELF cosine-distance -- Learning.embedding
         # against itself, not against the query -- is NaN for every
         # degenerate zero-norm shape pgvector's float4 arithmetic can
         # produce: all-zero, all-subnormal, or a vector whose squared
         # components underflow float32 before they are summed. That self-
         # distance is pgvector's own definition of "this stored vector has
         # zero norm," and it is unconditional: it does not depend on what is
-        # being searched for, so it is evaluated once per row regardless of
-        # query. _validated() rejects a zero-norm embedding in float64
-        # before it is written, but pgvector's float4 column can flatten a
-        # component differently than Python's float64 evaluated it on the
-        # way in -- a vector that looked fine to _validated() can still land
-        # zero-norm once stored. Excluding by self-distance is what catches
-        # that: a query-time `distance != NaN` only ever excludes a STORED
+        # being searched for. It is STILL that same definition here --
+        # Learning.embedding_degenerate is a generated column computed with
+        # exactly this expression (see migration 9439c6362bb3 and
+        # app/models/learning.py) -- but now computed once per row by
+        # Postgres at write time instead of once per candidate on every
+        # query: Wave 0 measured the old per-query self-distance at 29-35%
+        # of search() execution time on an exact (bitmap + top-N sort) plan.
+        # _validated() rejects a zero-norm embedding in float64 before it is
+        # written, but pgvector's float4 column can flatten a component
+        # differently than Python's float64 evaluated it on the way in -- a
+        # vector that looked fine to _validated() can still land zero-norm
+        # once stored, which is what embedding_degenerate catches. A
+        # query-time `distance != NaN` alone only ever excludes a STORED
         # all-zero row, because that is the one degenerate shape that stays
         # NaN at query time too. The other degenerate shapes (all-subnormal,
         # underflowing-norm) do NOT come back NaN against a real query
@@ -227,13 +233,11 @@ class LearningRepository:
         # excludes exactly the NaN rows (by either definition) without
         # excluding anything else; both are post-index filters like
         # client_name above them, not a change to ORDER BY/LIMIT.
-        self_distance = Learning.embedding.cosine_distance(Learning.embedding)
-
         stmt = (
             select(Learning, similarity)
             .where(
                 Learning.client_name == self.client_name,
-                self_distance != cast(literal(float("nan")), Float),
+                Learning.embedding_degenerate.is_(False),
                 distance != cast(literal(float("nan")), Float),
             )
             .order_by(distance)          # smaller distance = more similar
@@ -372,15 +376,23 @@ class LearningRepository:
         # would charge a duplicated chunk's characters twice, inflate the
         # estimate above the real region length, and wrongly skip a range the
         # builder would have admitted. Grouping by (range_id, chunk_index)
-        # first, and taking min(char_length) of the duplicates, keeps the
+        # first, and taking min(chars) of the duplicates, keeps the
         # per-index contribution a floor rather than letting a longer duplicate
         # inflate it -- consistent with the lower-bound requirement on the
         # whole estimate (see _region_chars_lower_bound).
+        # #54: summing the STORED content_chars generated column (see
+        # migration 9439c6362bb3 and app/models/learning.py) rather than
+        # computing char_length(Learning.content) here avoids reading
+        # `content` -- and its TOAST storage for any chunk over ~1950 bytes
+        # -- during this pre-flight; Wave 0 measured that detoast at ~20x
+        # the buffers of reading the stored int. The min() dedup below is
+        # unaffected: it is still a floor over duplicate chunk_index rows,
+        # now taken over the precomputed length instead of a recomputed one.
         indexed = (
             select(
                 range_id,
                 _CHUNK_INDEX.label("chunk_index"),
-                func.min(func.char_length(Learning.content)).label("chars"),
+                func.min(Learning.content_chars).label("chars"),
             )
             .where(
                 Learning.client_name == self.client_name,
