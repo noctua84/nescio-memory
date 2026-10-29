@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.v1.router import api_router
+from app.api.v2.router import api_router as api_router_v2
 from app.config import settings
 from app.core.db import get_engine
 from app.core.errors import register_exception_handlers
@@ -33,6 +34,7 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
 
     app.include_router(api_router, prefix="/api/v1")
+    app.include_router(api_router_v2, prefix="/api/v2")
 
     @app.get("/health", tags=["Ops"])
     def health():
