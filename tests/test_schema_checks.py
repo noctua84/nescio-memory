@@ -46,6 +46,48 @@ class _UnreachableEngine:
         raise OperationalError("SELECT 1", {}, Exception("connection refused"))
 
 
+class _PerTableStubConnection:
+    """Answers the pg_attribute query differently per table.
+
+    The check issues one query per table, so a single fixed scalar cannot
+    express "learnings is right, passages is wrong". The table name is read
+    back out of the SQL the check built, which also records every query for
+    the "both tables are checked" assertion.
+    """
+
+    def __init__(self, scalars_by_table, executed):
+        self._scalars_by_table = scalars_by_table
+        self.executed = executed
+        self._pending = None
+
+    def execute(self, statement, *args, **kwargs):
+        sql = str(statement)
+        matched = [table for table in self._scalars_by_table if f"'{table}'" in sql]
+        assert len(matched) == 1, f"could not tell which table this query is for: {sql}"
+        table = matched[0]
+        self.executed.append(table)
+        self._pending = self._scalars_by_table[table]
+        return self
+
+    def scalar(self):
+        return self._pending
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class _PerTableStubEngine:
+    def __init__(self, scalars_by_table):
+        self._scalars_by_table = scalars_by_table
+        self.executed = []
+
+    def connect(self):
+        return _PerTableStubConnection(self._scalars_by_table, self.executed)
+
+
 def test_a_matching_dimension_passes(monkeypatch):
     from app.config import settings
 
@@ -79,6 +121,54 @@ def test_an_unreachable_database_names_the_cause():
     with pytest.raises(RuntimeError, match="database") as excinfo:
         verify_embedding_dimension(_UnreachableEngine())
     assert isinstance(excinfo.value.__cause__, OperationalError)
+
+
+def test_a_mismatched_passages_dimension_names_the_table():
+    # learnings is correct, so a message that only names "the embedding column"
+    # would send the operator to the wrong table.
+    from app.config import settings
+
+    wrong = settings.embedding_dimension + 1
+    engine = _PerTableStubEngine(
+        {"learnings": settings.embedding_dimension, "passages": wrong}
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        verify_embedding_dimension(engine)
+    message = str(excinfo.value)
+    assert "passages" in message
+    assert "learnings" not in message
+    assert str(settings.embedding_dimension) in message
+    assert str(wrong) in message
+
+
+def test_a_missing_passages_table_names_the_remedy():
+    # A database migrated to the pre-passages revision: learnings exists, the
+    # new table does not. The remedy is migrating, not reconfiguring.
+    from app.config import settings
+
+    engine = _PerTableStubEngine(
+        {"learnings": settings.embedding_dimension, "passages": None}
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        verify_embedding_dimension(engine)
+    message = str(excinfo.value)
+    assert "passages" in message
+    assert "alembic upgrade head" in message
+
+
+def test_both_tables_are_checked():
+    # Dropping a table from the loop would leave this at one query, which is
+    # exactly the regression this test exists to catch.
+    from app.config import settings
+
+    engine = _PerTableStubEngine(
+        {
+            "learnings": settings.embedding_dimension,
+            "passages": settings.embedding_dimension,
+        }
+    )
+    verify_embedding_dimension(engine)
+    assert engine.executed == ["learnings", "passages"]
 
 
 def test_a_supported_pgvector_version_passes():
