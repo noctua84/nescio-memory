@@ -1,0 +1,44 @@
+# Golden queries for scripts/eval_queries.py.
+#
+# Slice 1 ships this scaffold with three placeholder queries. Replace them with
+# 15-20 real queries against your own corpus before the gate means anything;
+# with fewer than `gate.minimum_queries` queries, eval_queries.py reports the
+# raw ratio but exits 3 ("not yet populated") instead of pass/fail.
+#
+# Keep real queries OUT of this file. A query and the path it expects together
+# reveal what the private corpus contains, and this repository is public: hold
+# your real query set in a local, uncommitted file and pass it with --queries.
+#
+# version: schema version of this file. Must be 1.
+#
+# gate:
+#   top_k: a hit means the expected note appears within this many results.
+#   threshold: this many queries must hit for the gate to pass.
+#   minimum_queries: below this many queries, the gate is void (exit 3).
+#
+# queries: each entry has
+#   query: the text sent to /api/v2/search.
+#   expect_path_or_uri: the expected note's path_or_uri, or a list of any of
+#     the path_or_uri values that would count as a correct hit (for a
+#     question two notes could legitimately answer).
+#   notes: optional, free text explaining what the query exercises.
+
+version: 1
+gate:
+  top_k: 5           # a hit means the expected note appears within this many results
+  threshold: 15      # this many queries must hit for the gate to pass
+  minimum_queries: 15  # below this the file is not yet populated and the gate is void
+queries:
+  - query: "example: phrase query"
+    # A hit is the expected note appearing in the top_k. A list means "any of
+    # these counts", for a question two notes could legitimately answer.
+    expect_path_or_uri: "repo/example-project/adr/0001-example-decision.md"
+    notes: "Placeholder. Phrase query; tests that the decision note beats the ledger."
+  - query: "example: natural-language question with no keyword overlap"
+    expect_path_or_uri:
+      - "repo/example-project/adr/0001-example-decision.md"
+      - "context/example-convention.md"
+    notes: "Placeholder. Natural-language question, no overlap with the note's name."
+  - query: "\"example: quoted phrase\""
+    expect_path_or_uri: "repo/example-project/adr/0001-example-decision.md"
+    notes: "Placeholder. Quoted phrase; exercises websearch_to_tsquery phrase matching."
