@@ -362,6 +362,154 @@ the last region says so when it does. Whatever a bound held back is explained in
 `note` of the last region that did fit, which is the only place adjacent to the cut; if nothing
 fits at all, `contexts` is empty and every `context_ref` is `null`.
 
+### `/api/v2` — notes and passages
+
+> **Status: early.** `/api/v2` is a second, parallel storage model (`notes` + `passages`)
+> alongside the untouched `/api/v1` (`learnings`). There is no data migration between them —
+> see [Current limitations](#current-limitations). Design rationale and the retrieval-quality
+> baseline live in
+> [`docs/superpowers/specs/2026-10-29-notes-passages-slice-1-design.md`](docs/superpowers/specs/2026-10-29-notes-passages-slice-1-design.md).
+
+Every `/api/v2` route requires the same `X-API-Key` header as `/api/v1`, and is tenant-scoped the
+same way.
+
+#### `POST /api/v2/ingest`
+
+Stores one note as JSON (not `Form(...)` — there is no 1 MiB per-field byte limit here, only
+`MAX_CONTENT_CHARS`). The note is split into passages, embedded, and both are written in one
+transaction.
+
+```bash
+curl -X POST http://localhost:8000/api/v2/ingest \
+  -H "X-API-Key: nm_your_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scope": "nescio-memory",
+    "path_or_uri": "docs/architecture.md",
+    "content": "# Architecture\n\n...",
+    "status": "active",
+    "meta": {}
+  }'
+```
+
+```json
+{
+  "note_id": 42,
+  "passages": 3,
+  "skipped": false
+}
+```
+
+| Field         | Description                                                                 |
+| ------------- | ---------------------------------------------------------------------------- |
+| `scope`       | also accepted as `repo_name`; defaults to `""`                               |
+| `path_or_uri` | a relative path (no leading `/`, no `..`) or an absolute URI                 |
+| `content`     | note body, UTF-8 text                                                        |
+| `status`      | optional, stored as given — the service does not derive it from frontmatter |
+| `meta`        | optional, stored as given                                                    |
+| `force`       | optional, default `false` — bypasses the skip below without changing any stored value |
+
+Re-ingesting the same `(scope, path_or_uri)` is **skipped** — `note_id` and `passages` are
+returned unchanged, `skipped: true`, and nothing is re-split or re-embedded — only when **both**
+the content hash **and** the pipeline version (which covers the splitter, the FTS composition,
+the embedding-input composition, and the embedding backend + dimension) match the stored note. A
+hash match behind a changed pipeline version still re-splits and re-embeds. `force: true` is the
+escape hatch for a change the pipeline version cannot see — most plausibly a re-pulled embedding
+model behind an unchanged backend name and dimension — and always costs the work, never skipping.
+
+#### `GET /api/v2/notes/{id}`
+
+Returns one note by id, scoped to the calling client — a note belonging to another client is
+**indistinguishable** from an id that does not exist at all: both are the same `404`.
+
+```bash
+curl http://localhost:8000/api/v2/notes/42 -H "X-API-Key: nm_your_key_here"
+```
+
+```json
+{
+  "id": 42,
+  "scope": "nescio-memory",
+  "path_or_uri": "docs/architecture.md",
+  "name": "Architecture",
+  "description": null,
+  "type": null,
+  "provenance_kind": null,
+  "provenance_date": null,
+  "status": "active",
+  "content_hash": "...",
+  "pipeline_version": "...",
+  "body": "# Architecture\n\n...",
+  "meta": {},
+  "passage_count": 3,
+  "created_at": "2026-10-29T00:00:00Z",
+  "updated_at": "2026-10-29T00:00:00Z"
+}
+```
+
+`body` already contains the text of every passage, so passage texts are not returned alongside it
+— `passage_count` is the count, computed under the same tenant filter.
+
+#### `DELETE /api/v2/notes/{id}`
+
+The erasure path: removes a note and, by cascade, every one of its passages. Returns `204` with
+no body on success, and the same indistinguishable `404` as `GET` for a missing or foreign id.
+This is the **only** way to remove a note — nothing reconciles notes against a source tree, so a
+client that stops holding a file must call this itself.
+
+```bash
+curl -X DELETE http://localhost:8000/api/v2/notes/42 -H "X-API-Key: nm_your_key_here"
+```
+
+#### `POST /api/v2/search`
+
+**FTS only in this release** — there is no vector search on this path yet, and a result's `rank`
+is not comparable to `/api/v1`'s `similarity`. Results are **passages**, each carrying its note's
+identity, description and provenance.
+
+```bash
+curl -X POST http://localhost:8000/api/v2/search \
+  -H "X-API-Key: nm_your_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"q": "invoice-first checkout", "top_k": 5}'
+```
+
+```json
+{
+  "results": [
+    {
+      "passage_id": 101,
+      "note_id": 42,
+      "ordinal": 0,
+      "name": "Architecture",
+      "description": null,
+      "type": null,
+      "path_or_uri": "docs/architecture.md",
+      "heading_path": "Architecture > Overview",
+      "content": "...",
+      "provenance_kind": null,
+      "provenance_date": null,
+      "status": "active",
+      "rank": 0.642
+    }
+  ]
+}
+```
+
+| Field         | Default | Description                                                           |
+| ------------- | ------- | ----------------------------------------------------------------------- |
+| `q`           | —       | also accepted as `query` (required); parsed with `websearch_to_tsquery` semantics — quoted phrases, `OR`, leading `-` to exclude a word |
+| `top_k`       | `5`     | maximum number of results, 1–50, otherwise `422`                        |
+| `repo_filter` | `null`  | restrict to notes with that `scope`                                     |
+
+Results are ranked by `ts_rank_cd` over three FTS weights: `A` (note name + heading path), `B`
+(passage content) and `C` (note description). `description` is deliberately weighted below
+`content`: it is note-level and duplicated onto every passage of the note, so at the same weight
+as `content` it would score every passage of a long note identically and could outrank a passage
+that genuinely discusses the term — the "returns a page to read again" failure this search exists
+to avoid. A query that reduces to an empty tsquery (a stop word alone, or only punctuation) is not
+an error — it returns `{"results": []}` with a `200`.
+
 ## Configuration
 
 All settings are read from `.env` via [pydantic-settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/);
@@ -508,6 +656,44 @@ Four things are enforced by CI:
 - **The `local-embeddings` extra must still resolve.** A `--dry-run` sync verifies it against the
   lockfile on every run without downloading torch, so the opt-in backend cannot rot unnoticed.
 
+### Re-ingesting a corpus
+
+`scripts/reingest.py` walks a directory tree and `POST`s each Markdown file to
+`/api/v2/ingest`:
+
+```bash
+uv run python -m scripts.reingest --root ~/notes --api-key nm_your_key_here \
+  --url http://localhost:8000 --scope my-corpus
+```
+
+Two files are **excluded by default**, no matter what: `**/MEMORY.md` and
+`**/learning-log.md`. Both are generated artifacts — `MEMORY.md` is an index of other notes'
+descriptions and `learning-log.md` is a large promotion ledger — and both out-rank the original
+notes on exact-keyword FTS, which is a retrieval-quality problem, not a convenience. `--exclude`
+is **additive** to these defaults, so adding an unrelated exclusion never silently re-admits
+them; `--no-default-excludes` is the explicit, visible way to drop them. `--force` passes
+`force: true` on every file, so an unchanged file is re-split and re-embedded rather than
+skipped — useful after a model change the pipeline version does not see. `--dry-run` lists what
+would be posted and makes no HTTP call.
+
+### Measuring retrieval quality
+
+`scripts/eval_queries.py` runs a fixed list of queries against `/api/v2/search` and reports how
+many land the expected note in the top results — the harness for the quality gate slice 2's
+ranked-fusion work has to beat.
+
+```bash
+uv run python -m scripts.eval_queries --api-key nm_your_key_here \
+  --queries tests/fixtures/golden_queries.yaml
+```
+
+Queries live in `tests/fixtures/golden_queries.yaml`: each entry has a `query` string and an
+`expect_path_or_uri` (a single path/URI, or a list when more than one note could legitimately
+answer it). The file ships with three example queries; populate it with your own 15–20 real
+queries against your corpus. The gate is **15 of 20 queries hitting the expected note within the
+top 5 results** — below `gate.minimum_queries` (15) the gate is void and the script exits `3`
+rather than reporting a failure. Record the resulting ratio in the spec doc's baseline table.
+
 Releases are automated by [release-please](https://github.com/googleapis/release-please) from
 Conventional Commits (`feat:`, `fix:`, `chore:`, …). Merging the release PR it maintains bumps the
 version and publishes a GitHub Release — do not edit versions by hand.
@@ -544,6 +730,18 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
   bounded by query effort rather than refused. Recovering the corpus itself is a `pg_dump`/restore
   concern, not an API one. There is no `UPDATE` or `DELETE` route either — a document changes only
   by re-ingesting it whole.
+
+- **`/api/v2/search` has no semantic/vector branch yet.** It is FTS only (`websearch_to_tsquery`
+  + `ts_rank_cd`); vector search and rank fusion arrive in a later slice.
+- **`/api/v1` and `/api/v2` are two separate, unconverted storage models.** `/api/v1` and the
+  `learnings` table still exist and are unchanged, with no data migration to `/api/v2`: the
+  existing `learnings` rows are overlapping 1000-character fragments with no frontmatter and
+  cannot be converted into notes — moving to `/api/v2` means re-ingesting from source.
+- **Changing the FTS configuration or weights forces a full re-ingest**, because `tsv` is
+  materialized at ingest time, not computed on the fly.
+- **A note whose source file was deleted is not removed automatically.**
+  `DELETE /api/v2/notes/{id}` is the only erasure path; reconciling notes against a source tree
+  is a follow-up, not something this slice does.
 
 Contributions addressing any of the above are welcome.
 
