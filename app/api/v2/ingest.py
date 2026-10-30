@@ -26,8 +26,11 @@ router = APIRouter()
 MAX_CONTENT_CHARS = 500_000
 
 # Unlike v1, this route takes a JSON body (not Form(...) fields), so there is
-# no Starlette per-form-field byte limit firing ahead of this check. That
-# means MAX_CONTENT_CHARS below is the only size limit that actually applies.
+# no Starlette per-form-field byte limit firing ahead of this check.
+# app.core.body_limit.BodySizeLimitMiddleware bounds the raw request bytes
+# before the body is ever buffered or parsed, including for unauthenticated
+# clients; MAX_CONTENT_CHARS below is a separate, later check that bounds the
+# decoded character count once the JSON body has been parsed.
 
 _URI_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://")
 
