@@ -80,7 +80,7 @@ def normalised_body(content: str) -> str:
 
 class TestConstants:
     def test_the_published_constants_are_the_agreed_values(self):
-        assert SPLITTER_VERSION == "2"
+        assert SPLITTER_VERSION == "3"
         assert TARGET_CHARS == 1_500
         assert MAX_CHARS == 4_000
         assert MIN_SECTION_CHARS == 300
@@ -356,17 +356,19 @@ class TestSectioning:
         # The short section does not get a passage of its own.
         assert all(p.heading_path != "Tiny" for p in result.passages)
 
-    def test_when_every_section_is_short_the_first_heading_path_is_kept(self):
-        # Every section is individually under MIN_SECTION_CHARS, yet the body
-        # as a whole is over TARGET_CHARS, so the section branch is taken and
-        # the first section has no "next" unit to merge forward into.
+    def test_a_run_of_short_sections_is_grouped_without_mislabelling(self):
+        # Every section is under MIN_SECTION_CHARS but the body is over
+        # TARGET_CHARS, so the section branch runs and the first section has no
+        # "next" unit. Full contract: tests/test_splitter_short_sections.py.
         filler = "Just under the merge floor, so this section cannot stand. " * 4
         assert len(filler) < MIN_SECTION_CHARS
         body = "\n\n".join(f"## Section {n}\n\n{filler}" for n in range(1, 8))
         assert len(body) > TARGET_CHARS
         result = split_note(body)
-        assert len(result.passages) == 1
         assert result.passages[0].heading_path == "Section 1"
+        for passage in result.passages:
+            assert len(passage.content) <= TARGET_CHARS
+            assert f"## {passage.heading_path}" in passage.content  # own label
 
 
 class TestDegenerateInput:
