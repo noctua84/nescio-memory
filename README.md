@@ -701,7 +701,9 @@ is **additive** to these defaults, so adding an unrelated exclusion never silent
 them; `--no-default-excludes` is the explicit, visible way to drop them. `--force` passes
 `force: true` on every file, so an unchanged file is re-split and re-embedded rather than
 skipped — useful after a model change the pipeline version does not see. `--dry-run` lists what
-would be posted and makes no HTTP call.
+would be posted and makes no HTTP call. `--url` must point at an allowed host (`localhost`,
+`127.0.0.1`, `::1` by default); extend the allowlist with the comma-separated
+`NESCIO_ALLOWED_HOSTS` environment variable.
 
 ### Measuring retrieval quality
 
@@ -720,6 +722,8 @@ answer it). The file ships with three example queries; populate it with your own
 queries against your corpus. The gate is **15 of 20 queries hitting the expected note within the
 top 5 results** — below `gate.minimum_queries` (15) the gate is void and the script exits `3`
 rather than reporting a failure. Record the resulting ratio in the spec doc's baseline table.
+`--url` must point at an allowed host (`localhost`, `127.0.0.1`, `::1` by default); extend the
+allowlist with the comma-separated `NESCIO_ALLOWED_HOSTS` environment variable.
 
 Releases are automated by [release-please](https://github.com/googleapis/release-please) from
 Conventional Commits (`feat:`, `fix:`, `chore:`, …). Merging the release PR it maintains bumps the

@@ -9,6 +9,12 @@ Invoked with -m, not as a path: `python scripts/eval_queries.py` puts scripts/
 on sys.path instead of the repository root, so `import app`-style imports
 (none here, but keep the convention) would fail.
 
+--url must point at an allowed host: localhost, 127.0.0.1 and ::1 by
+default, extended via the comma-separated NESCIO_ALLOWED_HOSTS environment
+variable. This exists so a crafted --url cannot exfiltrate the X-API-Key
+header to an arbitrary host. --queries must resolve to an existing .yaml/
+.yml file, so a crafted path cannot make the script read an arbitrary file.
+
 Loads tests/fixtures/golden_queries.yaml (or --queries), POSTs each query to
 `{url}/api/v2/search`, and reports hits@top_k against the file's gate. The
 gate is "15 of 20 queries hit in the top 5" by default; the recorded score is
@@ -31,6 +37,8 @@ from dataclasses import dataclass
 
 import httpx
 import yaml
+
+from scripts._cli_safety import validate_base_url, validate_queries_path
 
 EXIT_PASS = 0
 EXIT_FAIL = 1
@@ -63,9 +71,18 @@ class GoldenQueries:
 
 
 def load_queries(path: str) -> GoldenQueries:
-    """Load and validate the golden-queries YAML. Raises QueriesFileError."""
+    """Load and validate the golden-queries YAML. Raises QueriesFileError.
+
+    Validates the path itself first (must resolve to an existing .yaml/.yml
+    file) so a crafted --queries cannot make this open() an arbitrary file.
+    """
     try:
-        with open(path, encoding="utf-8") as f:
+        safe_path = validate_queries_path(path)
+    except ValueError as exc:
+        raise QueriesFileError(str(exc)) from exc
+
+    try:
+        with open(safe_path, encoding="utf-8") as f:
             raw = yaml.safe_load(f)
     except yaml.YAMLError as exc:
         raise QueriesFileError(f"{path}: not valid YAML ({exc})") from exc
@@ -138,9 +155,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--api-key", required=True, help="API key sent as X-API-Key.")
     parser.add_argument(
-        "--queries", default="tests/fixtures/golden_queries.yaml", help="Path to the golden-queries YAML."
+        "--queries",
+        default="tests/fixtures/golden_queries.yaml",
+        help="Path to the golden-queries YAML. Must be an existing .yaml/.yml file.",
     )
-    parser.add_argument("--url", default="http://localhost:8080", help="Base URL of the running service.")
+    parser.add_argument(
+        "--url",
+        default="http://localhost:8080",
+        help=(
+            "Base URL of the running service. Host must be on the allowlist "
+            "(localhost, 127.0.0.1, ::1 by default; extend via the "
+            "NESCIO_ALLOWED_HOSTS environment variable, comma-separated)."
+        ),
+    )
     parser.add_argument("--repo-filter", default=None, help="Optional scope filter forwarded to the search.")
     parser.add_argument("--top-k", type=int, default=None, help="Overrides gate.top_k from the YAML.")
     parser.add_argument("--json", action="store_true", help="Emit a single JSON object instead of text.")
@@ -149,6 +176,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+
+    try:
+        base_url = validate_base_url(args.url)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
 
     try:
         golden = load_queries(args.queries)
@@ -185,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     per_query: list[dict] = []
 
     try:
-        with httpx.Client(base_url=args.url, headers=headers, timeout=30.0) as client:
+        with httpx.Client(base_url=base_url, headers=headers, timeout=30.0) as client:
             for golden_query in golden.queries:
                 payload: dict = {"q": golden_query.query, "top_k": top_k}
                 if args.repo_filter:

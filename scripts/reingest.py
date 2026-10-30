@@ -7,6 +7,11 @@
 Invoked with -m, not as a path: `python scripts/reingest.py` puts scripts/ on
 sys.path instead of the repository root, so `import app` fails.
 
+--url must point at an allowed host: localhost, 127.0.0.1 and ::1 by
+default, extended via the comma-separated NESCIO_ALLOWED_HOSTS environment
+variable. This exists so a crafted --url cannot exfiltrate the X-API-Key
+header to an arbitrary host.
+
 Exit codes: 0 nothing failed, 1 one or more files failed to ingest, 2 a
 usage or IO error (for example an unreadable --root).
 """
@@ -21,6 +26,8 @@ from pathlib import Path
 from typing import Sequence
 
 import httpx
+
+from scripts._cli_safety import validate_base_url
 
 # These two defaults are not a convenience -- they are a retrieval-quality
 # requirement. MEMORY.md is a generated index of other notes' descriptions
@@ -109,7 +116,15 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=None,
         help="API key sent as the X-API-Key header. Falls back to the NESCIO_API_KEY environment variable.",
     )
-    parser.add_argument("--url", default="http://localhost:8080", help="Base URL of the memory service.")
+    parser.add_argument(
+        "--url",
+        default="http://localhost:8080",
+        help=(
+            "Base URL of the memory service. Host must be on the allowlist "
+            "(localhost, 127.0.0.1, ::1 by default; extend via the "
+            "NESCIO_ALLOWED_HOSTS environment variable, comma-separated)."
+        ),
+    )
     parser.add_argument("--scope", default="", help="scope value sent with every ingest request.")
     parser.add_argument(
         "--exclude",
@@ -196,6 +211,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: --root is not a directory: {root}", file=sys.stderr)
         return EXIT_USAGE_ERROR
 
+    try:
+        base_url = validate_base_url(args.url)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE_ERROR
+
     excludes = resolve_excludes(args.exclude, use_defaults=not args.no_default_excludes)
 
     try:
@@ -225,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_USAGE_ERROR
 
-    ingest_url = f"{args.url.rstrip('/')}/api/v2/ingest"
+    ingest_url = f"{base_url}/api/v2/ingest"
 
     ingested = skipped = failed = 0
     total_passages = 0
