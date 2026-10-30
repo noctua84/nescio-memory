@@ -7,11 +7,13 @@ is 1.0, and similarity is reported as 1 - distance.
 import math
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import text
 
 from app.api.v1 import search as search_module
 from app.config import settings
 from app.repositories.learning import LearningRepository
+from app.schemas.search import SearchRequest
 from tests.factories import make_api_key, make_learning
 from tests.fakes import fake_embedding, unit_vector
 
@@ -157,6 +159,184 @@ def test_top_k_above_the_schema_maximum_is_rejected(client, db_session):
     assert response.status_code == 422
 
 
+# --- #56: a blank query is the caller's error, not the backend's ---
+#
+# A query of only whitespace carries nothing to search for, and it used to be
+# handed straight to the embedding backend. When that backend answers with a
+# zero-norm vector, _validated() (app/core/embeddings.py) reports 503 with a
+# Retry-After -- telling the caller the service is temporarily unwell and
+# inviting a retry that cannot ever succeed, because the request itself is what
+# is wrong. SearchRequest.query therefore rejects a blank query at validation
+# time, which FastAPI renders as a 422, and the embedder is never reached.
+#
+# Two halves to the contract, and both matter: the 422 (what the caller is
+# told) and the un-called embedder (that no network request is made and no 503
+# can be produced). A test asserting only the status code would pass for an
+# implementation that embedded first and mapped the failure to 422 afterwards.
+
+# Every one of these is "" after str.strip(). The non-breaking space is in the
+# list on purpose and was checked against CPython rather than assumed:
+# " ".strip() == "", because str.strip() with no argument strips by
+# str.isspace() and U+00A0 is whitespace there -- unlike bytes.strip() or a
+# C-locale isspace, which would leave it. So it is blank by this validator's
+# own rule and must be refused like any other blank. U+200B (zero-width space)
+# is deliberately NOT here: str.strip() does not remove it, so it is a
+# non-blank query by the same rule and belongs with " a " below.
+BLANK_QUERIES = [
+    pytest.param("", id="empty"),
+    pytest.param(" ", id="one-space"),
+    pytest.param("   ", id="several-spaces"),
+    pytest.param("\n\t", id="newline-and-tab"),
+    pytest.param("\r\f\v", id="carriage-return-formfeed-vtab"),
+    pytest.param(" ", id="non-breaking-space"),
+    pytest.param(" \t\n  ", id="mixed-whitespace"),
+]
+
+
+@pytest.fixture
+def recorded_embedder(client, monkeypatch):
+    """The query embedder, replaced by one that records what it is asked for.
+
+    Depends on `client` so this patch lands AFTER the client fixture's own
+    monkeypatch of the same attribute -- otherwise the fake would overwrite the
+    recorder and the call list would stay empty no matter what happened, which
+    is a test that can only pass. Returns the list of query strings, in order,
+    so a test can assert both that it stayed empty and what it received.
+    """
+    calls: list[str] = []
+
+    def _record(text: str) -> list[float]:
+        calls.append(text)
+        return fake_embedding(text)
+
+    monkeypatch.setattr(search_module, "get_embedding", _record)
+    return calls
+
+
+def _query_errors(response) -> list[dict]:
+    """The validation errors FastAPI reported against the `query` field.
+
+    Selected by loc rather than by position, because the 422 body is a list and
+    nothing promises this field's error is first in it.
+    """
+    return [
+        error
+        for error in response.json()["detail"]
+        if error.get("loc") and error["loc"][-1] == "query"
+    ]
+
+
+@pytest.mark.parametrize("query", BLANK_QUERIES)
+def test_a_blank_query_is_rejected_as_a_validation_error(client, db_session, query):
+    # 422, and an error the caller can act on: located at `query`, so a client
+    # library can point at the offending field, and saying what is wrong with
+    # it. The message is matched on "non-whitespace" rather than compared whole
+    # -- pydantic prefixes its own "Value error, " and that prefix is pydantic's
+    # to change, while the substance of the sentence is this project's.
+    key = make_api_key(db_session, "acme")
+
+    response = client.post(
+        "/api/v1/search",
+        json={"query": query, "top_k": 5},
+        headers={"X-API-Key": key},
+    )
+
+    assert response.status_code == 422
+    errors = _query_errors(response)
+    assert len(errors) == 1
+    assert "non-whitespace characters" in errors[0]["msg"]
+
+
+@pytest.mark.parametrize("query", BLANK_QUERIES)
+def test_a_blank_query_never_reaches_the_embedder(
+    client, db_session, recorded_embedder, query
+):
+    # The half of #56 that the status code cannot show. The 503-with-Retry-After
+    # this issue is about is produced by the embedding path, so the fix is only
+    # a fix if that path is not entered at all: no network request, no
+    # zero-norm vector, nothing for _validated() to refuse. Asserted as an
+    # empty call list rather than as "not called with this query", because an
+    # implementation that embedded a stripped or substituted string would still
+    # be making the request this test exists to prevent.
+    key = make_api_key(db_session, "acme")
+
+    response = client.post(
+        "/api/v1/search",
+        json={"query": query, "top_k": 5},
+        headers={"X-API-Key": key},
+    )
+
+    assert response.status_code == 422
+    assert recorded_embedder == []
+
+
+def test_a_non_blank_query_keeps_its_surrounding_whitespace(
+    client, db_session, recorded_embedder
+):
+    """The validator rejects; it does not normalise.
+
+    `" a "` has a non-empty strip() and so is a legitimate query, and what the
+    embedder receives must be the caller's own string -- not the stripped one.
+    The temptation when writing this validator is to `return value.strip()`,
+    which would pass every blank-rejection test above while silently rewriting
+    every other query in the system; the embedding of " a " is a different
+    vector from the embedding of "a", so that rewrite changes which rows a
+    caller gets back. This is the test that distinguishes the two, and it is
+    why the validator's own comment says "no stripping".
+    """
+    key = make_api_key(db_session, "acme")
+
+    response = client.post(
+        "/api/v1/search",
+        json={"query": " a ", "top_k": 5},
+        headers={"X-API-Key": key},
+    )
+
+    assert response.status_code == 200
+    assert recorded_embedder == [" a "]
+
+
+def test_a_zero_width_space_is_not_whitespace_to_strip(
+    client, db_session, recorded_embedder
+):
+    # The boundary of the rule, from the other side. str.strip() does not
+    # remove U+200B, so this query is non-blank under the validator's own
+    # definition and must be accepted and forwarded unchanged. Here to pin the
+    # rule as "str.strip() is empty" rather than some wider notion of
+    # "looks blank", which would be a different (and unimplemented) contract.
+    key = make_api_key(db_session, "acme")
+
+    response = client.post(
+        "/api/v1/search",
+        json={"query": "​", "top_k": 5},
+        headers={"X-API-Key": key},
+    )
+
+    assert response.status_code == 200
+    assert recorded_embedder == ["​"]
+
+
+@pytest.mark.parametrize("query", BLANK_QUERIES)
+def test_the_schema_itself_rejects_a_blank_query(query):
+    # The same guard at the layer that owns it, with no app, no database and no
+    # API key in the way. The endpoint tests above would also pass if the
+    # rejection came from a route-level check; asserting on SearchRequest says
+    # the rule travels with the schema, so any other caller of it -- a future
+    # endpoint, a background job -- gets it too.
+    with pytest.raises(ValidationError) as caught:
+        SearchRequest(query=query)
+
+    errors = caught.value.errors()
+    assert [error["loc"] for error in errors] == [("query",)]
+    assert "non-whitespace characters" in errors[0]["msg"]
+
+
+def test_the_schema_accepts_a_query_that_is_only_padded():
+    # And the accepted case at the same layer, unstripped. Without this, every
+    # assertion above is satisfied by a validator that rejects everything.
+    assert SearchRequest(query=" a ").query == " a "
+
+
 # --- #42 self-distance: what pgvector really does with a zero-norm vector ---
 #
 # These are the premise tests app/core/embeddings.py's comments point at by
@@ -169,16 +349,20 @@ def test_top_k_above_the_schema_maximum_is_rejected(client, db_session):
 #
 #   1. a vector whose float4 norm is zero has an UNDEFINED cosine distance,
 #      reported as NaN, even against ITSELF. That self-distance is pgvector's
-#      own definition of "this stored vector has zero norm", and it is what
-#      search()'s `self_distance != NaN` clause keys off.
+#      own definition of "this stored vector has zero norm", and it is the
+#      expression the STORED generated column `embedding_degenerate`
+#      (`(embedding <=> embedding) = 'NaN'`) is computed with -- which is
+#      what search()'s `embedding_degenerate IS false` clause reads. The
+#      question is the same one; #53 only moved it from once per candidate
+#      per query to once per row at write time.
 #   2. against an ordinary QUERY vector, only the all-zero shape stays NaN.
 #      The others produce an infinite similarity, which pgvector clamps into
 #      [-1, 1] -- so their query-time distance lands at a perfectly finite
 #      0.0 or 2.0 and a query-time `distance != NaN` clause cannot see them.
 #
-# Claim 2 is the reason the self-distance clause exists at all. If a future
-# pgvector stopped clamping, or returned 0 for claim 1, these tests are what
-# would say so rather than leaving a filter quietly matching nothing.
+# Claim 2 is the reason the stored flag exists at all. If a future pgvector
+# stopped clamping, or returned 0 for claim 1, these tests are what would say
+# so rather than leaving a filter quietly matching nothing.
 
 # Subnormal in float4 (below FLOAT32_MIN_NORMAL, 1.17549435e-38) and a
 # perfectly ordinary nonzero float64.
@@ -248,14 +432,16 @@ def _cosine_distance(connection, left: list[float], right: list[float]) -> float
 
 @pytest.mark.parametrize("vector", ZERO_NORM_STORED_VECTORS)
 def test_42_self_distance_of_a_zero_norm_vector_is_nan(connection, vector):
-    # Claim 1, and the clause it justifies: `v <=> v` is the friendliest
+    # Claim 1, and the generated column it justifies: `v <=> v` is the friendliest
     # question that can be asked of a vector -- identical operands, so any
     # nonzero norm gives exactly 0 -- and every one of these answers NaN,
     # because cosine distance divides by a norm that float4 evaluates as zero.
-    # That is why search() can ask the question of the STORED column alone,
-    # without reference to the query. Asserted as a float that is NaN rather
-    # than merely "not 0": a NULL or a raised error would be a different
-    # defect with different handling, and `!= 0` would admit both.
+    # That is why the question can be settled from the STORED column alone,
+    # without reference to the query, and so can be frozen into the generated
+    # `embedding_degenerate` column that search() filters on. Asserted as a
+    # float that is NaN rather than merely "not 0": a NULL or a raised error
+    # would be a different defect with different handling, and `!= 0` would
+    # admit both.
     distance = _cosine_distance(connection, vector, vector)
     assert isinstance(distance, float)
     assert math.isnan(distance)
@@ -289,7 +475,7 @@ def test_42_a_stored_all_zero_vector_is_nan_against_any_query(connection, query)
 def test_42_a_stored_zero_norm_vector_is_not_nan_against_an_ordinary_query(
     connection, vector
 ):
-    """Claim 2: why the self-distance clause is not redundant.
+    """Claim 2: why the stored degenerate flag is not redundant.
 
     These three shapes have a zero float4 norm -- the self-distance test above
     says so -- and yet their distance against an ordinary query is NOT NaN.
@@ -300,12 +486,13 @@ def test_42_a_stored_zero_norm_vector_is_not_nan_against_an_ordinary_query(
     reads as a PERFECT MATCH, and 2.0 for a negative one.
 
     This is measured rather than reasoned about, and it is the premise the
-    clause rests on: a query-time `distance != NaN` filter cannot see any of
-    these rows, so without the stored-row self-distance clause they would be
-    returned and ranked first. Pinned exactly (0.0 and 2.0, not merely "not
-    NaN") because the clamping is what produces those two values; a pgvector
-    that stopped clamping would hand back +-Inf, which is a different
-    serialisation problem and should fail here rather than pass quietly.
+    flag rests on: a query-time `distance != NaN` filter cannot see any of
+    these rows, so without the stored `embedding_degenerate` clause they
+    would be returned and ranked first. Pinned exactly (0.0 and 2.0, not
+    merely "not NaN") because the clamping is what produces those two
+    values; a pgvector that stopped clamping would hand back +-Inf, which is
+    a different serialisation problem and should fail here rather than pass
+    quietly.
     """
     positive = [0.01] * settings.embedding_dimension
     negative = [-0.01] * settings.embedding_dimension
@@ -321,9 +508,10 @@ def test_42_a_stored_zero_norm_vector_is_not_nan_against_an_ordinary_query(
 
 def test_42_self_distance_of_an_ordinary_vector_is_zero(connection):
     # The control, without which every assertion above would be satisfied by a
-    # pgvector that returned NaN for everything -- and the `!= NaN` filter in
-    # search() would then be excluding every row in the table while the
-    # premise tests stayed green. Exact rather than approximate: identical
+    # pgvector that returned NaN for everything -- `embedding_degenerate`
+    # would then be true for every row in the table, and search()'s
+    # `embedding_degenerate IS false` clause would exclude all of them while
+    # the premise tests stayed green. Exact rather than approximate: identical
     # operands of nonzero norm are distance 0, and orthogonal unit vectors are
     # distance 1, which is the arithmetic the ranking tests above rely on.
     assert _cosine_distance(connection, unit_vector(0), unit_vector(0)) == 0.0
@@ -335,11 +523,12 @@ def test_42_self_distance_of_an_ordinary_vector_is_zero(connection):
 # _validated() refuses to let one in through ingest, but rows predating that
 # check -- or written by any other path -- are already in the table, and
 # float4 can flatten a vector that looked fine in float64 on the way in. So
-# search() carries its own guard on the stored row's self-distance. These
-# tests seed such a row directly through the factory, which bypasses
-# _validated() exactly as a pre-existing row does, and they cover every
-# degenerate shape: the all-zero one, which is NaN at query time too, and the
-# three that are not and therefore need the self-distance clause.
+# search() carries its own guard on the stored row: `embedding_degenerate IS
+# false`, reading the generated column that froze the row's self-distance at
+# write time (#53). These tests seed such a row directly through the factory,
+# which bypasses _validated() exactly as a pre-existing row does, and they
+# cover every degenerate shape: the all-zero one, which is NaN at query time
+# too, and the three that are not and therefore need the stored flag.
 
 
 def _zero_norm_row(
@@ -531,7 +720,7 @@ OFF_AXIS_UNIT_VECTOR = [
 def test_a_stored_zero_norm_row_does_not_outrank_a_genuinely_relevant_one(
     client, db_session, query_on_axis, vector
 ):
-    """The harm the self-distance clause actually prevents, stated as ranking.
+    """The harm the degenerate-flag clause actually prevents, as ranking.
 
     This is the case a query-time `distance != NaN` filter could not see at
     all. These stored shapes have a zero float4 norm and a NONZERO dot product
