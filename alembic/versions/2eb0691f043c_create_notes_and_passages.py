@@ -1,7 +1,7 @@
 """create notes and passages
 
 Revision ID: 2eb0691f043c
-Revises: 57cfbdfa0d6a
+Revises: 9439c6362bb3
 Create Date: 2026-10-29 00:00:00.000000
 
 Adds the v2 storage model alongside the untouched `learnings` table: `notes`
@@ -25,7 +25,7 @@ from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 
 # revision identifiers, used by Alembic.
 revision: str = '2eb0691f043c'
-down_revision: Union[str, Sequence[str], None] = '57cfbdfa0d6a'
+down_revision: Union[str, Sequence[str], None] = '9439c6362bb3'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
