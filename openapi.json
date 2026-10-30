@@ -100,6 +100,193 @@
         ]
       }
     },
+    "/api/v2/search": {
+      "post": {
+        "tags": [
+          "Search v2"
+        ],
+        "summary": "Keyword and phrase search over passages",
+        "description": "Full-text search over note passages using websearch_to_tsquery (phrases, words, exclusions). Returns individual matching passages, never whole notes, ranked by ts_rank_cd. A query that reduces to an empty tsquery (stop words only, or pure punctuation) legitimately returns an empty result list with a 200, not an error.",
+        "operationId": "searchPassagesV2",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchV2Request"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchV2Response"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v2/ingest": {
+      "post": {
+        "tags": [
+          "Ingest v2"
+        ],
+        "summary": "Ingest a note",
+        "description": "Splits Markdown content into heading-aware passages, embeds them, and upserts the note and its passages. Skips re-splitting and re-embedding when the content and pipeline version are unchanged, unless force=True.",
+        "operationId": "ingestNoteV2",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestV2Request"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestV2Response"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v2/notes/{note_id}": {
+      "get": {
+        "tags": [
+          "Notes v2"
+        ],
+        "summary": "Get a note by id",
+        "description": "Fetch one note and its passage count. Returns 404 for a note that does not exist and for another tenant's note alike -- see the module docstring.",
+        "operationId": "getNoteV2",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "note_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Note Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NoteV2Response"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such note for this client."
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Notes v2"
+        ],
+        "summary": "Delete a note and its passages",
+        "description": "Delete one note. Its passages go with it via cascade. Returns 404 for a note that does not exist and for another tenant's note alike -- see the module docstring.",
+        "operationId": "deleteNoteV2",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "note_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Note Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "No such note for this client."
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "tags": [
@@ -258,6 +445,262 @@
         ],
         "title": "IngestResponse"
       },
+      "IngestV2Request": {
+        "properties": {
+          "scope": {
+            "type": "string",
+            "maxLength": 512,
+            "title": "Scope",
+            "description": "Scope to organize notes within a tenant. Accepts both 'scope' and 'repo_name' aliases for backwards compatibility.",
+            "default": "",
+            "examples": [
+              "project-a",
+              ""
+            ]
+          },
+          "path_or_uri": {
+            "type": "string",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Path Or Uri",
+            "description": "Unique path or URI of the note within its scope.",
+            "examples": [
+              "docs/architecture/adr-001.md"
+            ]
+          },
+          "content": {
+            "type": "string",
+            "title": "Content",
+            "description": "Full markdown content of the note."
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status",
+            "description": "Optional status label for the note (e.g., 'draft', 'approved', 'superseded').",
+            "examples": [
+              "approved"
+            ]
+          },
+          "meta": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Meta",
+            "description": "Optional metadata dictionary for the note."
+          },
+          "force": {
+            "type": "boolean",
+            "title": "Force",
+            "description": "Re-split, re-embed and rewrite this note's passages even when the content hash and pipeline version both match. The escape hatch for a change the pipeline version cannot see -- most plausibly a re-pulled embedding model behind an unchanged backend name and dimension.",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "path_or_uri",
+          "content"
+        ],
+        "title": "IngestV2Request",
+        "description": "Request to ingest a note with passages."
+      },
+      "IngestV2Response": {
+        "properties": {
+          "note_id": {
+            "type": "integer",
+            "title": "Note Id",
+            "description": "ID of the ingested note."
+          },
+          "passages": {
+            "type": "integer",
+            "title": "Passages",
+            "description": "Number of passages now stored for this note."
+          },
+          "skipped": {
+            "type": "boolean",
+            "title": "Skipped",
+            "description": "True when the skip fired (content unchanged and force=False); always False under force."
+          }
+        },
+        "type": "object",
+        "required": [
+          "note_id",
+          "passages",
+          "skipped"
+        ],
+        "title": "IngestV2Response",
+        "description": "Response after ingesting a note."
+      },
+      "NoteV2Response": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id",
+            "description": "Unique identifier for the note."
+          },
+          "scope": {
+            "type": "string",
+            "title": "Scope",
+            "description": "Scope to organize notes within a tenant.",
+            "examples": [
+              "project-a",
+              ""
+            ]
+          },
+          "path_or_uri": {
+            "type": "string",
+            "title": "Path Or Uri",
+            "description": "Unique path or URI of the note within its scope.",
+            "examples": [
+              "docs/architecture/adr-001.md"
+            ]
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name",
+            "description": "Optional human-readable name extracted from frontmatter.",
+            "examples": [
+              "ADR-001: Use PostgreSQL"
+            ]
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Optional summary from frontmatter. Used in search at FTS weight C."
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type",
+            "description": "Optional type classification from frontmatter (e.g., 'adr', 'design-doc').",
+            "examples": [
+              "adr"
+            ]
+          },
+          "provenance_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provenance Kind",
+            "description": "Optional provenance source kind (e.g., 'user override', 'empirical', 'agent inference').",
+            "examples": [
+              "user override"
+            ]
+          },
+          "provenance_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provenance Date",
+            "description": "Optional date associated with provenance."
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status",
+            "description": "Optional status label (e.g., 'approved', 'superseded').",
+            "examples": [
+              "approved"
+            ]
+          },
+          "content_hash": {
+            "type": "string",
+            "title": "Content Hash",
+            "description": "Hash of the note content, used to detect changes."
+          },
+          "pipeline_version": {
+            "type": "string",
+            "title": "Pipeline Version",
+            "description": "Version identifier combining splitter, FTS composition, embedding-input composition, and embedding backend+dimension."
+          },
+          "body": {
+            "type": "string",
+            "title": "Body",
+            "description": "Full markdown content of the note."
+          },
+          "meta": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Meta",
+            "description": "Optional metadata dictionary."
+          },
+          "passage_count": {
+            "type": "integer",
+            "title": "Passage Count",
+            "description": "Number of passages this note has been split into."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Timestamp when the note was created."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At",
+            "description": "Timestamp when the note was last updated."
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "scope",
+          "path_or_uri",
+          "content_hash",
+          "pipeline_version",
+          "body",
+          "meta",
+          "passage_count",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "NoteV2Response",
+        "description": "Response containing a note and its passage count."
+      },
       "SearchRequest": {
         "properties": {
           "query": {
@@ -379,6 +822,199 @@
           "similarity"
         ],
         "title": "SearchResult"
+      },
+      "SearchV2Request": {
+        "properties": {
+          "q": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Q",
+            "description": "Full-text search query. Accepts both 'q' and 'query' aliases.",
+            "examples": [
+              "invoice-first checkout"
+            ]
+          },
+          "top_k": {
+            "type": "integer",
+            "maximum": 50,
+            "minimum": 1,
+            "title": "Top K",
+            "description": "Maximum number of passages to return.",
+            "default": 5
+          },
+          "repo_filter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repo Filter",
+            "description": "Optional filter on the note's scope.",
+            "examples": [
+              "project-a"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "q"
+        ],
+        "title": "SearchV2Request",
+        "description": "Request to search notes and passages."
+      },
+      "SearchV2Response": {
+        "properties": {
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/SearchV2Result"
+            },
+            "type": "array",
+            "title": "Results",
+            "description": "List of passages matching the search query, ordered by relevance."
+          }
+        },
+        "type": "object",
+        "required": [
+          "results"
+        ],
+        "title": "SearchV2Response",
+        "description": "Response containing search results."
+      },
+      "SearchV2Result": {
+        "properties": {
+          "passage_id": {
+            "type": "integer",
+            "title": "Passage Id",
+            "description": "Unique identifier for the passage."
+          },
+          "note_id": {
+            "type": "integer",
+            "title": "Note Id",
+            "description": "Unique identifier of the note this passage belongs to."
+          },
+          "ordinal": {
+            "type": "integer",
+            "title": "Ordinal",
+            "description": "Position of this passage within the note."
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name",
+            "description": "Optional name of the note from frontmatter."
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Optional description of the note from frontmatter. Contributes to FTS ranking at weight C."
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type",
+            "description": "Optional type classification from note frontmatter."
+          },
+          "path_or_uri": {
+            "type": "string",
+            "title": "Path Or Uri",
+            "description": "Unique path or URI of the note within its scope."
+          },
+          "heading_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heading Path",
+            "description": "Optional heading hierarchy path within the note.",
+            "examples": [
+              "## Architecture > ### API Design"
+            ]
+          },
+          "content": {
+            "type": "string",
+            "title": "Content",
+            "description": "The passage text."
+          },
+          "provenance_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provenance Kind",
+            "description": "Optional provenance source kind from the note."
+          },
+          "provenance_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provenance Date",
+            "description": "Optional date associated with provenance from the note."
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status",
+            "description": "Optional status label from the note."
+          },
+          "rank": {
+            "type": "number",
+            "title": "Rank",
+            "description": "Relevance score from full-text search (higher is more relevant)."
+          }
+        },
+        "type": "object",
+        "required": [
+          "passage_id",
+          "note_id",
+          "ordinal",
+          "path_or_uri",
+          "content",
+          "rank"
+        ],
+        "title": "SearchV2Result",
+        "description": "A passage result from a search query."
       },
       "ValidationError": {
         "properties": {
