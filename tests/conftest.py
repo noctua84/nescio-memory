@@ -63,6 +63,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.api.v1 import ingest as ingest_module  # noqa: E402
 from app.api.v1 import search as search_module  # noqa: E402
+from app.api.v2 import ingest as ingest_v2_module  # noqa: E402
 from app.core.db import get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from tests.fakes import fake_embedding  # noqa: E402
@@ -176,14 +177,22 @@ def db_session(connection):
 def client(db_session, monkeypatch):
     """A TestClient wired to the test transaction, with embeddings faked.
 
-    The patch targets matter. ingest.py and search.py each did
+    The patch targets matter. v1's ingest.py and search.py each did
     `from app.core.embeddings import get_embedding`, which binds the name into
     their own module namespace -- patching app.core.embeddings.get_embedding
     would have no effect on what the endpoints actually call, and the tests
     would quietly make real HTTP requests and hang.
+
+    app/api/v2/ingest.py binds the name into its own namespace the same way, for
+    the same reason, so it needs its own patch: patching
+    app.core.embeddings.get_embedding would be just as ineffective there. There
+    is deliberately no v2 search patch -- app/api/v2/search.py is FTS only in
+    this slice and never embeds, so there is no such name to rebind. Add one if
+    and when it starts embedding; its absence is not an oversight.
     """
     monkeypatch.setattr(ingest_module, "get_embedding", fake_embedding)
     monkeypatch.setattr(search_module, "get_embedding", fake_embedding)
+    monkeypatch.setattr(ingest_v2_module, "get_embedding", fake_embedding)
 
     # get_current_client resolves through Depends(get_db) too, so overriding
     # get_db means a factory-created ApiKey row is immediately visible to

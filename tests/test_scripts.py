@@ -1,0 +1,377 @@
+"""The pure parts of scripts/reingest.py and scripts/eval_queries.py.
+
+No server, no database, no network: every test here builds its own corpus
+under tmp_path or its own YAML file, and the two tests that exercise a code
+path which *could* make an HTTP call install a stub client that raises if it
+is ever constructed. This module therefore passes with no Docker daemon
+running -- it never asks for the `client` or `db_session` fixtures.
+"""
+from pathlib import Path
+
+import httpx
+import pytest
+
+from scripts import eval_queries, reingest
+from scripts.eval_queries import QueriesFileError, load_queries, score
+from scripts.reingest import resolve_excludes, select_files
+
+SHIPPED_GOLDEN_QUERIES = Path(__file__).resolve().parent / "fixtures" / "golden_queries.yaml"
+
+
+class _ExplodingClient:
+    """An httpx.Client stand-in that fails the test if it is ever used.
+
+    Constructed with whatever arguments the real client takes, so the failure
+    is "you made a request" rather than "you called it wrongly".
+    """
+
+    def __init__(self, *args, **kwargs):
+        raise AssertionError("an HTTP client was constructed; no request was expected")
+
+
+def _install_transport(monkeypatch, handler) -> list[httpx.Request]:
+    """Route every request the script makes through ``handler``.
+
+    reingest builds its own ``httpx.Client(timeout=...)``, so the seam is the
+    class: replace it with a factory that drops the real network transport and
+    substitutes an ``httpx.MockTransport``. Returns the list the requests are
+    recorded into, in the order they were made.
+    """
+    seen: list[httpx.Request] = []
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return handler(request)
+
+    transport = httpx.MockTransport(recording)
+    # Bound before patching: reingest does `import httpx`, so the patch below
+    # rebinds the attribute on the shared module object and a later
+    # `httpx.Client(...)` inside the factory would call the factory again.
+    real_client = httpx.Client
+
+    def factory(*args, **kwargs):
+        kwargs.pop("timeout", None)
+        return real_client(*args, transport=transport, **kwargs)
+
+    monkeypatch.setattr(reingest.httpx, "Client", factory)
+    return seen
+
+
+def _ok(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={"skipped": False, "passages": 3})
+
+
+def _write(root: Path, rel: str, text: str = "# note\n\nbody\n") -> Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _corpus(root: Path) -> None:
+    """A corpus with both default-excluded files, one at the top level."""
+    _write(root, "top.md")
+    _write(root, "repo/project/adr/0001-decision.md")
+    _write(root, "context/convention.md")
+    _write(root, "notes/scratch.draft.md")
+    _write(root, "MEMORY.md")
+    _write(root, "learning-log.md")  # top level: the PurePath.match hazard
+    _write(root, "repo/project/MEMORY.md")
+    _write(root, "notes/README.txt")  # not markdown
+
+
+def _selected_rel(root: Path, excludes) -> list[str]:
+    return [path.relative_to(root).as_posix() for path in select_files(root, excludes)]
+
+
+def test_select_files_finds_markdown_recursively(tmp_path):
+    _corpus(tmp_path)
+
+    selected = _selected_rel(tmp_path, [])
+
+    assert "top.md" in selected
+    assert "repo/project/adr/0001-decision.md" in selected
+    assert "context/convention.md" in selected
+    # Only *.md, at any depth.
+    assert "notes/README.txt" not in selected
+    assert all(name.endswith(".md") for name in selected)
+
+
+def test_the_default_excludes_drop_memory_indexes_and_the_learning_log(tmp_path):
+    _corpus(tmp_path)
+
+    selected = _selected_rel(tmp_path, resolve_excludes([], use_defaults=True))
+
+    assert "MEMORY.md" not in selected
+    assert "repo/project/MEMORY.md" not in selected
+    # The top-level ledger is the case PurePath.match("**/learning-log.md")
+    # does not cover on its own.
+    assert "learning-log.md" not in selected
+    assert "repo/project/adr/0001-decision.md" in selected
+
+
+def test_an_explicit_exclude_adds_to_the_defaults_rather_than_replacing_them(tmp_path):
+    _corpus(tmp_path)
+
+    excludes = resolve_excludes(["**/*.draft.md"], use_defaults=True)
+    selected = _selected_rel(tmp_path, excludes)
+
+    # The user's glob took effect ...
+    assert "notes/scratch.draft.md" not in selected
+    # ... and did not displace the defaults.
+    assert "MEMORY.md" not in selected
+    assert "learning-log.md" not in selected
+    assert "repo/project/adr/0001-decision.md" in selected
+
+
+def test_no_default_excludes_admits_the_generated_index_and_the_ledger(tmp_path):
+    _corpus(tmp_path)
+
+    selected = _selected_rel(tmp_path, resolve_excludes([], use_defaults=False))
+
+    assert "MEMORY.md" in selected
+    assert "repo/project/MEMORY.md" in selected
+    assert "learning-log.md" in selected
+
+
+def test_select_files_returns_posix_relative_paths(tmp_path, capsys):
+    _write(tmp_path, "repo/project/adr/0001-decision.md")
+
+    selected = select_files(tmp_path, [])
+
+    # Every selected file is addressable relative to --root, and the relative
+    # form the script derives from it is posix even on a backslash host.
+    rels = [path.relative_to(tmp_path).as_posix() for path in selected]
+    assert rels == ["repo/project/adr/0001-decision.md"]
+    assert all("\\" not in rel for rel in rels)
+
+    # And that is what the script actually reports/sends, not just what the
+    # test can compute from the return value.
+    exit_code = reingest.main(["--root", str(tmp_path), "--dry-run"])
+    stdout = capsys.readouterr().out
+    assert exit_code == 0
+    assert "repo/project/adr/0001-decision.md" in stdout
+    assert "\\" not in stdout
+
+
+def test_dry_run_makes_no_http_call(tmp_path, monkeypatch, capsys):
+    _corpus(tmp_path)
+    monkeypatch.setattr(reingest.httpx, "Client", _ExplodingClient)
+
+    exit_code = reingest.main(
+        ["--root", str(tmp_path), "--api-key", "nm_test_key", "--dry-run"]
+    )
+
+    stdout = capsys.readouterr().out
+    assert exit_code == 0
+    assert "dry run, no HTTP call made" in stdout
+
+
+def test_golden_queries_file_parses():
+    golden = load_queries(str(SHIPPED_GOLDEN_QUERIES))
+
+    assert golden.gate.top_k >= 1
+    assert golden.gate.threshold >= 1
+    assert golden.gate.minimum_queries >= 1
+    assert len(golden.queries) >= 1
+
+
+def test_every_golden_query_has_a_query_and_an_expectation():
+    golden = load_queries(str(SHIPPED_GOLDEN_QUERIES))
+
+    for entry in golden.queries:
+        assert entry.query
+        assert entry.expect_path_or_uri
+        assert all(isinstance(path, str) and path for path in entry.expect_path_or_uri)
+
+
+def test_a_golden_query_missing_its_expectation_is_rejected_by_index(tmp_path):
+    path = tmp_path / "queries.yaml"
+    path.write_text(
+        "version: 1\n"
+        "gate:\n"
+        "  top_k: 5\n"
+        "  threshold: 15\n"
+        "  minimum_queries: 15\n"
+        "queries:\n"
+        "  - query: \"first\"\n"
+        "    expect_path_or_uri: \"a.md\"\n"
+        "  - query: \"second, with no expectation\"\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(QueriesFileError) as exc_info:
+        load_queries(str(path))
+
+    # The index names the offending entry: "one of them is wrong" is not an
+    # actionable error against a 20-query file.
+    assert "queries[1]" in str(exc_info.value)
+    assert "expect_path_or_uri" in str(exc_info.value)
+
+
+def test_score_counts_a_hit_at_rank_five_and_a_miss_at_rank_six():
+    results = [{"path_or_uri": f"filler-{index}.md"} for index in range(6)]
+    results[4] = {"path_or_uri": "wanted.md"}
+
+    assert score(results, "wanted.md", top_k=5) == 5
+
+    # Same corpus, the wanted note one place further down: outside top_k, so
+    # it is a miss rather than a rank-6 hit.
+    results[4] = {"path_or_uri": "filler-4.md"}
+    results[5] = {"path_or_uri": "wanted.md"}
+    assert score(results, "wanted.md", top_k=5) is None
+
+
+def test_score_accepts_a_list_of_acceptable_paths():
+    results = [
+        {"path_or_uri": "unrelated.md"},
+        {"path_or_uri": "second-acceptable.md"},
+    ]
+
+    assert score(results, ["first-acceptable.md", "second-acceptable.md"], top_k=5) == 2
+    assert score(results, ["neither.md", "nor-this.md"], top_k=5) is None
+
+
+def test_an_underpopulated_query_file_reports_the_gate_as_void(monkeypatch, capsys):
+    # The shipped fixture carries placeholders only, fewer than
+    # gate.minimum_queries. That is the expected slice-1 state: exit 3, no
+    # request attempted, and wording that does not read as a failure.
+    monkeypatch.setattr(eval_queries.httpx, "Client", _ExplodingClient)
+
+    exit_code = eval_queries.main(
+        ["--api-key", "nm_test_key", "--queries", str(SHIPPED_GOLDEN_QUERIES)]
+    )
+
+    stdout = capsys.readouterr().out
+    assert exit_code == eval_queries.EXIT_NOT_POPULATED == 3
+    assert "not yet populated" in stdout
+    assert "gate void" in stdout
+    assert "GATE FAIL" not in stdout
+
+
+class TestReingestTransportErrors:
+    """A dead socket on one file must not abandon the rest of the run."""
+
+    def test_a_transport_error_fails_one_file_and_the_run_continues(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        _write(tmp_path, "a-first.md")
+        _write(tmp_path, "b-second.md")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "a-first.md" in request.content.decode("utf-8"):
+                raise httpx.ConnectError("connection refused", request=request)
+            return _ok(request)
+
+        seen = _install_transport(monkeypatch, handler)
+
+        exit_code = reingest.main(
+            ["--root", str(tmp_path), "--api-key", "nm_test_key"]
+        )
+
+        stdout = capsys.readouterr().out
+        # Both files were attempted: the error did not abort the loop.
+        assert len(seen) == 2
+        assert "a-first.md: FAILED transport-error ConnectError: " in stdout
+        assert "b-second.md: ok" in stdout
+        # The summary always prints, and counts the dead file as failed.
+        assert "failed=1" in stdout
+        assert "ingested=1" in stdout
+        assert "considered=2" in stdout
+        assert exit_code == reingest.EXIT_FAILED == 1
+
+    def test_a_transport_error_on_every_file_still_prints_the_summary(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        _write(tmp_path, "one.md")
+        _write(tmp_path, "two.md")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("timed out", request=request)
+
+        _install_transport(monkeypatch, handler)
+
+        exit_code = reingest.main(
+            ["--root", str(tmp_path), "--api-key", "nm_test_key"]
+        )
+
+        stdout = capsys.readouterr().out
+        assert stdout.count("FAILED transport-error ReadTimeout: ") == 2
+        assert "failed=2" in stdout
+        assert "ingested=0" in stdout
+        assert exit_code == 1
+
+
+class TestReingestRetryAfter:
+    """A 503 gets exactly one retry, after a bounded delay."""
+
+    @pytest.mark.parametrize(
+        "retry_after, expected_delay",
+        [
+            # A hostile or misconfigured header is capped, not obeyed.
+            ("86400", reingest.MAX_RETRY_AFTER_S),
+            # Nonsense values fall back to the 5 s default rather than
+            # sleeping a negative or non-finite number of seconds.
+            ("-3", 5.0),
+            ("nan", 5.0),
+            ("inf", 5.0),
+            ("not-a-number", 5.0),
+            # A sane header is honoured exactly.
+            ("2", 2.0),
+            (None, 5.0),
+        ],
+    )
+    def test_the_retry_delay_is_bounded_and_falls_back_safely(
+        self, tmp_path, monkeypatch, capsys, retry_after, expected_delay
+    ):
+        _write(tmp_path, "note.md")
+        delays: list[float] = []
+        monkeypatch.setattr(reingest.time, "sleep", delays.append)
+
+        attempts: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts.append(1)
+            if len(attempts) == 1:
+                headers = {} if retry_after is None else {"Retry-After": retry_after}
+                return httpx.Response(503, text="backend down", headers=headers)
+            return _ok(request)
+
+        _install_transport(monkeypatch, handler)
+
+        exit_code = reingest.main(
+            ["--root", str(tmp_path), "--api-key", "nm_test_key"]
+        )
+
+        stdout = capsys.readouterr().out
+        assert delays == [expected_delay]
+        assert delays[0] <= reingest.MAX_RETRY_AFTER_S
+        # Exactly one retry, and the second response is final.
+        assert len(attempts) == 2
+        assert "note.md: ok" in stdout
+        assert exit_code == reingest.EXIT_OK == 0
+
+    def test_a_second_503_is_final_and_the_file_is_reported_failed(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        _write(tmp_path, "note.md")
+        delays: list[float] = []
+        monkeypatch.setattr(reingest.time, "sleep", delays.append)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                503, text="backend down", headers={"Retry-After": "2"}
+            )
+
+        seen = _install_transport(monkeypatch, handler)
+
+        exit_code = reingest.main(
+            ["--root", str(tmp_path), "--api-key", "nm_test_key"]
+        )
+
+        stdout = capsys.readouterr().out
+        assert delays == [2.0]
+        assert len(seen) == 2  # one retry, not a loop
+        assert "note.md: FAILED 503 backend down" in stdout
+        assert "failed=1" in stdout
+        assert exit_code == 1

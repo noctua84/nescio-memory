@@ -3,7 +3,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.v1.router import api_router
+from app.api.v2.router import api_router as api_router_v2
 from app.config import settings
+from app.core.body_limit import BodySizeLimitMiddleware
 from app.core.db import get_engine
 from app.core.errors import register_exception_handlers
 from app.core.schema_checks import verify_embedding_dimension, verify_pgvector_version
@@ -32,7 +34,15 @@ def create_app() -> FastAPI:
 
     register_exception_handlers(app)
 
+    # Bounds /api/v2 request bytes before FastAPI buffers and parses the JSON
+    # body (which otherwise happens ahead of every dependency, including
+    # auth). Added as ASGI middleware, not a Depends(...), precisely so it
+    # runs before dependency resolution rather than as part of it. v1 is
+    # untouched: it already has Starlette's per-form-field limit.
+    app.add_middleware(BodySizeLimitMiddleware)
+
     app.include_router(api_router, prefix="/api/v1")
+    app.include_router(api_router_v2, prefix="/api/v2")
 
     @app.get("/health", tags=["Ops"])
     def health():
