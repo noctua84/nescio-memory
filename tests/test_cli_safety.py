@@ -66,7 +66,6 @@ def test_the_default_allowlist_is_exactly_the_three_loopback_names():
         ("http://localhost:8080", "http://localhost:8080"),
         ("http://localhost:8080/", "http://localhost:8080"),
         ("https://127.0.0.1", "https://127.0.0.1"),
-        ("http://127.0.0.1:8080/prefix/", "http://127.0.0.1:8080/prefix"),
         # An IPv6 literal has to come back bracketed, or the rebuilt string
         # is not a usable URL (the port would read as another hextet).
         ("http://[::1]:8080/", "http://[::1]:8080"),
@@ -112,6 +111,14 @@ def test_the_hostname_is_matched_case_insensitively():
 def test_a_url_that_is_not_a_plain_allowed_http_url_is_rejected(url):
     with pytest.raises(ValueError):
         validate_base_url(url)
+
+
+def test_a_url_with_a_path_on_an_allowed_host_is_rejected():
+    # A base URL carries no path; this used to be normalised (trailing
+    # slash stripped, path kept) but is now rejected outright so the
+    # returned string never carries any argv-derived path material.
+    with pytest.raises(ValueError):
+        validate_base_url("http://127.0.0.1:8080/prefix/")
 
 
 @pytest.mark.parametrize(

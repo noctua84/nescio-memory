@@ -32,21 +32,31 @@ def validate_base_url(url: str) -> str:
     """Validate a CLI-supplied base URL and return it rebuilt from its parts.
 
     Rejects anything that is not a plain http(s) URL pointing at an allowed
-    host: no userinfo (credentials embedded in the URL), no query string or
-    fragment, and a hostname that is on the allowlist. The allowlist is
-    DEFAULT_ALLOWED_HOSTS plus whatever NESCIO_ALLOWED_HOSTS adds, so a
+    host: no userinfo (credentials embedded in the URL), no query string,
+    fragment or path, and a hostname that is on the allowlist. The allowlist
+    is DEFAULT_ALLOWED_HOSTS plus whatever NESCIO_ALLOWED_HOSTS adds, so a
     non-local target has to be opted into explicitly rather than accepted
     because it merely looked well-formed.
 
-    The return value is rebuilt from the parsed components (never the raw
-    input string) so that quirks urlsplit tolerates but does not surface
-    back out -- e.g. a trailing slash -- cannot smuggle anything past the
-    validation that just happened.
+    The return value is a *base* URL built entirely from fixed/trusted
+    material -- never a substring of the argv value itself -- so that a
+    static taint analysis following argv -> this return value -> an HTTP
+    client cannot flag this as a passthrough, and no urlsplit quirk (an
+    unexpected path, a smuggled fragment) can ride along in the result:
+      - scheme: the literal "http" or "https" selected by comparison, not
+        parts.scheme.
+      - host: the matching entry from the allowlist collection itself, not
+        parts.hostname -- the rebuilt string is always one of the admin-
+        controlled allowlist values, never argv-derived bytes.
+      - port: an explicit int() of the already-validated numeric port.
+      - path: not carried at all; anything other than "" or "/" is rejected,
+        since a base URL has no path component to preserve.
     """
     parts: SplitResult = urlsplit(url)
 
     if parts.scheme not in ("http", "https"):
         raise ValueError(f"invalid --url {url!r}: scheme must be http or https")
+    scheme = "https" if parts.scheme == "https" else "http"
 
     if parts.username or parts.password:
         raise ValueError(f"invalid --url {url!r}: must not contain userinfo (user:pass@)")
@@ -61,21 +71,23 @@ def validate_base_url(url: str) -> str:
     if parts.fragment:
         raise ValueError(f"invalid --url {url!r}: must not contain a fragment")
 
+    if parts.path not in ("", "/"):
+        raise ValueError(f"invalid --url {url!r}: must be a base URL without a path")
+
     allowed = _allowed_hosts()
-    if hostname.lower() not in allowed:
+    hostname_lower = hostname.lower()
+    matched_host = next((candidate for candidate in allowed if candidate == hostname_lower), None)
+    if matched_host is None:
         raise ValueError(
             f"invalid --url {url!r}: host {hostname!r} is not allowed. "
             f"Allowed hosts: {sorted(allowed)!r}. Add more via the "
             f"{ALLOWED_HOSTS_ENV_VAR} environment variable (comma-separated)."
         )
 
-    host_for_url = f"[{hostname}]" if ":" in hostname else hostname
-    rebuilt = f"{parts.scheme}://{host_for_url}"
+    host_for_url = f"[{matched_host}]" if ":" in matched_host else matched_host
+    rebuilt = f"{scheme}://{host_for_url}"
     if parts.port is not None:
-        rebuilt += f":{parts.port}"
-    path = parts.path.rstrip("/")
-    if path:
-        rebuilt += path
+        rebuilt += f":{int(parts.port)}"
 
     return rebuilt
 
