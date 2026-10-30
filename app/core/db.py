@@ -21,6 +21,9 @@ def get_engine() -> Engine:
         # Postgres instances. With pool_pre_ping, a dead database adds this
         # timeout inside request processing.
         connect_args={"connect_timeout": settings.db_connect_timeout_s},
+        # Hide bound SQL parameters: exception strings reach Langfuse span
+        # status_message and logs, and bound parameters include note content.
+        hide_parameters=True,
     )
 
 
