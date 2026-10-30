@@ -53,7 +53,7 @@ class SearchV2Result(BaseModel):
     heading_path: str | None = Field(
         None,
         description="Optional heading hierarchy path within the note.",
-        examples=["## Architecture > ### API Design"],
+        examples=["Architecture › API Design"],
     )
     content: str = Field(
         ...,

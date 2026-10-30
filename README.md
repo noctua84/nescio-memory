@@ -485,7 +485,7 @@ curl -X POST http://localhost:8000/api/v2/search \
       "description": null,
       "type": null,
       "path_or_uri": "docs/architecture.md",
-      "heading_path": "Architecture > Overview",
+      "heading_path": "Architecture › Overview",
       "content": "...",
       "provenance_kind": null,
       "provenance_date": null,
