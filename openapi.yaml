@@ -673,7 +673,7 @@ components:
           title: Heading Path
           description: Optional heading hierarchy path within the note.
           examples:
-            - '## Architecture > ### API Design'
+            - "Architecture \u203A API Design"
         content:
           type: string
           title: Content
