@@ -21,7 +21,9 @@ import yaml
 # planning: structure is now used only when the body *exceeds* TARGET_CHARS.
 # Any corpus loaded against a prototype of the earlier rule must therefore
 # re-split rather than be skipped.
-SPLITTER_VERSION = "2"
+#
+# "3": short-section runs no longer collapse under one heading.
+SPLITTER_VERSION = "3"
 
 # TARGET_CHARS and MAX_CHARS are two different things, not one threshold used
 # twice. TARGET_CHARS decides *whether the document's structure is worth
@@ -205,12 +207,48 @@ def _scan_sections(body: str) -> list[_Section]:
 
 
 def _merge_short_sections(sections: list[_Section]) -> list[_Unit]:
-    """Fold sections below ``MIN_SECTION_CHARS`` into a neighbour."""
+    """Fold sections below ``MIN_SECTION_CHARS`` into a neighbour.
+
+    A short section merges *backward* into the previous unit while the
+    result stays at or under TARGET_CHARS (unchanged).
+
+    A short section with no previous unit yet -- the document opens with
+    one or more short sections -- instead merges *forward* into ``pending``,
+    which takes the heading path of whatever eventually absorbs it: a long
+    section it joins, or its own first entry if the whole run stays short.
+
+    The forward-merge has a stop rule: once adding the next short section to
+    ``pending`` would push the group over TARGET_CHARS, ``pending`` is
+    flushed as its own unit -- labelled with its *first* section's heading
+    path -- before that section is considered at all. The section is then
+    re-evaluated against the freshly flushed unit under the ordinary
+    backward-merge rule above (merge in if it still fits, else stand alone).
+    Without this stop, a long run of short sections (e.g. hundreds of daily
+    log entries) would collapse into one oversized unit carrying only the
+    first entry's heading path.
+    """
     units: list[_Unit] = []
     pending: list[_Section] = []
 
     for section in sections:
         short = len(section.text.strip()) < MIN_SECTION_CHARS
+
+        if short and pending:
+            candidate = "\n\n".join(p.text for p in pending) + "\n\n" + section.text
+            if len(candidate) <= TARGET_CHARS:
+                pending.append(section)
+                continue
+            # The pending run can't absorb another section without outgrowing
+            # TARGET_CHARS. Flush it now, labelled with its first heading, and
+            # fall through to re-check `section` against the unit just created.
+            units.append(
+                _Unit(
+                    heading_path=pending[0].heading_path,
+                    text="\n\n".join(p.text for p in pending),
+                )
+            )
+            pending = []
+
         if short and units:
             previous = units[-1]
             candidate = f"{previous.text}\n\n{section.text}"
@@ -235,8 +273,8 @@ def _merge_short_sections(sections: list[_Section]) -> list[_Unit]:
         pending = []
 
     if pending:
-        # Every section was short. There is no "next" to inherit from, so the
-        # merged unit keeps the first section's heading path.
+        # Every remaining section was short. There is no "next" to inherit
+        # from, so the merged unit keeps the first section's heading path.
         units.append(
             _Unit(
                 heading_path=pending[0].heading_path,
