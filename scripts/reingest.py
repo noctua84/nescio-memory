@@ -13,6 +13,7 @@ usage or IO error (for example an unreadable --root).
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -33,6 +34,12 @@ DEFAULT_EXCLUDES = ["**/MEMORY.md", "**/learning-log.md"]
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE_ERROR = 2
+
+# A hostile or misconfigured server could send an arbitrarily large
+# Retry-After (or we could misparse one), stalling a ~574-file run for
+# hours. Cap the single 503 retry delay so a bad header degrades to a
+# slow retry instead of an effectively hung process.
+MAX_RETRY_AFTER_S = 60.0
 
 
 def resolve_excludes(user_excludes: Sequence[str], use_defaults: bool) -> list[str]:
@@ -163,9 +170,12 @@ def _ingest_one(
         retry_after = response.headers.get("Retry-After")
         if retry_after is not None:
             try:
-                delay = float(retry_after)
+                parsed = float(retry_after)
+                if parsed >= 0 and math.isfinite(parsed):
+                    delay = parsed
             except ValueError:
                 pass
+        delay = min(delay, MAX_RETRY_AFTER_S)
         time.sleep(delay)
         response = client.post(url, json=payload, headers=headers)
 
@@ -230,9 +240,18 @@ def main(argv: list[str] | None = None) -> int:
                 failed += 1
                 continue
 
-            outcome, passages = _ingest_one(
-                client, ingest_url, api_key, args.scope, rel_path, content, args.force
-            )
+            try:
+                outcome, passages = _ingest_one(
+                    client, ingest_url, api_key, args.scope, rel_path, content, args.force
+                )
+            except httpx.HTTPError as exc:
+                detail = str(exc)[:200]
+                print(
+                    f"{rel_path}: FAILED transport-error {type(exc).__name__}: {detail}",
+                    flush=True,
+                )
+                failed += 1
+                continue
             print(f"{rel_path}: {outcome}", flush=True)
 
             if outcome == "ok":
