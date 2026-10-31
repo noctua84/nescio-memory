@@ -1,3 +1,4 @@
+import math
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -28,15 +29,43 @@ class Settings(BaseSettings):
     local_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 
     # Ollama
-    ollama_url: str = "http://localhost:11434/api/embeddings"
+    # The batch endpoint: it takes `input` (a list) and returns `embeddings`.
+    # The legacy /api/embeddings (single `prompt`) is rejected at startup by
+    # _ollama_url_must_be_http below.
+    ollama_url: str = "http://localhost:11434/api/embed"
     ollama_model: str = "qwen3-embedding:0.6b"
     # qwen3-embedding:0.6b emits 1024 floats -- measured, not inferred:
-    # /api/show reports qwen3.embedding_length 1024 and /api/embeddings returns
-    # a 1024-element vector. Nothing in the suite compares this number against
+    # /api/show reports qwen3.embedding_length 1024 and the embedding endpoint
+    # returns 1024-element vectors. Nothing in the suite compares this number against
     # a real model, so `uv run python -m scripts.check_embedding_dimension`
     # exists to do exactly that. (Was 384 until #36, which made the default
     # configuration unable to embed anything at all.)
     embedding_dimension: int = 1024
+
+    # Search and query embedding
+    # How many candidates each arm (vector, full-text) contributes to rank
+    # fusion. Larger pools give fusion more to reorder at the cost of a wider
+    # index scan; 50 comfortably covers the page sizes callers ask for.
+    search_candidates: int = 50
+    # Reciprocal Rank Fusion damping constant. 60 is the value from the
+    # original RRF paper; it keeps a single arm's top rank from dominating.
+    rrf_k: int = 60
+    # Per-arm multipliers on the fused score. 0 switches an arm off, which is
+    # how a single-arm baseline is measured.
+    fts_weight: float = 1.0
+    vector_weight: float = 1.0
+    # Qwen3-Embedding is instruction-tuned on the query side only, so queries
+    # get this prefix and passages never do. Empty string disables the prefix,
+    # which is what a model without an instruction format needs.
+    query_instruction: str = (
+        "Given a web search query, retrieve relevant passages that answer the query"
+    )
+    # A search is interactive, so waiting the 30 s ingest timeout on a dead
+    # Ollama would be worse than degrading; this bounds the query embedding.
+    query_embed_timeout_s: float = 5.0
+    # Texts per /api/embed request. Bounds each request under the 30 s ingest
+    # timeout on a CPU Ollama and bounds how long ingest holds its row lock.
+    embed_batch_size: int = 16
 
     # langfuse:
     langfuse_public_key: str = ""
@@ -103,6 +132,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "OLLAMA_URL must be an absolute http:// or https:// URL with a "
                 f"host, got {self.ollama_url!r}"
+            )
+        # Fail fast: Ollama still answers the legacy endpoint, but with a
+        # different request/response shape, so a stale .env would otherwise
+        # surface per request as a bad-response 503 that retrying never fixes.
+        if parsed.path.rstrip("/").endswith("/api/embeddings"):
+            raise ValueError(
+                "OLLAMA_URL points at the legacy /api/embeddings endpoint, which "
+                "is no longer supported: the service now uses the batch endpoint "
+                "/api/embed, which takes `input` and returns `embeddings`; "
+                f"set OLLAMA_URL=<same host>/api/embed, got {self.ollama_url!r}"
             )
         return self
 
@@ -175,6 +214,57 @@ class Settings(BaseSettings):
                 "Postgres, and above 60000 risks reinstating the unbounded "
                 "search #17 closed -- a search with context runs up to three "
                 "statements under this ceiling, not one"
+            )
+        return self
+
+    # Each knob below fails at startup naming its env var, like the validators
+    # above, rather than surfacing as a malformed query or request later.
+    @model_validator(mode="after")
+    def _search_knobs_must_be_in_range(self) -> "Settings":
+        if not 1 <= self.search_candidates <= 1000:
+            raise ValueError(
+                "SEARCH_CANDIDATES must be in range 1..1000, got "
+                f"{self.search_candidates}; 0 leaves fusion nothing to rank and "
+                "a very large pool makes every search scan that many rows"
+            )
+        if self.rrf_k < 1:
+            raise ValueError(
+                f"RRF_K must be >= 1, got {self.rrf_k}; the fused score is "
+                "1 / (RRF_K + rank), which is undefined at rank 0 for RRF_K=0"
+            )
+        for name, value in (
+            ("FTS_WEIGHT", self.fts_weight),
+            ("VECTOR_WEIGHT", self.vector_weight),
+        ):
+            # NaN compares false against everything, so `< 0` alone would let it through.
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and >= 0, got {value}")
+        if self.fts_weight == 0 and self.vector_weight == 0:
+            raise ValueError(
+                "FTS_WEIGHT and VECTOR_WEIGHT must not both be 0, got "
+                "FTS_WEIGHT=0 and VECTOR_WEIGHT=0; with both arms off every "
+                "search would return nothing"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _embedding_knobs_must_be_in_range(self) -> "Settings":
+        # The upper bound mirrors OLLAMA_TIMEOUT_SECONDS (30) in
+        # app.core.embeddings, inlined because config must not import embeddings:
+        # a query may never be allowed to wait longer than an ingest call.
+        if not (
+            math.isfinite(self.query_embed_timeout_s)
+            and 0 < self.query_embed_timeout_s <= 30
+        ):
+            raise ValueError(
+                "QUERY_EMBED_TIMEOUT_S must satisfy 0 < x <= 30 "
+                f"(OLLAMA_TIMEOUT_SECONDS), got {self.query_embed_timeout_s}"
+            )
+        if not 1 <= self.embed_batch_size <= 256:
+            raise ValueError(
+                "EMBED_BATCH_SIZE must be in range 1..256, got "
+                f"{self.embed_batch_size}; 0 would never advance through the "
+                "texts and a huge batch defeats the per-request timeout bound"
             )
         return self
 

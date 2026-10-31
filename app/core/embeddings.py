@@ -39,66 +39,150 @@ def _get_local_model():
                 "EMBEDDING_BACKEND=local needs the local-embeddings extra; "
                 "install it with `uv sync --extra local-embeddings`"
             ) from exc
-        _local_model = SentenceTransformer(settings.local_embedding_model)
+        try:
+            _local_model = SentenceTransformer(settings.local_embedding_model)
+        except Exception as exc:
+            # Accepted trade-off: a one-off download hiccup on first load is
+            # also reported as a 500, and a retry or restart fixes it. The
+            # alternative, the transient base class, would let search degrade
+            # to FTS-only for ever on a typo'd LOCAL_EMBEDDING_MODEL.
+            raise EmbeddingBackendMisconfigured(
+                "Could not load LOCAL_EMBEDDING_MODEL "
+                f"{settings.local_embedding_model!r}: {exc}"
+            ) from exc
     return _local_model
 
 
-def _fetch(text: str) -> object:
-    """Ask the configured backend for an embedding, without validating it.
+def _fetch_batch(texts: list[str], timeout: float) -> list[object]:
+    """Ask the configured backend for one embedding per text, unvalidated.
 
-    Split out of get_embedding so probe_embedding_dimension() can measure what
-    the backend actually emits. Routing it through get_embedding instead would
-    mean the dimension check rejects the very vector being measured, which is
-    the one thing the probe must not do.
+    The single raw transport for both backends. Nothing here checks the count
+    or the contents of what comes back; _embed does, so the probe can still
+    measure a backend whose output _validated would reject.
     """
     if settings.embedding_backend == "local":
         try:
-            vector = _get_local_model().encode(text).tolist()
+            return [row.tolist() for row in _get_local_model().encode(texts)]
         except EmbeddingBackendError:
             # _get_local_model raises EmbeddingBackendMisconfigured for a missing
-            # extra. That is a subclass, so re-raise it unchanged rather than
-            # reclassifying a permanent fault as a transient one.
+            # extra or an unloadable model. That is a subclass, so re-raise it
+            # unchanged rather than reclassifying a permanent fault as a
+            # transient one.
             raise
         except Exception as exc:
             # Everything else here is a runtime fault in the in-process model --
-            # memory pressure, a bad model name, a failed download. Treated as
-            # transient: unlike a missing extra, a later attempt may succeed.
+            # memory pressure, for one. Treated as transient: unlike a missing
+            # extra or a bad model name, a later attempt may succeed.
             raise EmbeddingBackendError(
                 f"Local embedding backend failed: {exc}"
             ) from exc
-        return vector
 
-    payload = {"model": settings.ollama_model, "prompt": text}
+    # truncate=True matches the silent truncation of the legacy endpoint. With
+    # false, an over-long passage fails as an HTTP 400, which the status
+    # classification below would report as a misconfiguration.
+    payload = {"model": settings.ollama_model, "input": texts, "truncate": True}
     try:
-        with httpx.Client(timeout=OLLAMA_TIMEOUT_SECONDS) as client:
+        with httpx.Client(timeout=timeout) as client:
             response = client.post(settings.ollama_url, json=payload)
             response.raise_for_status()
     except httpx.InvalidURL as exc:
         # InvalidURL inherits from Exception rather than httpx.HTTPError, so the
-        # clause below does not catch it. A malformed URL is a deployment
+        # clauses below do not catch it. A malformed URL is a deployment
         # mistake, not a transient condition, so it must not promise a retry.
         raise EmbeddingBackendMisconfigured(
             f"OLLAMA_URL is not a valid URL: {settings.ollama_url!r}"
         ) from exc
+    except httpx.HTTPStatusError as exc:
+        # Must precede the generic clause. Ollama answers 404 for a model that
+        # was never pulled and for a build without /api/embed, and 400 for a
+        # non-embedding model; retrying never fixes either. Left on the base
+        # class they would make search degrade to FTS-only for good while
+        # claiming to be transient. 408 and 429 are the 4xx codes that do mean
+        # "try again later". The message carries the status and URL, never the
+        # input texts.
+        code = exc.response.status_code
+        if 400 <= code < 500 and code not in (408, 429):
+            raise EmbeddingBackendMisconfigured(
+                f"Ollama rejected the request with HTTP {code} at "
+                f"{settings.ollama_url!r}; check that OLLAMA_MODEL is pulled "
+                "and is an embedding model, and that Ollama supports /api/embed"
+            ) from exc
+        raise EmbeddingBackendError(f"Ollama request failed: HTTP {code}") from exc
     except httpx.HTTPError as exc:
-        # httpx.HTTPError is the base of RequestError (connection, timeout) and
-        # HTTPStatusError, so every transport failure is caught here and the
-        # httpx dependency stops at this module's edge.
+        # httpx.HTTPError is the base of RequestError (connection, timeout), so
+        # every remaining transport failure is caught here and the httpx
+        # dependency stops at this module's edge.
         raise EmbeddingBackendError(f"Ollama request failed: {exc}") from exc
 
     try:
-        vector = response.json()["embedding"]
+        embeddings = response.json()["embeddings"]
     except (ValueError, KeyError, TypeError) as exc:
         # ValueError covers a non-JSON body (JSONDecodeError subclasses it);
         # KeyError and TypeError cover JSON that is not the shape we expect.
         raise EmbeddingBackendBadResponse(
-            f"Ollama response was not a usable embedding: {exc}"
+            f"Ollama response was not a usable embedding batch: {exc}"
         ) from exc
-    return vector
+    if not isinstance(embeddings, list):
+        raise EmbeddingBackendBadResponse(
+            f"Ollama response 'embeddings' was {type(embeddings).__name__}, "
+            "expected a list"
+        )
+    return embeddings
+
+
+def _fetch(text: str) -> object:
+    """Ask the configured backend for one embedding, without validating it.
+
+    Split out of get_embedding so probe_embedding_dimension() can measure what
+    the backend actually emits. Routing it through get_embedding instead would
+    mean the dimension check rejects the very vector being measured, which is
+    the one thing the probe must not do. The probe and
+    scripts/check_embedding_dimension.py still call this; tests that want the
+    validation chain patch _fetch_batch instead.
+    """
+    vectors = _fetch_batch([text], OLLAMA_TIMEOUT_SECONDS)
+    if not vectors:
+        # An empty batch for one input would otherwise surface as IndexError.
+        raise EmbeddingBackendBadResponse("backend returned no embedding for 1 input")
+    return vectors[0]
+
+
+def _embed(texts: list[str], timeout: float) -> list[list[float]]:
+    """Embed texts in order, in sub-batches, validating every vector."""
+    if not texts:
+        return []
+    # Sub-batches bound each request under the 30 s timeout on a CPU Ollama,
+    # and bound how long ingest holds its FOR UPDATE lock across these calls
+    # (see app/api/v2/ingest.py).
+    size = settings.embed_batch_size
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), size):
+        batch = texts[start : start + size]
+        result = _fetch_batch(batch, timeout)
+        if len(result) != len(batch):
+            # Counts only: the texts are note content and must not be logged.
+            raise EmbeddingBackendBadResponse(
+                f"backend returned {len(result)} embeddings for {len(batch)} inputs"
+            )
+        vectors.extend(_validated(vector) for vector in result)
+    return vectors
+
+
+def get_embeddings(texts: list[str]) -> list[list[float]]:
+    return _embed(texts, OLLAMA_TIMEOUT_SECONDS)
 
 
 def get_embedding(text: str) -> list[float]:
-    return _validated(_fetch(text))
+    return get_embeddings([text])[0]
+
+
+def get_query_embedding(query: str) -> list[float]:
+    # Qwen3-Embedding is instruction-tuned on the query side only. Passages stay
+    # unprefixed, so the prefix does not enter pipeline_version() and changing
+    # QUERY_INSTRUCTION never invalidates stored embeddings.
+    if settings.query_instruction:
+        query = f"Instruct: {settings.query_instruction}\nQuery:{query}"
+    return _embed([query], settings.query_embed_timeout_s)[0]
 
 
 # Short and fixed. The probe's only job is to make the backend emit one vector,

@@ -79,6 +79,16 @@ def _vector_with_a_non_finite_component() -> list[float]:
     return vector
 
 
+def _batch_of(make_vector):
+    """A stand-in for `_fetch_batch` answering every text with `make_vector()`.
+
+    One vector per input rather than a fixed one-element list: a count mismatch
+    raises the same EmbeddingBackendBadResponse, so a short batch would make
+    these tests pass without the component checks they target ever running.
+    """
+    return lambda texts, timeout: [make_vector() for _ in texts]
+
+
 def _raise(exception):
     def _raiser(text):
         raise exception
@@ -741,10 +751,11 @@ def test_a_degenerate_embedding_is_a_503_on_search_and_not_a_400(
     # The alerting contract, pinned. This is the one test in the suite that
     # catches a revert of the finiteness check, and it is built to discriminate.
     #
-    # _fetch is what gets patched, not get_embedding. search_module.get_embedding
-    # is left as the real function so the real get_embedding -> _validated chain
-    # runs and raises on its own. Patching get_embedding to raise
-    # EmbeddingBackendBadResponse directly would only re-test the handler mapping
+    # _fetch_batch, the raw transport, is what gets patched, not get_embedding.
+    # search_module.get_embedding is left as the real function so the real
+    # get_embedding -> _validated chain runs and raises on its own. Patching
+    # get_embedding to raise EmbeddingBackendBadResponse directly would only
+    # re-test the handler mapping
     # -- which test_an_unreadable_backend_response_is_reported_distinctly already
     # covers -- and would still pass with the finiteness check removed, making it
     # worthless as a guard.
@@ -758,7 +769,9 @@ def test_a_degenerate_embedding_is_a_503_on_search_and_not_a_400(
     # not the caller's fault.
     key = make_api_key(db_session, "acme")
     monkeypatch.setattr(
-        embeddings_module, "_fetch", lambda text: _vector_with_a_non_finite_component()
+        embeddings_module,
+        "_fetch_batch",
+        _batch_of(_vector_with_a_non_finite_component),
     )
 
     with _client_that_reports_server_errors(db_session) as http:
@@ -788,7 +801,9 @@ def test_a_degenerate_embedding_is_a_503_on_ingest_and_persists_nothing(
     # committed would lose the file's existing chunks rather than merely fail.
     key = make_api_key(db_session, "acme")
     monkeypatch.setattr(
-        embeddings_module, "_fetch", lambda text: _vector_with_a_non_finite_component()
+        embeddings_module,
+        "_fetch_batch",
+        _batch_of(_vector_with_a_non_finite_component),
     )
 
     with _client_that_reports_server_errors(db_session) as http:
@@ -838,15 +853,15 @@ def test_a_float32_overflowing_embedding_is_a_503_on_search_and_not_a_400(
     # search look like a client error while 5xx alerts, error-rate dashboards
     # and SLOs all stayed green. That mapping is what this test pins against.
     #
-    # _fetch is patched rather than get_embedding, and search_module.get_embedding
-    # is left as the real function, for the reason spelled out on the NaN test:
-    # patching get_embedding to raise would only re-test the handler and would
-    # stay green with the range check removed.
+    # _fetch_batch is patched rather than get_embedding, and
+    # search_module.get_embedding is left as the real function, for the reason
+    # spelled out on the NaN test: patching get_embedding to raise would only
+    # re-test the handler and would stay green with the range check removed.
     key = make_api_key(db_session, "acme")
     monkeypatch.setattr(
         embeddings_module,
-        "_fetch",
-        lambda text: _vector_with_a_float32_overflowing_component(),
+        "_fetch_batch",
+        _batch_of(_vector_with_a_float32_overflowing_component),
     )
 
     with _client_that_reports_server_errors(db_session) as http:
@@ -896,7 +911,7 @@ def test_a_zero_norm_embedding_is_a_503_on_search_and_not_a_200_with_a_null_scor
     # tell from a good one. Silently wrong rather than noisily broken, which is
     # why the vector is refused before it reaches SQL at all.
     #
-    # _fetch is patched rather than get_embedding, and search_module's
+    # _fetch_batch is patched rather than get_embedding, and search_module's
     # get_embedding is left as the real function, for the reason the NaN and
     # float32-overflow tests above give: patching get_embedding to raise would
     # only re-test the handler mapping and would stay green with the norm check
@@ -908,7 +923,8 @@ def test_a_zero_norm_embedding_is_a_503_on_search_and_not_a_200_with_a_null_scor
     # something to report a null score for.
     key = make_api_key(db_session, "acme")
     make_learning(db_session, "acme", content=ORIGINAL_CONTENT)
-    monkeypatch.setattr(embeddings_module, "_fetch", lambda text: _zero_norm_vector())
+    zero_norm_batch = _batch_of(_zero_norm_vector)
+    monkeypatch.setattr(embeddings_module, "_fetch_batch", zero_norm_batch)
 
     with _client_that_reports_server_errors(db_session) as http:
         response = http.post(
@@ -940,7 +956,8 @@ def test_a_zero_norm_embedding_is_a_503_on_ingest_and_persists_nothing(
     # (tests/test_search.py), so the cheapest place to stop it is here, at the
     # write.
     key = make_api_key(db_session, "acme")
-    monkeypatch.setattr(embeddings_module, "_fetch", lambda text: _zero_norm_vector())
+    zero_norm_batch = _batch_of(_zero_norm_vector)
+    monkeypatch.setattr(embeddings_module, "_fetch_batch", zero_norm_batch)
 
     with _client_that_reports_server_errors(db_session) as http:
         response = http.post(
@@ -1109,8 +1126,8 @@ def test_a_degenerate_embedding_is_logged_with_the_component_that_was_wrong(
     """The end-to-end case: a real NaN, through the real chain, into the log.
 
     Every other logging test here stages the exception, which proves the
-    handler formats what it is given. This one patches `_fetch` and leaves the
-    real get_embedding -> _validated chain in place, so the message that
+    handler formats what it is given. This one patches `_fetch_batch` and leaves
+    the real get_embedding -> _validated chain in place, so the message that
     reaches the log is the one app.core.embeddings actually composed. That is
     what makes the two halves meet: the diagnostic names the offending
     component and its value, and until the handler passed exc_info there was no
@@ -1120,7 +1137,9 @@ def test_a_degenerate_embedding_is_logged_with_the_component_that_was_wrong(
     """
     key = make_api_key(db_session, "acme")
     monkeypatch.setattr(
-        embeddings_module, "_fetch", lambda text: _vector_with_a_non_finite_component()
+        embeddings_module,
+        "_fetch_batch",
+        _batch_of(_vector_with_a_non_finite_component),
     )
     monkeypatch.setattr(errors_module.logger, "disabled", False)
 
