@@ -6,7 +6,7 @@ from langfuse import observe
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.embeddings import get_embedding
+from app.core.embeddings import get_embeddings
 from app.core.pipeline import content_hash, embedding_input, fts_lead_a, fts_lead_c, pipeline_version
 from app.core.security import get_current_client
 from app.core.splitter import split_note
@@ -95,7 +95,7 @@ def ingest_note(
 
     repo = NoteRepository(db, client_name=client.client_name)
 
-    # The FOR UPDATE lock lock_note takes is held across every get_embedding call
+    # The FOR UPDATE lock lock_note takes is held across the batched get_embeddings call
     # below and released only by the single commit at the end. That is
     # deliberate, and it is the same ordering v1 already has (v1 holds an open
     # transaction across its per-chunk Ollama calls -- see QWEN.md "Known Gaps",
@@ -104,8 +104,8 @@ def ingest_note(
     # two concurrent ingests of one note serialise instead of interleaving a
     # delete with the other's insert.
     #
-    # The cost is lock hold time proportional to passage count times embedding
-    # latency -- for the 112 KB ADR that is tens of seconds. It is acceptable
+    # The cost is lock hold time of about ceil(passages / embed_batch_size)
+    # embedding round-trips -- one per sub-batch, not one per passage. It is acceptable
     # because the lock is per NOTE identity and the only contender is another
     # ingest of that same note, which has nothing useful to do concurrently
     # anyway; reads never take this lock.
@@ -144,18 +144,25 @@ def ingest_note(
         meta=request.meta,
     )
 
+    # One call for the whole note; vectors come back in input order, so they are
+    # zipped onto the passages by position. strict=True turns a count mismatch
+    # into an error instead of silently dropping passages.
+    vectors = get_embeddings(
+        [
+            embedding_input(result.name, passage.heading_path, passage.content)
+            for passage in result.passages
+        ]
+    )
     rows = [
         PassageRow(
             ordinal=passage.ordinal,
             heading_path=passage.heading_path,
             content=passage.content,
-            embedding=get_embedding(
-                embedding_input(result.name, passage.heading_path, passage.content)
-            ),
+            embedding=vector,
             fts_a=fts_lead_a(result.name, passage.heading_path),
             fts_c=fts_lead_c(result.description),
         )
-        for passage in result.passages
+        for passage, vector in zip(result.passages, vectors, strict=True)
     ]
 
     # Embedding failures (EmbeddingBackendError) propagate uncaught and are

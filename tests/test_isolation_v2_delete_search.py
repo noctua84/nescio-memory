@@ -13,10 +13,13 @@ from sqlalchemy.exc import IntegrityError
 from app.models.note import Note
 from app.models.passage import Passage
 from tests.factories import make_api_key, make_note, make_passage
+from tests.fakes import fake_embedding
 
-# Single lowercase tokens, deliberately: v2 search is full text, and
+# Single lowercase tokens, deliberately: v2 search has a full-text arm, and
 # to_tsvector/websearch_to_tsquery must agree on the token for a marker to be
-# both findable by the owner and assertable-absent for everyone else.
+# both findable by the owner and assertable-absent for everyone else. Its
+# vector arm matches on meaning instead, with no keyword in common needed --
+# the last search test below seeds for that arm specifically.
 ACME_MARKER = "xenofluxacme"
 GLOBEX_MARKER = "quorvaneglobex"
 
@@ -303,3 +306,61 @@ def test_search_v2_does_not_return_a_passage_whose_note_belongs_to_another_tenan
         )
 
     db_session.rollback()
+
+
+def test_search_v2_vector_arm_never_returns_another_tenants_passages(
+    client, db_session
+):
+    """The tenant boundary with the vector arm on, seeded so a leak would win.
+
+    Acme's passages carry EXACTLY the query's vector (fake_embedding of the
+    query text, which is what the `client` fixture's fake query embedder
+    returns), so they sit at cosine distance 0 and an unfiltered vector arm
+    would rank them first. Their text shares no word with the query, so
+    nothing but the vector arm could reach them. The vector arm always fills
+    up to top_k, so a leak would surface rather than fall below a cutoff.
+    Globex holds one passage of its own, so the statement really runs for it.
+
+    Acme's own search is the control: the same query ranks those passages
+    first by vector, which proves the seeded vectors are the query's.
+    """
+    query = "anything worth remembering"
+    acme_note = make_note(db_session, "acme", name="Acme Ledger")
+    acme_ids = {
+        make_passage(
+            db_session,
+            acme_note,
+            ordinal=ordinal,
+            content=f"{ACME_MARKER} passage {ordinal}.",
+            embedding=fake_embedding(query),
+        ).id
+        for ordinal in (0, 1)
+    }
+    globex_note = make_note(db_session, "globex", name="Globex Ledger")
+    globex_passage = make_passage(
+        db_session, globex_note, content=_body(GLOBEX_MARKER)
+    )
+    acme_key = make_api_key(db_session, "acme")
+    globex_key = make_api_key(db_session, "globex")
+
+    other_view = _search(client, globex_key, q=query)
+    owner_view = _search(client, acme_key, q=query)
+
+    assert other_view.status_code == owner_view.status_code == 200
+    assert other_view.json()["degraded"] is owner_view.json()["degraded"] is False
+    other_results = other_view.json()["results"]
+    assert [r["passage_id"] for r in other_results] == [globex_passage.id]
+    # Found by the vector arm alone, at the top of it: no foreign passage at
+    # distance 0 took that place. This also catches a leak the final join
+    # would mask -- an arm missing its own client_name predicate would rank
+    # acme's passages 1 and 2 there, pushing this one to 3, even though the
+    # join's predicates then drop them from the response.
+    assert (other_results[0]["fts_rank"], other_results[0]["vector_rank"]) == (
+        None,
+        1,
+    )
+    assert ACME_MARKER not in other_view.text
+
+    owner_results = owner_view.json()["results"]
+    assert {r["passage_id"] for r in owner_results} == acme_ids
+    assert sorted(r["vector_rank"] for r in owner_results) == [1, 2]

@@ -1,19 +1,25 @@
-"""POST /api/v2/search -- keyword and phrase search over passages.
+"""POST /api/v2/search -- hybrid keyword, phrase and semantic search over passages.
 
-FTS only in this slice: no vector expression, no embedding call and no HNSW
-index involvement anywhere in this module. The semantic/vector branch arrives
-in slice 2; its absence here is deliberate, not an omission.
+Two arms (full-text and vector) are fused by reciprocal rank in the repository.
+With VECTOR_WEIGHT=0 the vector arm is off and the query is never embedded.
 """
+
+import logging
 
 from fastapi import APIRouter, Depends
 from langfuse import observe
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.core.db import get_db
+from app.core.embeddings import get_query_embedding
+from app.core.errors import EmbeddingBackendError
 from app.core.security import get_current_client
 from app.models import ApiKey
 from app.repositories.passage_search import PassageSearchRepository
 from app.schemas.search_v2 import SearchV2Request, SearchV2Response, SearchV2Result
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -28,13 +34,18 @@ router = APIRouter()
 @router.post(
     "/search",
     response_model=SearchV2Response,
-    summary="Keyword and phrase search over passages",
+    summary="Hybrid keyword and semantic search over passages",
     description=(
-        "Full-text search over note passages using websearch_to_tsquery "
-        "(phrases, words, exclusions). Returns individual matching passages, "
-        "never whole notes, ranked by ts_rank_cd. A query that reduces to an "
-        "empty tsquery (stop words only, or pure punctuation) legitimately "
-        "returns an empty result list with a 200, not an error."
+        "Hybrid search over note passages: a full-text arm "
+        "(websearch_to_tsquery: phrases, words, exclusions) and a vector arm "
+        "(semantic similarity), fused by reciprocal rank. Returns individual "
+        "matching passages, never whole notes, ordered by the fused score. "
+        "Always fills up to top_k when that many passages exist -- there is no "
+        "relevance floor -- and fts_rank null marks a semantic-only match. A "
+        "query with no usable keywords (stop words only) is answered by the "
+        "vector arm. If the query cannot be embedded because the embedding "
+        "backend is briefly unavailable, the response is full-text only and "
+        "degraded is true."
     ),
     operation_id="searchPassagesV2",
 )
@@ -44,8 +55,36 @@ def search_passages(
     db: Session = Depends(get_db),
     client: ApiKey = Depends(get_current_client),
 ) -> SearchV2Response:
+    # Embed BEFORE the repository's first statement so no search work (and no
+    # statement_timeout window) overlaps the HTTP call. NOTE: get_current_client
+    # has already run a SELECT on this session, which autobegins a transaction,
+    # so the connection is idle-in-transaction during the embed regardless.
+    # VECTOR_WEIGHT=0 is the FTS-only baseline mode: the embedder is never called.
+    query_vector: list[float] | None = None
+    degraded = False
+    if settings.vector_weight > 0:
+        try:
+            query_vector = get_query_embedding(request.q)
+        except EmbeddingBackendError as exc:
+            # Exact class only. The base class means the backend is transiently
+            # unreachable, where full-text results are a useful answer. The
+            # subclasses mean it answered wrongly (bad response) or we are
+            # misconfigured (wrong model/dimension); serving FTS-only there
+            # would hide a fault that needs attention, so they propagate to the
+            # 503/500 handlers in app/core/errors.py. Ingest does NOT degrade:
+            # it still returns 503, since a note stored without vectors would
+            # be silently unsearchable by meaning.
+            if type(exc) is not EmbeddingBackendError:
+                raise
+            # Class name only: the exception text may carry request details.
+            logger.warning(
+                "query embedding unavailable (%s); serving full-text results only",
+                type(exc).__name__,
+            )
+            degraded = True
+
     repo = PassageSearchRepository(db, client_name=client.client_name)
-    rows = repo.search_fts(request.q, request.top_k, request.repo_filter)
+    rows = repo.search(request.q, query_vector, request.top_k, request.repo_filter)
 
     # Mapped field by field to the DTO. Never return a `Row`/model instance
     # directly -- the response shape is the contract, not whatever columns
@@ -64,8 +103,10 @@ def search_passages(
             provenance_kind=row.provenance_kind,
             provenance_date=row.provenance_date,
             status=row.status,
-            rank=row.rank,
+            score=row.score,
+            fts_rank=row.fts_rank,
+            vector_rank=row.vector_rank,
         )
         for row in rows
     ]
-    return SearchV2Response(results=results)
+    return SearchV2Response(results=results, degraded=degraded)

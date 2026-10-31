@@ -105,8 +105,8 @@
         "tags": [
           "Search v2"
         ],
-        "summary": "Keyword and phrase search over passages",
-        "description": "Full-text search over note passages using websearch_to_tsquery (phrases, words, exclusions). Returns individual matching passages, never whole notes, ranked by ts_rank_cd. A query that reduces to an empty tsquery (stop words only, or pure punctuation) legitimately returns an empty result list with a 200, not an error.",
+        "summary": "Hybrid keyword and semantic search over passages",
+        "description": "Hybrid search over note passages: a full-text arm (websearch_to_tsquery: phrases, words, exclusions) and a vector arm (semantic similarity), fused by reciprocal rank. Returns individual matching passages, never whole notes, ordered by the fused score. Always fills up to top_k when that many passages exist -- there is no relevance floor -- and fts_rank null marks a semantic-only match. A query with no usable keywords (stop words only) is answered by the vector arm. If the query cannot be embedded because the embedding backend is briefly unavailable, the response is full-text only and degraded is true.",
         "operationId": "searchPassagesV2",
         "requestBody": {
           "content": {
@@ -829,7 +829,7 @@
             "type": "string",
             "minLength": 1,
             "title": "Q",
-            "description": "Full-text search query. Accepts both 'q' and 'query' aliases.",
+            "description": "Search query, matched by keyword/phrase and by meaning. Accepts both 'q' and 'query' aliases.",
             "examples": [
               "invoice-first checkout"
             ]
@@ -839,7 +839,7 @@
             "maximum": 50,
             "minimum": 1,
             "title": "Top K",
-            "description": "Maximum number of passages to return.",
+            "description": "Number of passages to return. Hybrid search always fills up to top_k when that many passages exist (there is no relevance floor), so trailing results can be weak matches.",
             "default": 5
           },
           "repo_filter": {
@@ -874,11 +874,17 @@
             "type": "array",
             "title": "Results",
             "description": "List of passages matching the search query, ordered by relevance."
+          },
+          "degraded": {
+            "type": "boolean",
+            "title": "Degraded",
+            "description": "true when the query could not be embedded and the results are full-text only"
           }
         },
         "type": "object",
         "required": [
-          "results"
+          "results",
+          "degraded"
         ],
         "title": "SearchV2Response",
         "description": "Response containing search results."
@@ -998,10 +1004,34 @@
             "title": "Status",
             "description": "Optional status label from the note."
           },
-          "rank": {
+          "score": {
             "type": "number",
-            "title": "Rank",
-            "description": "Relevance score from full-text search (higher is more relevant)."
+            "title": "Score",
+            "description": "Reciprocal-rank-fusion score; comparable only within one response; higher is more relevant."
+          },
+          "fts_rank": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fts Rank",
+            "description": "1-based rank in that arm's candidate list, null if the passage was not among that arm's candidates or the arm did not run. A null fts_rank means a semantic-only match."
+          },
+          "vector_rank": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vector Rank",
+            "description": "1-based rank in that arm's candidate list, null if the passage was not among that arm's candidates or the arm did not run."
           }
         },
         "type": "object",
@@ -1011,7 +1041,7 @@
           "ordinal",
           "path_or_uri",
           "content",
-          "rank"
+          "score"
         ],
         "title": "SearchV2Result",
         "description": "A passage result from a search query."

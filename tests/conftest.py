@@ -64,9 +64,11 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.api.v1 import ingest as ingest_module  # noqa: E402
 from app.api.v1 import search as search_module  # noqa: E402
 from app.api.v2 import ingest as ingest_v2_module  # noqa: E402
+from app.api.v2 import search as search_v2_module  # noqa: E402
+from app.config import settings  # noqa: E402
 from app.core.db import get_db  # noqa: E402
 from app.main import app  # noqa: E402
-from tests.fakes import fake_embedding  # noqa: E402
+from tests.fakes import fake_embedding, fake_embeddings  # noqa: E402
 
 # testcontainers.postgres is a deprecation shim as of 4.15.0; the import above
 # is the live path.
@@ -183,16 +185,19 @@ def client(db_session, monkeypatch):
     would have no effect on what the endpoints actually call, and the tests
     would quietly make real HTTP requests and hang.
 
-    app/api/v2/ingest.py binds the name into its own namespace the same way, for
-    the same reason, so it needs its own patch: patching
-    app.core.embeddings.get_embedding would be just as ineffective there. There
-    is deliberately no v2 search patch -- app/api/v2/search.py is FTS only in
-    this slice and never embeds, so there is no such name to rebind. Add one if
-    and when it starts embedding; its absence is not an oversight.
+    The v2 routes bind their names the same way, so each needs its own patch
+    too: app/api/v2/ingest.py imports get_embeddings (one batched call per
+    note) and app/api/v2/search.py imports get_query_embedding (called whenever
+    settings.vector_weight > 0). The rule is mechanical: every embedding name a
+    route module imports needs a patch here, or tests make real HTTP calls to
+    Ollama -- which hang, or, for search, silently degrade to full-text results
+    and pass for the wrong reason. Adding a route that embeds means adding a
+    line below.
     """
     monkeypatch.setattr(ingest_module, "get_embedding", fake_embedding)
     monkeypatch.setattr(search_module, "get_embedding", fake_embedding)
-    monkeypatch.setattr(ingest_v2_module, "get_embedding", fake_embedding)
+    monkeypatch.setattr(ingest_v2_module, "get_embeddings", fake_embeddings)
+    monkeypatch.setattr(search_v2_module, "get_query_embedding", fake_embedding)
 
     # get_current_client resolves through Depends(get_db) too, so overriding
     # get_db means a factory-created ApiKey row is immediately visible to
@@ -203,3 +208,25 @@ def client(db_session, monkeypatch):
     # into the next one, which then fails somewhere that points at the wrong
     # test.
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def fts_only(monkeypatch):
+    """Switch search to the full-text arm alone, for tests asserting pure FTS
+    semantics.
+
+    This is VECTOR_WEIGHT=0 -- the same switch the FTS-only baseline
+    measurement uses (scripts/eval_queries.py) -- not a test-only code path.
+    With it, app/api/v2/search.py never calls the embedder and
+    PassageSearchRepository builds no vector arm.
+
+    The patch target is the one `settings` object in app.config. Both the
+    route and app/repositories/passage_search.py do `from app.config import
+    settings` and read `settings.vector_weight` at call time, so they see this
+    instance; patching the attribute (not rebinding the name) is what reaches
+    both. Settings does not set validate_assignment, so the cross-field check
+    that FTS_WEIGHT and VECTOR_WEIGHT are not both 0 does not run here --
+    fts_weight stays at whatever it was, and a test that also zeroes it is on
+    its own.
+    """
+    monkeypatch.setattr(settings, "vector_weight", 0.0)

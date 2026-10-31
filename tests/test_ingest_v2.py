@@ -4,17 +4,17 @@ Shaped like tests/test_ingest.py -- one local `_ingest` helper, then one
 behaviour per test named after the behaviour.
 
 Input validation (path_or_uri, the content cap) lives in
-tests/test_ingest_v2_validation.py, split out only to keep each module under
-the length the plan asks for.
+tests/test_ingest_v2_validation.py, and what ingest hands the embedder (one
+batched call, the skip spending none, a failure persisting nothing) in
+tests/test_ingest_v2_embeddings.py -- both split out only to keep each module
+under the length the plan asks for.
 """
 from types import SimpleNamespace
 
 from sqlalchemy import Text, cast, select
 
-from app.api.v2 import ingest as ingest_v2
 from app.config import settings
 from app.core import pipeline
-from app.core.errors import EmbeddingBackendError
 from app.models.note import Note
 from app.models.passage import Passage
 from tests.factories import make_api_key
@@ -99,18 +99,6 @@ def _stale_pipeline_settings(monkeypatch, **changes) -> None:
     for attribute, value in changes.items():
         setattr(stand_in, attribute, value)
     monkeypatch.setattr(pipeline, "settings", stand_in)
-
-
-def _recorder(monkeypatch):
-    """Replace the route's get_embedding with one that records its input."""
-    seen: list[str] = []
-
-    def record(text: str) -> list[float]:
-        seen.append(text)
-        return [0.0] * (settings.embedding_dimension - 1) + [1.0]
-
-    monkeypatch.setattr(ingest_v2, "get_embedding", record)
-    return seen
 
 
 def test_ingest_v2_persists_a_note_and_its_passages(client, db_session):
@@ -341,59 +329,3 @@ def test_a_note_without_a_name_or_description_still_gets_a_usable_tsv(client, db
     passage_id = _passage_ids(db_session, note.id)[0]
     assert "B" in _tsv_weights(db_session, passage_id, "marmoset")
     assert "B" in _tsv_weights(db_session, passage_id, "ledger")
-
-
-def test_the_description_is_not_part_of_the_embedding_input(
-    client, db_session, monkeypatch
-):
-    # Decision 6, asserted rather than assumed.
-    key = make_api_key(db_session, "acme")
-    seen = _recorder(monkeypatch)
-
-    _ingest(client, key, content=FRONTMATTER_NOTE)
-
-    assert seen
-    assert all("Pangolin" not in recorded for recorded in seen)
-    # The name IS part of it, so this is not passing merely because nothing
-    # was recorded in a usable form.
-    assert any("Quokka Ledger" in recorded for recorded in seen)
-
-
-def test_an_embedding_failure_leaves_the_previous_passages_intact(
-    client, db_session, monkeypatch
-):
-    key = make_api_key(db_session, "acme")
-    first = _ingest(client, key).json()
-    before = [
-        (passage.id, passage.ordinal, passage.content)
-        for passage in _passages(db_session, first["note_id"])
-    ]
-
-    def boom(text: str) -> list[float]:
-        raise EmbeddingBackendError("backend down")
-
-    monkeypatch.setattr(ingest_v2, "get_embedding", boom)
-    response = _ingest(client, key, content="a different body entirely")
-
-    assert response.status_code == 503
-    assert response.headers["Retry-After"]
-    # No commit happened on the failing request, so the route's own writes are
-    # discarded exactly as a real request teardown would discard them.
-    db_session.rollback()
-    assert [
-        (passage.id, passage.ordinal, passage.content)
-        for passage in _passages(db_session, first["note_id"])
-    ] == before
-
-
-def test_a_skipped_ingest_spends_no_embeddings(client, db_session, monkeypatch):
-    # The economy the lock ordering exists for: the skip check runs before any
-    # embedding is requested.
-    key = make_api_key(db_session, "acme")
-    seen = _recorder(monkeypatch)
-    _ingest(client, key)
-    after_first = len(seen)
-
-    assert _ingest(client, key).json()["skipped"] is True
-    assert after_first > 0
-    assert len(seen) == after_first

@@ -28,6 +28,16 @@ def fake_embedding(text: str) -> list[float]:
     return [component / magnitude for component in vector]
 
 
+def fake_embeddings(texts: list[str]) -> list[list[float]]:
+    """The batch form of fake_embedding, standing in for get_embeddings.
+
+    One vector per input, in input order, each identical to what
+    fake_embedding returns for that text -- so a passage's stored vector does
+    not depend on which batch it arrived in.
+    """
+    return [fake_embedding(text) for text in texts]
+
+
 def unit_vector(axis: int) -> list[float]:
     """A basis vector: 1.0 on `axis`, 0.0 elsewhere.
 

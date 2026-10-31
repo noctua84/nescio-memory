@@ -10,14 +10,21 @@ class SearchV2Request(BaseModel):
         ...,
         min_length=1,
         validation_alias=AliasChoices("q", "query"),
-        description="Full-text search query. Accepts both 'q' and 'query' aliases.",
+        description=(
+            "Search query, matched by keyword/phrase and by meaning. Accepts "
+            "both 'q' and 'query' aliases."
+        ),
         examples=["invoice-first checkout"],
     )
     top_k: int = Field(
         5,
         ge=1,
         le=50,
-        description="Maximum number of passages to return.",
+        description=(
+            "Number of passages to return. Hybrid search always fills up to "
+            "top_k when that many passages exist (there is no relevance "
+            "floor), so trailing results can be weak matches."
+        ),
     )
     repo_filter: str | None = Field(
         None,
@@ -71,9 +78,27 @@ class SearchV2Result(BaseModel):
         None,
         description="Optional status label from the note.",
     )
-    rank: float = Field(
+    score: float = Field(
         ...,
-        description="Relevance score from full-text search (higher is more relevant).",
+        description=(
+            "Reciprocal-rank-fusion score; comparable only within one "
+            "response; higher is more relevant."
+        ),
+    )
+    fts_rank: int | None = Field(
+        None,
+        description=(
+            "1-based rank in that arm's candidate list, null if the passage "
+            "was not among that arm's candidates or the arm did not run. "
+            "A null fts_rank means a semantic-only match."
+        ),
+    )
+    vector_rank: int | None = Field(
+        None,
+        description=(
+            "1-based rank in that arm's candidate list, null if the passage "
+            "was not among that arm's candidates or the arm did not run."
+        ),
     )
 
 
@@ -83,4 +108,11 @@ class SearchV2Response(BaseModel):
     results: list[SearchV2Result] = Field(
         ...,
         description="List of passages matching the search query, ordered by relevance.",
+    )
+    degraded: bool = Field(
+        ...,
+        description=(
+            "true when the query could not be embedded and the results are "
+            "full-text only"
+        ),
     )

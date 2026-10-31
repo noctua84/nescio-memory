@@ -17,13 +17,20 @@ header to an arbitrary host. --queries must resolve to an existing .yaml/
 
 Loads tests/fixtures/golden_queries.yaml (or --queries), POSTs each query to
 `{url}/api/v2/search`, and reports hits@top_k against the file's gate. The
-gate is "15 of 20 queries hit in the top 5" by default; the recorded score is
-the baseline slice 2's RRF work must beat.
+gate is "15 of 20 queries hit in the top 5" by default. The baseline is
+measured with `VECTOR_WEIGHT=0` against the same build, so the FTS-only
+result set is scored by the same harness as the hybrid one.
+
+A response whose top-level `degraded` flag is true (query embedding failed,
+so the search ran FTS-only) is not a hybrid result and invalidates the run.
+Any such response makes the whole measurement an error. With --json, a
+degraded run still prints the payload, marked "valid": false with
+"passed": null and the "degraded" count, before exiting 2.
 
 Exit codes:
     0  gate passed
     1  gate failed
-    2  usage, connection, or validation error
+    2  usage, connection, or validation error, or any degraded response
     3  fewer than gate.minimum_queries queries -- not yet populated, not a
        failure; this is the expected state in slice 1 with the 3 examples
        shipped in the fixture.
@@ -215,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
 
     headers = {"X-API-Key": args.api_key}
     hits = 0
+    degraded = 0
     per_query: list[dict] = []
 
     try:
@@ -226,7 +234,10 @@ def main(argv: list[str] | None = None) -> int:
 
                 response = client.post("/api/v2/search", json=payload)
                 response.raise_for_status()
-                results = response.json().get("results", [])
+                body = response.json()
+                results = body.get("results", [])
+                if body.get("degraded") is True:
+                    degraded += 1
 
                 rank = score(results, golden_query.expect_path_or_uri, top_k)
                 if rank is not None:
@@ -243,22 +254,36 @@ def main(argv: list[str] | None = None) -> int:
         print(f"request failed: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    passed = hits >= golden.gate.threshold
-    print(f"hits@{top_k}: {hits}/{total}")
-    print("GATE PASS" if passed else "GATE FAIL")
+    # A degraded run is invalid: its verdict is never presented as a gate result.
+    # The JSON payload still goes out so a stdout consumer sees the degraded count.
+    valid = degraded == 0
+    passed = valid and hits >= golden.gate.threshold
+    if valid:
+        print(f"hits@{top_k}: {hits}/{total}")
+        print("GATE PASS" if passed else "GATE FAIL")
 
     if args.json:
         print(json_module.dumps(
             {
                 "populated": True,
+                "valid": valid,
                 "top_k": top_k,
                 "hits": hits,
                 "total": total,
                 "threshold": golden.gate.threshold,
-                "passed": passed,
+                "passed": passed if valid else None,
+                "degraded": degraded,
                 "queries": per_query,
             }
         ))
+
+    if not valid:
+        print(
+            f"error: {degraded} of {total} responses were degraded (FTS-only fallback); "
+            "the measurement is not valid",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
 
     return EXIT_PASS if passed else EXIT_FAIL
 

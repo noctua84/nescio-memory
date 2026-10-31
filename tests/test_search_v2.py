@@ -1,7 +1,19 @@
-"""POST /api/v2/search: what FTS finds, in what order, and the transaction it runs in.
+"""POST /api/v2/search: what it finds and in what order.
 
-FTS only in this slice -- nothing here embeds. Tenant isolation lives in
-tests/test_isolation_v2.py; everything below runs as a single client.
+Search is hybrid -- a full-text arm and a vector arm fused by reciprocal rank
+-- so a test that asserts pure full-text semantics (which words match, the
+A > B > C weight ordering, phrases, exclusions, an empty tsquery) requests the
+`fts_only` fixture. That is VECTOR_WEIGHT=0, the same switch the FTS-only
+baseline uses, and it pins the FTS arm: without it the vector arm, which
+always fills up to top_k, would answer an exact-result-set assertion for the
+wrong reason. Tests with no such dependency run hybrid, as production does.
+The fused ranking itself is pinned at the repository level in
+tests/test_search_hybrid.py; the stop-word query answered by the vector arm
+and the transaction guards are in tests/test_search_contract.py (split out
+for length); tenant isolation is in tests/test_isolation_v2*.py.
+Every response here is asserted non-degraded: the `client` fixture fakes the
+query embedder, so a degraded answer would mean the vector arm silently
+dropped out.
 
 The ranking tests depend on ts_rank_cd's default weight vector
 {D, C, B, A} = {0.1, 0.2, 0.4, 1.0} and on which text goes at which weight:
@@ -12,12 +24,6 @@ ordering, which is otherwise an untested opinion.
 """
 from datetime import date
 
-import pytest
-from sqlalchemy import text
-from sqlalchemy.orm import Session
-
-import app.config as config_module
-from app.repositories.passage_search import PassageSearchRepository
 from tests.factories import make_api_key, make_note, make_passage
 
 
@@ -29,10 +35,11 @@ def _search(client, key, q, **overrides):
 
 def _results(response):
     assert response.status_code == 200, response.text
+    assert response.json()["degraded"] is False
     return response.json()["results"]
 
 
-def test_search_finds_a_passage_by_a_word_in_its_content(client, db_session):
+def test_search_finds_a_passage_by_a_word_in_its_content(client, db_session, fts_only):
     key = make_api_key(db_session, "acme")
     note = make_note(db_session, "acme")
     passage = make_passage(
@@ -43,10 +50,12 @@ def test_search_finds_a_passage_by_a_word_in_its_content(client, db_session):
 
     assert [r["passage_id"] for r in results] == [passage.id]
     assert results[0]["content"] == "The pelicanium isotope decays slowly."
-    assert results[0]["rank"] > 0
+    assert results[0]["score"] > 0
 
 
-def test_search_finds_a_passage_by_a_word_in_its_notes_name(client, db_session):
+def test_search_finds_a_passage_by_a_word_in_its_notes_name(
+    client, db_session, fts_only
+):
     # The A-weight section's first half: the term appears only in the note's
     # name, nowhere in the passage text.
     key = make_api_key(db_session, "acme")
@@ -59,7 +68,9 @@ def test_search_finds_a_passage_by_a_word_in_its_notes_name(client, db_session):
     assert results[0]["name"] == "Pelicanium handling guide"
 
 
-def test_search_finds_a_passage_by_a_word_in_its_heading_path(client, db_session):
+def test_search_finds_a_passage_by_a_word_in_its_heading_path(
+    client, db_session, fts_only
+):
     # The other half of A.
     key = make_api_key(db_session, "acme")
     note = make_note(db_session, "acme")
@@ -77,7 +88,7 @@ def test_search_finds_a_passage_by_a_word_in_its_heading_path(client, db_session
 
 
 def test_search_finds_a_passage_by_a_word_in_its_notes_description(
-    client, db_session
+    client, db_session, fts_only
 ):
     # The C-weight section: description reaches the index only through it, so
     # without that section this query finds nothing at all.
@@ -93,7 +104,9 @@ def test_search_finds_a_passage_by_a_word_in_its_notes_description(
     assert results[0]["description"] == "Everything about pelicanium decay."
 
 
-def test_a_content_match_outranks_a_description_only_match(client, db_session):
+def test_a_content_match_outranks_a_description_only_match(
+    client, db_session, fts_only
+):
     # Decision 9 asserted rather than assumed: description sits at C (0.2),
     # below content's B (0.4), because a note-level description is copied onto
     # every passage of its note and would otherwise outrank the one passage
@@ -121,10 +134,10 @@ def test_a_content_match_outranks_a_description_only_match(client, db_session):
         content_passage.id,
         description_passage.id,
     ]
-    assert results[0]["rank"] > results[1]["rank"]
+    assert results[0]["score"] > results[1]["score"]
 
 
-def test_name_and_heading_matches_outrank_content_matches(client, db_session):
+def test_name_and_heading_matches_outrank_content_matches(client, db_session, fts_only):
     # The A end of the same ordering: name + heading path sit at weight 1.0.
     key = make_api_key(db_session, "acme")
     a_note = make_note(
@@ -147,10 +160,12 @@ def test_name_and_heading_matches_outrank_content_matches(client, db_session):
     results = _results(_search(client, key, "pelicanium"))
 
     assert [r["passage_id"] for r in results] == [a_passage.id, b_passage.id]
-    assert results[0]["rank"] > results[1]["rank"]
+    assert results[0]["score"] > results[1]["score"]
 
 
-def test_a_quoted_phrase_matches_only_an_adjacent_occurrence(client, db_session):
+def test_a_quoted_phrase_matches_only_an_adjacent_occurrence(
+    client, db_session, fts_only
+):
     # The websearch_to_tsquery behaviour that motivates it over
     # plainto_tsquery: a quoted phrase becomes a <-> (adjacency) query, so the
     # passage with the same two words far apart does not match.
@@ -177,7 +192,7 @@ def test_a_quoted_phrase_matches_only_an_adjacent_occurrence(client, db_session)
     assert [r["passage_id"] for r in results] == [adjacent.id]
 
 
-def test_a_negated_term_excludes_a_passage(client, db_session):
+def test_a_negated_term_excludes_a_passage(client, db_session, fts_only):
     key = make_api_key(db_session, "acme")
     note = make_note(db_session, "acme")
     kept = make_passage(
@@ -206,14 +221,17 @@ def test_top_k_limits_the_number_of_results(client, db_session):
             content=f"Pelicanium note number {ordinal} with some filler text.",
         )
 
+    # Hybrid on: the vector arm alone would return all four, so the cap is
+    # what holds this to two.
     results = _results(_search(client, key, "pelicanium", top_k=2))
 
     assert len(results) == 2
 
 
-def test_results_are_ordered_by_descending_rank(client, db_session):
+def test_results_are_ordered_by_descending_score(client, db_session, fts_only):
     # Three deliberately different weights, so the order is forced rather
-    # than tied: A > B > C.
+    # than tied: A > B > C. With the vector arm off, each result reports its
+    # FTS rank and a null vector rank -- that arm did not run.
     key = make_api_key(db_session, "acme")
     a_note = make_note(
         db_session, "acme", path_or_uri="docs/a.md", name="Pelicanium guide"
@@ -233,17 +251,20 @@ def test_results_are_ordered_by_descending_rank(client, db_session):
 
     results = _results(_search(client, key, "pelicanium"))
 
-    ranks = [r["rank"] for r in results]
-    assert ranks == sorted(ranks, reverse=True)
+    scores = [r["score"] for r in results]
     assert [r["passage_id"] for r in results] == [
         a_passage.id,
         b_passage.id,
         c_passage.id,
     ]
-    assert ranks[0] > ranks[1] > ranks[2]
+    assert scores[0] > scores[1] > scores[2]
+    assert [r["fts_rank"] for r in results] == [1, 2, 3]
+    assert [r["vector_rank"] for r in results] == [None, None, None]
 
 
 def test_repo_filter_restricts_to_one_scope(client, db_session):
+    # Hybrid on, deliberately: both passages match both arms, so the filter
+    # must hold on the vector arm too, not only on the full-text one.
     key = make_api_key(db_session, "acme")
     wanted_note = make_note(db_session, "acme", scope="repo_a")
     wanted = make_passage(
@@ -263,16 +284,15 @@ def test_repo_filter_restricts_to_one_scope(client, db_session):
 
 
 def test_an_empty_tsquery_returns_no_results_rather_than_an_error(
-    client, db_session
+    client, db_session, fts_only
 ):
+    # The FTS arm alone: a stop-word-only query reduces to an empty tsquery,
+    # which matches nothing and must not raise.
     key = make_api_key(db_session, "acme")
     note = make_note(db_session, "acme")
     make_passage(db_session, note, content="The pelicanium isotope decays slowly.")
 
-    response = _search(client, key, "the")
-
-    assert response.status_code == 200
-    assert response.json()["results"] == []
+    assert _results(_search(client, key, "the")) == []
 
 
 def test_search_returns_the_notes_description_provenance_and_status_on_each_result(
@@ -315,13 +335,16 @@ def test_search_returns_the_notes_description_provenance_and_status_on_each_resu
     assert result["provenance_kind"] == "user override"
     assert result["provenance_date"] == "2026-02-03"
     assert result["status"] == "approved"
-    assert result["rank"] > 0
+    assert result["score"] > 0
+    # The only passage, matched by keyword and (as every passage is) by
+    # meaning, so it tops both arms.
+    assert (result["fts_rank"], result["vector_rank"]) == (1, 1)
 
 
 def test_search_does_not_filter_or_rerank_by_status(client, db_session):
     # The user decision made explicit: status is metadata the caller may act
     # on, not a search-time filter or a ranking input. A superseded note's
-    # passage appears, with the same rank as its approved twin.
+    # passage appears, ranked exactly as its approved twin would be.
     key = make_api_key(db_session, "acme")
     superseded_note = make_note(
         db_session, "acme", path_or_uri="docs/old.md", status="superseded"
@@ -342,38 +365,9 @@ def test_search_does_not_filter_or_rerank_by_status(client, db_session):
     assert set(by_id) == {superseded.id, approved.id}
     assert by_id[superseded.id]["status"] == "superseded"
     assert by_id[approved.id]["status"] == "approved"
-    # Identical text, so identical rank: status moved neither of them.
-    assert by_id[superseded.id]["rank"] == by_id[approved.id]["rank"]
-
-
-def test_search_applies_the_configured_statement_timeout_to_its_transaction(
-    db_session, monkeypatch
-):
-    # Modelled on the v1 test of the same name. A distinctive value, unlikely
-    # to collide with either the default (5000) or the Postgres server default
-    # (0), so this fails loudly if the set_config('statement_timeout', ...)
-    # line in PassageSearchRepository.search_fts is ever removed or stops reading
-    # settings.statement_timeout_ms.
-    monkeypatch.setattr(config_module.settings, "statement_timeout_ms", 4321)
-
-    PassageSearchRepository(db_session, "acme").search_fts("pelicanium", 5)
-
-    shown = db_session.execute(text("SHOW statement_timeout")).scalar()
-    assert shown == "4321ms"
-
-
-def test_the_read_back_guard_fires_without_an_open_transaction(engine):
-    # Deliberately not the db_session fixture: that wraps everything in an
-    # outer transaction plus a savepoint, where SET LOCAL always persists and
-    # this failure cannot be reproduced. Under AUTOCOMMIT there is no
-    # transaction block, so set_config(..., true) applies only to its own
-    # statement and the search would otherwise run uncapped while still
-    # answering 200.
-    connection = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
-    session = Session(bind=connection)
-    try:
-        with pytest.raises(RuntimeError, match="did not take effect"):
-            PassageSearchRepository(session, "acme").search_fts("pelicanium", 5)
-    finally:
-        session.close()
-        connection.close()
+    # Identical text, so identical keyword relevance and identical vectors:
+    # both arms tie, and a tie in either arm breaks by passage id. The
+    # superseded passage is seeded first, so it leads in both arms -- a
+    # status-based demotion would be the only thing that could flip it.
+    assert [r["passage_id"] for r in results] == [superseded.id, approved.id]
+    assert [(r["fts_rank"], r["vector_rank"]) for r in results] == [(1, 1), (2, 2)]
