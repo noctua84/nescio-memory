@@ -185,6 +185,7 @@ def make_passage(
     content: str = "a remembered passage",
     embedding: list[float] | None = None,
     client_name: str | None = None,
+    scope: str | None = None,
 ) -> Passage:
     """Insert a Passage row directly, bypassing NoteRepository.replace_passages.
 
@@ -210,14 +211,17 @@ def make_passage(
     `client_name` defaults to the note's -- which is what replace_passages
     stamps, copying it from the note it writes under -- and is overridable
     specifically so a test can attempt a cross-tenant passage and assert the
-    composite FK (note_id, client_name) -> notes(id, client_name) rejects it
-    with an IntegrityError on flush.
+    composite FK (note_id, client_name, scope) -> notes(id, client_name, scope)
+    rejects it with an IntegrityError on flush. `scope` works the same way: it
+    defaults to the note's, as replace_passages stamps it, and is overridable
+    to attempt a mismatched scope.
 
     Flushes rather than commits, like the builders above.
     """
     row = Passage(
         note_id=note.id,
         client_name=note.client_name if client_name is None else client_name,
+        scope=note.scope if scope is None else scope,
         ordinal=ordinal,
         heading_path=heading_path,
         content=content,

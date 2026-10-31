@@ -11,12 +11,14 @@ it was created for. Those are behavioural facts and they are what this module
 asserts, by provoking each constraint through a real PostgreSQL server.
 
 The most important of them is the composite FK
-`(note_id, client_name) -> notes(id, client_name)`. Every v2 query filters
-`passages.client_name` as a single-table predicate rather than joining through
-`notes` (see app/repositories/note.py's module docstring), which is correct only
-while that column cannot disagree with the note's. The FK is the only thing that
-makes it so; `test_a_passage_cannot_name_another_tenants_note` is the only thing
-that makes the FK load-bearing in CI.
+`(note_id, client_name, scope) -> notes(id, client_name, scope)`. Every v2 query
+filters `passages.client_name` as a single-table predicate rather than joining
+through `notes` (see app/repositories/note.py's module docstring), which is
+correct only while that column cannot disagree with the note's. The FK is the
+only thing that makes it so; `test_a_passage_cannot_name_another_tenants_note`
+is the only thing that makes the FK load-bearing for the tenant column in CI.
+The scope column it also covers -- added by 17be352b1a4c -- is guarded in
+tests/test_passages_schema.py, along with that revision's own round trip.
 
 Every test here writes through the `db_session`/`connection` fixtures, whose
 outer transaction is rolled back, except `test_the_migration_is_reversible`,
@@ -37,6 +39,10 @@ from tests.factories import make_note, make_passage
 # not depend on a fixture module's private constants, and the path is the same
 # assumption alembic.ini's `prepend_sys_path = "."` already makes.
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
+
+# The revision immediately below 2eb0691f043c (create notes and passages). See
+# test_the_migration_is_reversible for why this is a literal and not `-1`.
+BEFORE_NOTES_AND_PASSAGES = "9439c6362bb3"
 
 
 def _passage_count(db_session, note_id: int) -> int:
@@ -126,10 +132,12 @@ def test_a_passage_cannot_name_another_tenants_note(db_session):
 
     `passages.client_name` is duplicated from the note so the tenant predicate
     stays single-table on the scanned table (issues #12/#74). That duplication is
-    safe only because the composite FK (note_id, client_name) ->
-    notes(id, client_name) makes a disagreeing pair unrepresentable. Two
-    independent single-column FKs would accept this insert: note_id 1 exists and
-    the client_name column has no FK of its own.
+    safe only because the composite FK (note_id, client_name, scope) ->
+    notes(id, client_name, scope) makes a disagreeing pair unrepresentable.
+    Independent single-column FKs would accept this insert: the note_id exists
+    and the client_name column has no FK of its own. The passage keeps the
+    note's scope (make_passage's default), so the only column in disagreement
+    is client_name and the rejection is attributable to it alone.
     """
     note = make_note(db_session, "acme")
     make_note(db_session, "other", path_or_uri="docs/other.md")
@@ -294,12 +302,22 @@ def test_the_tsv_gin_index_is_used_for_a_search(db_session):
 
 
 def test_the_migration_is_reversible(engine):
-    """`alembic downgrade -1` then `upgrade head` must both succeed.
+    """Downgrading past the notes/passages revision, then to head, both succeed.
 
     A migration whose downgrade is wrong is only discovered when someone needs
     it, which is the worst possible moment. Both directions are exercised here
     and the schema is left exactly as the session-scoped `engine` fixture
     migrated it.
+
+    Pinned to an explicit revision, 9439c6362bb3 -- the one immediately before
+    2eb0691f043c created notes and passages -- rather than `-1`. A relative
+    target means whatever the newest revision happens to be, so adding a
+    revision on top silently changes what this test covers: it once did, when
+    17be352b1a4c landed and `-1` stopped reaching the table drops at all. The
+    downgrade therefore runs every revision above 9439c6362bb3, which is the
+    point: the whole stack on top of the tables must unwind, in order. The
+    newer revision's own before/after shape is asserted separately in
+    tests/test_passages_schema.py.
 
     Isolation, following the pattern in
     tests/test_statement_timeout.py::test_postgres_actually_cancels_a_statement_over_a_tight_timeout:
@@ -326,7 +344,11 @@ def test_the_migration_is_reversible(engine):
     try:
         alembic_config.attributes["connection"] = conn
 
-        command.downgrade(alembic_config, "-1")
+        command.downgrade(alembic_config, BEFORE_NOTES_AND_PASSAGES)
+
+        assert conn.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one() == BEFORE_NOTES_AND_PASSAGES
 
         # Both tables are gone, and the extension other migrations depend on is
         # not: the downgrade deliberately leaves `vector` alone because

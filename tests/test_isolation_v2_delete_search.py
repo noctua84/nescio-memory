@@ -284,8 +284,8 @@ def test_search_v2_does_not_return_a_passage_whose_note_belongs_to_another_tenan
 
     A passage carries its own `client_name`, so in principle one could sit
     under another tenant's note and be returned to the wrong caller. No query
-    prevents that; the composite FK (note_id, client_name) -> notes(id,
-    client_name) does, by refusing the row at insert time. So the assertion is
+    prevents that; the composite FK (note_id, client_name, scope) -> notes(id,
+    client_name, scope) does, by refusing the row at insert time. So the assertion is
     on the constraint, not on a search response: there is no such passage to
     search for.
     """

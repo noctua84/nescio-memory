@@ -167,7 +167,9 @@ class NoteRepository:
         ).returning(Note.id)
         return self.db.execute(stmt).scalar_one()
 
-    def replace_passages(self, note_id: int, passages: Sequence[PassageRow]) -> int:
+    def replace_passages(
+        self, note_id: int, scope: str, passages: Sequence[PassageRow]
+    ) -> int:
         """Delete this note's passages and write the given set in their place.
 
         Wholesale replacement rather than a diff: ordinals shift whenever a
@@ -217,6 +219,7 @@ class NoteRepository:
         stmt = insert(Passage).values(
             note_id=bindparam("note_id"),
             client_name=bindparam("client_name"),
+            scope=bindparam("scope"),
             ordinal=bindparam("ordinal"),
             heading_path=bindparam("heading_path"),
             content=bindparam("content"),
@@ -229,6 +232,10 @@ class NoteRepository:
                 {
                     "note_id": note_id,
                     "client_name": self.client_name,  # stamped from self
+                    # The composite FK (note_id, client_name, scope) rejects a
+                    # scope that differs from the note's, so a caller passing
+                    # the wrong one fails loudly instead of desynchronising it.
+                    "scope": scope,
                     "ordinal": passage.ordinal,
                     "heading_path": passage.heading_path,
                     "content": passage.content,

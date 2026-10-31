@@ -161,7 +161,7 @@ def ingest_note(
     # Embedding failures (EmbeddingBackendError) propagate uncaught and are
     # mapped to 503 + Retry-After by app/core/errors.py. No commit has
     # happened yet, so a failure here leaves the previous passages intact.
-    count = repo.replace_passages(note_id, rows)
+    count = repo.replace_passages(note_id, request.scope, rows)
 
     db.commit()  # single transaction boundary for the whole note
     return IngestV2Response(note_id=note_id, passages=count, skipped=False)

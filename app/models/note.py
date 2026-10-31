@@ -19,9 +19,12 @@ class Note(Base):
             name="uq_notes_client_scope_path",
         ),
         # Exists solely so passages' composite FK can reference
-        # (notes.id, notes.client_name) -- Postgres requires the referenced
-        # columns of a composite FK to be covered by a unique constraint.
-        UniqueConstraint("id", "client_name", name="uq_notes_id_client"),
+        # (notes.id, notes.client_name, notes.scope) -- Postgres requires the
+        # referenced columns of a composite FK to be covered by a unique
+        # constraint.
+        UniqueConstraint(
+            "id", "client_name", "scope", name="uq_notes_id_client_scope"
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
