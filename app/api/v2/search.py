@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db
 from app.core.security import get_current_client
 from app.models import ApiKey
-from app.repositories.note import NoteRepository
+from app.repositories.passage_search import PassageSearchRepository
 from app.schemas.search_v2 import SearchV2Request, SearchV2Response, SearchV2Result
 
 router = APIRouter()
@@ -44,12 +44,12 @@ def search_passages(
     db: Session = Depends(get_db),
     client: ApiKey = Depends(get_current_client),
 ) -> SearchV2Response:
-    repo = NoteRepository(db, client_name=client.client_name)
+    repo = PassageSearchRepository(db, client_name=client.client_name)
     rows = repo.search_fts(request.q, request.top_k, request.repo_filter)
 
     # Mapped field by field to the DTO. Never return a `Row`/model instance
     # directly -- the response shape is the contract, not whatever columns
-    # search_fts happens to select.
+    # the search happens to select.
     results = [
         SearchV2Result(
             passage_id=row.id,

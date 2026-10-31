@@ -263,7 +263,7 @@ def test_the_tsv_gin_index_is_used_for_a_search(db_session):
 
     db_session.execute(text("SET LOCAL enable_seqscan = off"))
 
-    # The FTS predicate from NoteRepository.search_fts verbatim, including
+    # The FTS predicate from PassageSearchRepository.search_fts verbatim, including
     # websearch_to_tsquery and the 'english' configuration -- an index built
     # under a different configuration would not serve this.
     plan = "\n".join(

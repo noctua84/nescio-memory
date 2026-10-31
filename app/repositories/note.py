@@ -1,4 +1,5 @@
-"""All notes/passages SQL (v2). Nothing outside this module touches those tables.
+"""All notes/passages SQL (v2) for writes and single-note reads. Nothing outside
+this module and passage_search.py touches those tables.
 
 Tenant discipline, stated once so it is not re-argued per method: every statement
 here carries `client_name == self.client_name` as a DIRECT argument to
@@ -18,7 +19,7 @@ from typing import Any, Sequence
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
-    Row, and_, bindparam, delete, func, insert, literal_column, select, text,
+    Row, bindparam, delete, func, insert, literal_column, select,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
@@ -202,7 +203,8 @@ class NoteRepository:
         # no frontmatter at all -- silently blanking that whole weight section.
         #
         # D is left unused: ts_rank_cd's default weight vector
-        # {D, C, B, A} = {0.1, 0.2, 0.4, 1.0} is what search_fts relies on.
+        # {D, C, B, A} = {0.1, 0.2, 0.4, 1.0} is what passage search relies on
+        # (app/repositories/passage_search.py).
         tsv = (
             _weighted("fts_a", "A")
             .op("||")(_weighted("content", "B"))
@@ -295,105 +297,3 @@ class NoteRepository:
             .returning(Note.id)
         )
         return self.db.execute(stmt).one_or_none() is not None
-
-    def search_fts(
-        self,
-        query: str,
-        top_k: int,
-        repo_filter: str | None = None,
-    ) -> Sequence[Row[Any]]:
-        """Full-text search over passages, carrying their note's metadata.
-
-        FTS only in this slice: no vector expression and no hnsw.* setting
-        anywhere, because nothing here touches the HNSW index.
-
-        statement_timeout is set with set_config(..., true), i.e. SET LOCAL --
-        scoped to this transaction, so it cannot leak onto a pooled connection
-        or affect ingest and the startup schema checks. `settings` is read at
-        CALL time, not captured at import, so tests can monkeypatch it.
-        """
-        self.db.execute(
-            text("SELECT set_config('statement_timeout', :t, true)"),
-            {"t": str(settings.statement_timeout_ms)},
-        )
-
-        # Read it back in a SEPARATE statement, mirroring
-        # app/repositories/learning.py:182-196. The separation is the point:
-        # SET LOCAL needs an open transaction block to persist past its own
-        # statement, and with none open the timeout covers only the set_config
-        # call itself while this search runs uncapped and still answers 200.
-        # Reading it back inside the same statement would prove nothing.
-        #
-        # Session.in_transaction() is not the guard: it is False before the
-        # first statement (autobegin is lazy) and True under AUTOCOMMIT where
-        # SET LOCAL still no-ops. It inspects the Session, not the database.
-        shown = self.db.execute(
-            text("SELECT current_setting('statement_timeout')")
-        ).scalar_one()
-        if shown not in _timeout_spellings(settings.statement_timeout_ms):
-            raise RuntimeError(
-                f"statement_timeout setting did not take effect: expected "
-                f"{settings.statement_timeout_ms}ms but got {shown!r}. "
-                f"set_config(..., true) is SET LOCAL and requires an open "
-                f"transaction block to persist to the next statement. With no "
-                f"transaction open (e.g. an AUTOCOMMIT connection) it applies "
-                f"only to its own statement and this search would run uncapped "
-                f"while still answering 200."
-            )
-
-        q = func.websearch_to_tsquery("english", query)
-        # Left on the default weight vector {0.1, 0.2, 0.4, 1.0} deliberately:
-        # putting description at weight C depends on those defaults, so a
-        # custom vector here would silently rebalance A/B/C.
-        rank = func.ts_rank_cd(Passage.tsv, q).label("rank")
-        stmt = (
-            select(
-                Passage.id, Passage.note_id, Passage.ordinal,
-                Passage.heading_path, Passage.content, rank,
-                Note.name, Note.description, Note.type, Note.path_or_uri,
-                Note.scope, Note.provenance_kind, Note.provenance_date,
-                Note.status,
-            )
-            .join(
-                Note,
-                and_(
-                    Note.id == Passage.note_id,
-                    Note.client_name == Passage.client_name,
-                ),
-            )
-            # Both client_name predicates are present on purpose: the one on
-            # Passage is the single-table predicate on the table the GIN index
-            # scans, and the one on Note is independent of the join condition,
-            # so dropping either still leaves the boundary enforced.
-            .where(
-                Passage.client_name == self.client_name,
-                Note.client_name == self.client_name,
-                Passage.tsv.op("@@")(q),
-            )
-            # Passage.id is a deterministic tiebreak: ts_rank_cd ties are
-            # common and an unstable order makes tests flap.
-            .order_by(rank.desc(), Passage.id)
-            .limit(top_k)
-        )
-        if repo_filter:
-            stmt = stmt.where(Note.scope == repo_filter)
-
-        return self.db.execute(stmt).all()
-
-
-def _timeout_spellings(milliseconds: int) -> frozenset[str]:
-    """Every rendering Postgres may give back for this many milliseconds.
-
-    `current_setting('statement_timeout')` normalises an integer GUC to the
-    largest unit that divides it evenly -- 5000 comes back as "5s", 60000 as
-    "1min", 4321 stays "4321ms", 0 is a bare "0". So the read-back guard cannot
-    compare against f"{ms}ms" alone: on the default 5000 that spelling never
-    matches and the guard would fire on a correctly applied setting.
-    """
-    if milliseconds == 0:
-        return frozenset({"0", "0ms"})
-    spellings = {f"{milliseconds}ms"}
-    for unit, size in (("s", 1_000), ("min", 60_000), ("h", 3_600_000)):
-        if milliseconds % size == 0:
-            spellings.add(f"{milliseconds // size}{unit}")
-    return frozenset(spellings)

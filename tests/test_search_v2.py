@@ -17,7 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import app.config as config_module
-from app.repositories.note import NoteRepository
+from app.repositories.passage_search import PassageSearchRepository
 from tests.factories import make_api_key, make_note, make_passage
 
 
@@ -352,11 +352,11 @@ def test_search_applies_the_configured_statement_timeout_to_its_transaction(
     # Modelled on the v1 test of the same name. A distinctive value, unlikely
     # to collide with either the default (5000) or the Postgres server default
     # (0), so this fails loudly if the set_config('statement_timeout', ...)
-    # line in NoteRepository.search_fts is ever removed or stops reading
+    # line in PassageSearchRepository.search_fts is ever removed or stops reading
     # settings.statement_timeout_ms.
     monkeypatch.setattr(config_module.settings, "statement_timeout_ms", 4321)
 
-    NoteRepository(db_session, "acme").search_fts("pelicanium", 5)
+    PassageSearchRepository(db_session, "acme").search_fts("pelicanium", 5)
 
     shown = db_session.execute(text("SHOW statement_timeout")).scalar()
     assert shown == "4321ms"
@@ -373,7 +373,7 @@ def test_the_read_back_guard_fires_without_an_open_transaction(engine):
     session = Session(bind=connection)
     try:
         with pytest.raises(RuntimeError, match="did not take effect"):
-            NoteRepository(session, "acme").search_fts("pelicanium", 5)
+            PassageSearchRepository(session, "acme").search_fts("pelicanium", 5)
     finally:
         session.close()
         connection.close()
