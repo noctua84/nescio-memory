@@ -42,8 +42,8 @@ class Note(Base):
     content_hash: Mapped[str] = mapped_column(Text, nullable=False)
     pipeline_version: Mapped[str] = mapped_column(Text, nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
-    # Column name "meta", not "metadata" -- that collision is learnings'
-    # problem, not ours.
+    # Column name "meta", not "metadata": SQLAlchemy reserves `metadata` on
+    # declarative classes, so no mapped attribute can carry that name.
     meta: Mapped[dict] = mapped_column("meta", JSONB, nullable=False, server_default="{}")
 
     created_at: Mapped[datetime] = mapped_column(

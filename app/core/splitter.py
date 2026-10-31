@@ -30,7 +30,7 @@ SPLITTER_VERSION = "3"
 # using* (and is the soft target when packing paragraphs); MAX_CHARS is the
 # hard cap on a single passage.
 #
-# The gap between them is measured, not guessed: of the 458 notes in the ai-os
+# The gap between them is measured, not guessed: of the 458 notes in a real-world
 # corpus at or under 4 KB, 64 carry three or more `##` headings and all 64 sit
 # in the 1.5-4 KB band. A 4 KB "small note stays whole" threshold would have
 # left every one of those 64 genuinely structured notes as a single
@@ -46,8 +46,8 @@ MAX_CHARS = 4_000
 MIN_SECTION_CHARS = 300
 
 # There is no *minimum passage length*. The MIN_CONTENT_CHARS = 50 floor that
-# /api/v1 applies is deliberately absent here: it silently dropped short
-# notes, and a short note is still worth finding.
+# the removed v1 chunker applied is deliberately absent here: it silently
+# dropped short notes, and a short note is still worth finding.
 
 # `#` (H1) is not a split point. A document opening with `# ADR-0003: ...`
 # followed by a status block keeps that text as the preamble.
@@ -58,9 +58,8 @@ _FENCE_PREFIXES = ("```", "~~~")
 # "Decision › Eviction order" for a `### Eviction order` under `## Decision`.
 _HEADING_SEP = " › "
 
-# The provenance line ai-os writes (see
-# ~/PycharmProjects/ai-os/scripts/promote_learnings.py). The separator is an
-# em-dash *or* a hyphen, hence the alternation.
+# The provenance line the upstream note-promotion tool writes. The separator
+# is an em-dash *or* a hyphen, hence the alternation.
 _PROVENANCE_RE = re.compile(
     r"\[Source:\s*(user override|empirical|agent inference)\s*[—-]\s*"
     r"(\d{4}-\d{2}-\d{2})\s*\]"

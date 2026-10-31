@@ -157,28 +157,42 @@ def test_a_bad_db_connect_timeout_in_the_environment_fails_at_startup(monkeypatc
         Settings(_env_file=None)
 
 
-def test_max_context_documents_defaults_to_25():
-    assert _settings().max_context_documents == 25
+@pytest.mark.parametrize(
+    "stale_env_var, stale_field",
+    [
+        ("CHUNK_SIZE", "chunk_size"),
+        ("CHUNK_OVERLAP", "chunk_overlap"),
+        ("MAX_CONTEXT_CHARS", "max_context_chars"),
+        ("MAX_CONTEXT_DOCUMENTS", "max_context_documents"),
+    ],
+)
+def test_an_env_var_for_a_removed_setting_is_ignored(
+    monkeypatch, stale_env_var, stale_field
+):
+    # These four settings went with the removed v1 API. A deployment whose
+    # .env still carries them must keep booting, so Settings relies on
+    # extra="ignore": the stale variable is neither rejected as an unknown
+    # field nor bound to an attribute anything could still read. A value that
+    # the removed validators would have refused (0, an overlap that never
+    # advances the window) makes a surviving validator impossible to miss.
+    monkeypatch.setenv(stale_env_var, "0")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@localhost:5432/db")
+    monkeypatch.setenv("OLLAMA_URL", "http://localhost:11434/api/embed")
+
+    loaded = Settings(_env_file=None)
+
+    assert not hasattr(loaded, stale_field)
+    assert stale_field not in Settings.model_fields
 
 
-def test_a_single_context_document_is_accepted():
-    assert _settings(max_context_documents=1).max_context_documents == 1
+def test_stale_settings_are_ignored_when_passed_as_init_kwargs():
+    # The same contract for values that reach Settings as keyword arguments
+    # (the route _settings() above takes), which pydantic validates separately
+    # from the environment source.
+    loaded = _settings(chunk_size=1000, chunk_overlap=200, max_context_chars=0)
 
-
-@pytest.mark.parametrize("non_positive", [0, -1])
-def test_a_non_positive_max_context_documents_fails_at_startup(non_positive):
-    # 0 does not narrow context expansion, it disables it while /search still
-    # accepts requests asking for context -- indistinguishable from a bug.
-    with pytest.raises(ValueError, match="MAX_CONTEXT_DOCUMENTS"):
-        _settings(max_context_documents=non_positive)
-
-
-def test_max_context_documents_reads_its_environment_variable(monkeypatch):
-    monkeypatch.setenv("MAX_CONTEXT_DOCUMENTS", "7")
-    monkeypatch.setenv(
-        "DATABASE_URL", "postgresql+psycopg://u:p@localhost:5432/db"
-    )
-    assert Settings(_env_file=None).max_context_documents == 7
+    for stale_field in ("chunk_size", "chunk_overlap", "max_context_chars"):
+        assert not hasattr(loaded, stale_field)
 
 
 # --- search and query-embedding settings ---

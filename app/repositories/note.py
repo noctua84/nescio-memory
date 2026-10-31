@@ -4,7 +4,7 @@ this module and passage_search.py touches those tables.
 Tenant discipline, stated once so it is not re-argued per method: every statement
 here carries `client_name == self.client_name` as a DIRECT argument to
 `.where(...)` -- top level, never only inside a join condition, never inside an
-`or_()` group. Same reasoning as app/repositories/learning.py:305-319: a filter
+`or_()` group. A filter
 inside a composed predicate is correct only while every branch of that
 composition carries it, so one `continue` or one refactored predicate list leaks
 another tenant's rows from a single branch while the rest still look right --
@@ -124,8 +124,7 @@ class NoteRepository:
         """Insert or update the note by its (client, scope, path) identity.
 
         `client_name` is stamped from self, never passed by the caller --
-        exactly as LearningRepository.add stamps it, so no route can choose
-        which tenant it writes to.
+        so no route can choose which tenant it writes to.
 
         Why this is a SECOND statement after lock_note, which looks redundant
         and is not: one INSERT ... ON CONFLICT DO UPDATE ... RETURNING cannot

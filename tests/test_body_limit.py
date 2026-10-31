@@ -32,6 +32,8 @@ LIMIT = 100
 TOO_LARGE_DETAIL = f"Request body too large: limit is {LIMIT} bytes."
 BAD_LENGTH_DETAIL = "Invalid Content-Length header."
 
+UNLIMITED_PATH = "/internal/echo"
+
 
 class Recorder:
     """What the wrapped app saw, if it was entered at all."""
@@ -72,8 +74,12 @@ def _build_app(max_bytes: int = LIMIT) -> tuple[TestClient, Recorder]:
         methods=["POST"],
         dependencies=[Depends(record_dependency)],
     )
+    # Outside the limited prefix, for the scoping tests. Deliberately not an
+    # /api/<version> path: the scoping contract is "only /api/v2/ is
+    # inspected", and a neutral path keeps that true whatever the API prefix
+    # is later renamed to.
     app.add_api_route(
-        "/api/v1/echo",
+        UNLIMITED_PATH,
         echo,
         methods=["POST"],
         dependencies=[Depends(record_dependency)],
@@ -290,21 +296,34 @@ def test_a_chunked_body_under_the_limit_passes_through_intact():
 # --- scoping -----------------------------------------------------------------
 
 
-def test_a_non_v2_path_is_not_intercepted():
+def test_a_path_outside_the_prefix_is_not_intercepted():
     client, recorder = _build_app()
     body = b"x" * (LIMIT * 5)
 
-    response = client.post("/api/v1/echo", content=body)
+    response = client.post(UNLIMITED_PATH, content=body)
 
     assert response.status_code == 200
     assert recorder.body == body
 
 
-def test_a_non_v2_path_with_a_bad_content_length_is_not_intercepted():
+def test_a_path_outside_the_prefix_with_a_bad_content_length_is_not_intercepted():
     status, _, recorder = _raw_asgi_post(
-        "/api/v1/echo",
+        UNLIMITED_PATH,
         [(b"content-length", b"not-a-number")],
         b"",
+    )
+
+    assert status == 200
+    assert recorder.handler_calls == 1
+
+
+def test_the_prefix_match_is_on_the_whole_segment():
+    """``/api/v2/`` with its trailing slash: a sibling such as ``/api/v2x/``
+    shares the leading characters but is outside the limited prefix."""
+    status, _, recorder = _raw_asgi_post(
+        "/api/v2x/echo",
+        [(b"content-length", str(LIMIT * 5).encode())],
+        b"x" * (LIMIT * 5),
     )
 
     assert status == 200

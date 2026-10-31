@@ -929,7 +929,7 @@ def test_a_zero_norm_embedding_is_rejected_through_the_whole_fetch_chain(
 @pytest.mark.parametrize("vector", ZERO_NORM_VECTORS)
 def test_the_zero_norm_rejection_is_a_backend_fault_not_a_request_error(vector):
     # The alerting contract, pinned at the exception level rather than at the
-    # route (tests/test_error_responses.py covers that end). The class decides
+    # route (tests/test_error_responses_embedding.py covers that end). The class decides
     # the status: EmbeddingBackendBadResponse is a 503 with Retry-After, which
     # is the honest answer -- the backend returned something architecturally
     # unusable and the caller's input was not at fault. Exact type as well as

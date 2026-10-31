@@ -204,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    ... and {remaining} more")
         print(
             "  Every ingest and every search will fail with a 503 while this "
-            "holds: the learnings.embedding column is float4 and pgvector "
+            "holds: passages.embedding is a float4 pgvector column and pgvector "
             "cannot store these values, so app.core.embeddings rejects the "
             "vector before the database sees it. EMBEDDING_DIMENSION is not "
             "the fault here -- fix or replace the model, then re-run."
@@ -224,8 +224,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  EMBEDDING_DIMENSION  {expected}")
         print(
             "  Every ingest and every search will fail. Set EMBEDDING_DIMENSION "
-            f"to {actual} and migrate the learnings.embedding column to "
+            f"to {actual} and migrate passages.embedding to "
             f"vector({actual}), or configure a model of width {expected}."
+        )
+        # passages.embedding_degenerate is a STORED generated column that reads
+        # embedding, so Postgres refuses ALTER COLUMN ... TYPE while it exists.
+        print(
+            "  The migration must drop passages.embedding_degenerate first, alter "
+            "embedding's type, then re-add embedding_degenerate with the same "
+            "generation expression. See the warning in "
+            "alembic/versions/17be352b1a4c_add_passage_scope_and_degenerate_flag.py."
         )
         return EXIT_MISMATCH
 

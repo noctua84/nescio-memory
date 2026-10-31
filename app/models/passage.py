@@ -37,8 +37,7 @@ class Passage(Base):
         Index("ix_passages_tsv", "tsv", postgresql_using="gin"),
         # Declared so the model matches the schema the migration creates.
         # It is not created from here -- the migration owns it -- but
-        # declaring it keeps autogenerate from reporting it as removable,
-        # exactly as learnings_embedding_idx is declared on Learning.
+        # declaring it keeps autogenerate from reporting it as removable.
         Index(
             "passages_embedding_idx",
             "embedding",

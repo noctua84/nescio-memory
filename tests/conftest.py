@@ -33,8 +33,8 @@ os.environ.setdefault(
     "postgresql+psycopg://placeholder:placeholder@localhost:1/placeholder",
 )
 
-# app/api/v1/ingest.py and app/api/v1/search.py are wrapped in Langfuse's
-# @observe(...) decorator, which reads its configuration directly from the
+# The route handlers in app/api/v2/ (ingest.py, search.py, notes.py) are
+# wrapped in Langfuse's @observe(...) decorator, which reads its configuration directly from the
 # process environment (nothing in app/ or tests/ feeds it settings.langfuse_*
 # explicitly). Confirmed from the installed langfuse==4.15.4 source
 # (langfuse/_client/environment_variables.py and
@@ -61,8 +61,6 @@ from testcontainers.community.postgres import PostgresContainer  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app.api.v1 import ingest as ingest_module  # noqa: E402
-from app.api.v1 import search as search_module  # noqa: E402
 from app.api.v2 import ingest as ingest_v2_module  # noqa: E402
 from app.api.v2 import search as search_v2_module  # noqa: E402
 from app.config import settings  # noqa: E402
@@ -131,7 +129,9 @@ def connection(engine):
     # problem. With ef_search back at its default -- the right call for production --
     # the full suite went red in 4 of 6 runs, test_top_k_limits_the_number_of_results
     # returning 0 or 1 rows of 2. Measured: ef=40 without this line, 4 of 6 red;
-    # ef=40 with it, 6 of 6 green.
+    # ef=40 with it, 6 of 6 green. That measurement was taken against the v1
+    # learnings search, since removed; the passages search's vector arm is ordered
+    # by the same HNSW index type, so the same reasoning applies to it.
     #
     # The mechanism: HNSW is approximate and post-filtered, so earlier tests'
     # rolled-back inserts leave index entries that crowd out the candidate window and
@@ -162,7 +162,8 @@ def db_session(connection):
     read its presence as evidence that a regression in it would be caught.
 
     What the suite does guard is the genuinely wrong setting: with
-    join_transaction_mode="control_fully", 17 tests fail, including
+    join_transaction_mode="control_fully", tests fail (17 when measured,
+    before the v1 suites were removed), including
     test_an_application_level_commit_does_not_escape_the_transaction, because
     the application's own commit() then ends the outer transaction.
 
@@ -179,23 +180,21 @@ def db_session(connection):
 def client(db_session, monkeypatch):
     """A TestClient wired to the test transaction, with embeddings faked.
 
-    The patch targets matter. v1's ingest.py and search.py each did
-    `from app.core.embeddings import get_embedding`, which binds the name into
-    their own module namespace -- patching app.core.embeddings.get_embedding
-    would have no effect on what the endpoints actually call, and the tests
-    would quietly make real HTTP requests and hang.
+    The patch targets matter. app/api/v2/ingest.py does
+    `from app.core.embeddings import get_embeddings` (one batched call per
+    note) and app/api/v2/search.py does
+    `from app.core.embeddings import get_query_embedding` (called whenever
+    settings.vector_weight > 0). A from-import binds the name into the route
+    module's own namespace, so patching app.core.embeddings would have no
+    effect on what the endpoints actually call: each route module needs its
+    own patch, on the name it imported.
 
-    The v2 routes bind their names the same way, so each needs its own patch
-    too: app/api/v2/ingest.py imports get_embeddings (one batched call per
-    note) and app/api/v2/search.py imports get_query_embedding (called whenever
-    settings.vector_weight > 0). The rule is mechanical: every embedding name a
-    route module imports needs a patch here, or tests make real HTTP calls to
-    Ollama -- which hang, or, for search, silently degrade to full-text results
-    and pass for the wrong reason. Adding a route that embeds means adding a
-    line below.
+    The rule is mechanical: every embedding name a route module imports needs
+    a patch here, or tests make real HTTP calls to Ollama -- which hang on
+    ingest, or, on search, degrade to full-text results (degraded: true) and
+    pass for the wrong reason. Adding a route that embeds means adding a line
+    below.
     """
-    monkeypatch.setattr(ingest_module, "get_embedding", fake_embedding)
-    monkeypatch.setattr(search_module, "get_embedding", fake_embedding)
     monkeypatch.setattr(ingest_v2_module, "get_embeddings", fake_embeddings)
     monkeypatch.setattr(search_v2_module, "get_query_embedding", fake_embedding)
 

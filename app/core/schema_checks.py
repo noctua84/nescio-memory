@@ -11,13 +11,13 @@ from app.config import settings
 
 
 def verify_embedding_dimension(engine: Engine) -> None:
-    """Fail fast if EMBEDDING_DIMENSION disagrees with the learnings/passages columns.
+    """Fail fast if EMBEDDING_DIMENSION disagrees with the passages.embedding column.
 
     Without this, a mismatch is rejected by pgvector at insert time, so the
     service starts cleanly, passes its liveness probe, and then fails at the
     first ingest -- possibly long after the deploy that caused it.
     """
-    tables = ("learnings", "passages")
+    tables = ("passages",)
 
     try:
         with engine.connect() as connection:
@@ -53,7 +53,7 @@ def verify_embedding_dimension(engine: Engine) -> None:
 
 
 # pgvector reports its own version through pg_extension. hnsw.iterative_scan,
-# which LearningRepository.search sets on every query, arrived in 0.8.0.
+# which PassageSearchRepository.search sets on every query, arrived in 0.8.0.
 _PGVECTOR_VERSION_QUERY = text(
     "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
 )
@@ -67,7 +67,7 @@ def verify_pgvector_version(engine: Engine) -> None:
     The `vector` extension reserves the `hnsw` GUC prefix, and PostgreSQL
     rejects an unknown parameter under a reserved prefix once the library is
     loaded in that backend. On pgvector 0.7.x the set_config call in
-    LearningRepository.search therefore raises and every search returns 500.
+    PassageSearchRepository.search therefore raises and every search returns 500.
     Checking at boot turns that into a failed deploy instead.
     """
     try:
