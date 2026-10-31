@@ -11,7 +11,7 @@ it was created for. Those are behavioural facts and they are what this module
 asserts, by provoking each constraint through a real PostgreSQL server.
 
 The most important of them is the composite FK
-`(note_id, client_name, scope) -> notes(id, client_name, scope)`. Every v2 query
+`(note_id, client_name, scope) -> notes(id, client_name, scope)`. Every passages query
 filters `passages.client_name` as a single-table predicate rather than joining
 through `notes` (see app/repositories/note.py's module docstring), which is
 correct only while that column cannot disagree with the note's. The FK is the
@@ -61,7 +61,7 @@ def _passage_count(db_session, note_id: int) -> int:
 def test_the_notes_identity_is_unique_per_client_scope_and_path(db_session):
     """uq_notes_client_scope_path is the identity ingest upserts on.
 
-    If it stopped covering all three columns, POST /api/v2/ingest's
+    If it stopped covering all three columns, POST /api/v1/ingest's
     `ON CONFLICT (constraint="uq_notes_client_scope_path")` would either fail to
     match or match the wrong row, and the same note could exist twice.
     """
@@ -152,7 +152,7 @@ def test_a_passage_cannot_name_another_tenants_note(db_session):
 def test_deleting_a_note_cascades_to_its_passages(db_session):
     """ON DELETE CASCADE on fk_passages_note, asserted at the schema level.
 
-    DELETE /api/v2/notes/{id} deletes the note row only and relies on the
+    DELETE /api/v1/notes/{id} deletes the note row only and relies on the
     cascade for its passages (NoteRepository.delete_note documents that choice).
     Without the cascade that route would either fail on the FK or orphan every
     passage, and a route-level test could only observe the 204 either way.
@@ -229,7 +229,7 @@ def test_the_passages_embedding_column_has_the_configured_width(engine):
 
     assert atttypmod == settings.embedding_dimension, (
         f"passages.embedding is vector({atttypmod}) but EMBEDDING_DIMENSION is "
-        f"{settings.embedding_dimension}. Every v2 ingest would fail at insert "
+        f"{settings.embedding_dimension}. Every ingest would fail at insert "
         "time and verify_embedding_dimension would refuse to boot. Either "
         "correct EMBEDDING_DIMENSION or migrate the column."
     )
@@ -286,7 +286,7 @@ def test_the_tsv_gin_index_is_used_for_a_search(db_session):
 
     assert "ix_passages_tsv" in plan, (
         "the FTS predicate cannot be served by the GIN index on passages.tsv, "
-        "so every v2 search is a sequential scan over the whole tenant corpus. "
+        "so every search is a sequential scan over the whole tenant corpus. "
         f"Plan:\n{plan}"
     )
     # The row is actually found through that plan, not merely planned for: an

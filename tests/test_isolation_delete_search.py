@@ -1,6 +1,6 @@
-"""The tenant boundary for /api/v2 -- delete and search.
+"""The tenant boundary for /api/v1 -- delete and search.
 
-The second half of tests/test_isolation_v2.py, split out to keep each module
+The second half of tests/test_isolation.py, split out to keep each module
 under the length the plan asks for; that module's docstring states the stakes
 and the two rules every test here follows, and the markers and small request
 helpers are repeated here rather than shared, so neither module depends on the
@@ -15,7 +15,7 @@ from app.models.passage import Passage
 from tests.factories import make_api_key, make_note, make_passage
 from tests.fakes import fake_embedding
 
-# Single lowercase tokens, deliberately: v2 search has a full-text arm, and
+# Single lowercase tokens, deliberately: search has a full-text arm, and
 # to_tsvector/websearch_to_tsquery must agree on the token for a marker to be
 # both findable by the owner and assertable-absent for everyone else. Its
 # vector arm matches on meaning instead, with no keyword in common needed --
@@ -42,21 +42,21 @@ def _body(marker: str) -> str:
 
 
 def _delete_note(client, key, note_id):
-    return client.delete(f"/api/v2/notes/{note_id}", headers={"X-API-Key": key})
+    return client.delete(f"/api/v1/notes/{note_id}", headers={"X-API-Key": key})
 
 
 def _search(client, key, **overrides):
     payload = {"q": SHARED_WORD, "top_k": 50}
     payload.update(overrides)
-    return client.post("/api/v2/search", json=payload, headers={"X-API-Key": key})
+    return client.post("/api/v1/search", json=payload, headers={"X-API-Key": key})
 
 
 # ---------------------------------------------------------------------------
-# DELETE /api/v2/notes/{note_id}
+# DELETE /api/v1/notes/{note_id}
 # ---------------------------------------------------------------------------
 
 
-def test_delete_note_v2_returns_404_for_another_tenants_note_id(client, db_session):
+def test_delete_note_returns_404_for_another_tenants_note_id(client, db_session):
     acme_note = make_note(db_session, "acme", body=_body(ACME_MARKER))
     globex_key = make_api_key(db_session, "globex")
 
@@ -128,7 +128,7 @@ def test_the_client_filter_is_what_prevents_the_delete(client, db_session):
     )
 
 
-def test_delete_note_v2_404_is_identical_for_a_missing_and_a_foreign_note(
+def test_delete_note_404_is_identical_for_a_missing_and_a_foreign_note(
     client, db_session
 ):
     acme_note = make_note(db_session, "acme", body=_body(ACME_MARKER))
@@ -144,11 +144,11 @@ def test_delete_note_v2_404_is_identical_for_a_missing_and_a_foreign_note(
 
 
 # ---------------------------------------------------------------------------
-# POST /api/v2/search
+# POST /api/v1/search
 # ---------------------------------------------------------------------------
 
 
-def test_search_v2_does_not_return_another_clients_passages(client, db_session):
+def test_search_does_not_return_another_clients_passages(client, db_session):
     acme_note = make_note(db_session, "acme", name="Acme Ledger")
     make_passage(db_session, acme_note, content=_body(ACME_MARKER))
     globex_key = make_api_key(db_session, "globex")
@@ -160,7 +160,7 @@ def test_search_v2_does_not_return_another_clients_passages(client, db_session):
     assert ACME_MARKER not in response.text
 
 
-def test_the_client_filter_is_what_excludes_the_passage_in_v2(client, db_session):
+def test_the_client_filter_is_what_excludes_the_passage(client, db_session):
     """The same body posted twice with different keys.
 
     Globex holds its own marker-bearing passage matching the same query, so
@@ -189,7 +189,7 @@ def test_the_client_filter_is_what_excludes_the_passage_in_v2(client, db_session
     assert GLOBEX_MARKER not in owner_view.text
 
 
-def test_search_v2_repo_filter_does_not_cross_the_tenant_boundary(client, db_session):
+def test_search_repo_filter_does_not_cross_the_tenant_boundary(client, db_session):
     """repo_filter narrows within a tenant; it never widens across tenants."""
     acme_note = make_note(
         db_session, "acme", scope="shared", path_or_uri="docs/acme.md"
@@ -217,7 +217,7 @@ def test_search_v2_repo_filter_does_not_cross_the_tenant_boundary(client, db_ses
     assert ACME_MARKER not in other_view.text
 
 
-def test_search_v2_a_colliding_note_id_under_two_tenants_does_not_leak(
+def test_search_a_colliding_note_id_under_two_tenants_does_not_leak(
     client, db_session
 ):
     """The join hazard: note metadata must come from the OWNER's note.
@@ -280,7 +280,7 @@ def test_search_v2_a_colliding_note_id_under_two_tenants_does_not_leak(
         assert other_marker not in response.text
 
 
-def test_search_v2_does_not_return_a_passage_whose_note_belongs_to_another_tenant(
+def test_search_does_not_return_a_passage_whose_note_belongs_to_another_tenant(
     client, db_session
 ):
     """This leak is unrepresentable, and the schema is why.
@@ -308,7 +308,7 @@ def test_search_v2_does_not_return_a_passage_whose_note_belongs_to_another_tenan
     db_session.rollback()
 
 
-def test_search_v2_vector_arm_never_returns_another_tenants_passages(
+def test_search_vector_arm_never_returns_another_tenants_passages(
     client, db_session
 ):
     """The tenant boundary with the vector arm on, seeded so a leak would win.

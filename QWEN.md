@@ -5,13 +5,19 @@ Instructional context for AI agents working in this repository.
 ## Project Overview
 
 **nescio-memory** is a small FastAPI service that provides *semantic memory* over a PostgreSQL +
-pgvector database. It exposes two operations:
+pgvector database. It stores **notes**, each split into **passages**, and exposes them under
+`/api/v1` (every route requires an `X-API-Key`; all data is tenant-scoped by the key's
+`client_name`):
 
-- **`POST /api/v1/ingest`** — accepts a file's text content (form-encoded), splits it into
-  overlapping character chunks, embeds each chunk, and upserts them into the `learnings` table
-  (deleting that file's previous chunks first, so re-ingesting is idempotent).
-- **`POST /api/v1/search`** — embeds a query and returns the `top_k` nearest chunks by cosine
-  similarity.
+- **`POST /api/v1/ingest`** — accepts one note as JSON (`scope`, `path_or_uri`, `content`, ...),
+  splits it into passages, embeds them in batches, and writes the note and its passages in one
+  transaction. Re-ingesting an unchanged note is skipped unless `force` is set.
+- **`GET /api/v1/notes/{id}`** and **`DELETE /api/v1/notes/{id}`** — read or erase one note (the
+  delete cascades to its passages). A missing note and another tenant's note give the same `404`.
+- **`POST /api/v1/search`** — hybrid search: a full-text branch and a vector branch fused by
+  reciprocal rank (RRF) in one SQL statement. Each result carries `score`, `fts_rank` and
+  `vector_rank`; the response carries a top-level `degraded` flag, set when the query could not be
+  embedded and the search fell back to keyword-only.
 
 `GET /health` sits at the root, outside the version prefix, and reports the active embedding
 backend and model. It is a pure liveness probe — it never contacts PostgreSQL or Ollama, so an
@@ -19,25 +25,23 @@ unhealthy dependency cannot get a pod restarted. Do not add dependency checks to
 concern belongs in a separate endpoint.
 
 By default embeddings are **not** computed in-process: they are requested over HTTP from an
-[Ollama](https://ollama.com) `/api/embeddings` endpoint (default model `qwen3-embedding:0.6b`,
-384 dims). The intended deployment is a **Kubernetes cluster that already runs an Ollama pod**, so
+[Ollama](https://ollama.com) `/api/embed` batch endpoint (default model `qwen3-embedding:0.6b`,
+1024 dims). The intended deployment is a **Kubernetes cluster that already runs an Ollama pod**, so
 `OLLAMA_URL` points at an in-cluster Service — that is why HTTP is the default and why torch is not
 part of the base install. An optional in-process backend sits behind `EMBEDDING_BACKEND=local` and
-the `local-embeddings` extra. Langfuse `@observe` decorators are applied to both handlers for
-tracing.
+the `local-embeddings` extra. Langfuse `@observe` decorators are applied to the handlers for
+tracing, with input and output capture off.
 
-Stack: Python ≥ 3.12 · FastAPI · Pydantic v2 / pydantic-settings · psycopg2 + pgvector · httpx ·
-Langfuse · uvicorn. Dependency management and the virtualenv are owned by **uv** (`uv.lock` is
-committed and is the single source of truth).
+Stack: Python ≥ 3.12 · FastAPI · Pydantic v2 / pydantic-settings · SQLAlchemy 2 + psycopg 3 +
+pgvector · Alembic · httpx · Langfuse · uvicorn. Dependency management and the virtualenv are owned
+by **uv** (`uv.lock` is committed and is the single source of truth).
 
 The code lives in a single importable **`app/` package** at the repository root (no `src/`), split
-by concern into `api/v1`, `core` and `schemas`. There are no migrations and no tests yet. The
-package directories currently rely on **implicit namespace packages** — there are no `__init__.py`
-files — which works because uvicorn is launched from the repository root, but makes `app` a rather
-generic name to be sharing `sys.path` under.
+by concern into `api/v1`, `core`, `models`, `repositories` and `schemas`. Alembic owns the schema
+(`alembic/`), and an integration test suite in `tests/` runs against a real pgvector container.
 
 > **This is a proof of concept and is expected to change significantly.** The API surface, storage
-> schema, and chunking strategy are all in flux. Treat the gaps listed at the end of this document
+> schema, and passage-splitting strategy are all in flux. Treat the gaps listed at the end of this document
 > as known PoC rough edges to be aware of, not as a standing work queue — do not "fix" them
 > unprompted, and do not assume any current shape will survive.
 
@@ -47,19 +51,36 @@ generic name to be sharing `sys.path` under.
 app/main.py                 create_app() factory + module-level `app`; owns GET /health
 app/config.py               pydantic-settings Settings class; module-level `settings` singleton
 app/helper.py               get_app_version() — importlib.metadata, else read pyproject.toml
-app/api/v1/router.py        Aggregates the ingest and search routers under the /api/v1 prefix
-app/api/v1/ingest.py        POST /api/v1/ingest — chunk, embed, delete-then-upsert
-app/api/v1/search.py        POST /api/v1/search — embed query, cosine nearest-neighbour select
-app/core/db.py              get_db_connection() — plain psycopg2 connect, one per call
-app/core/embeddings.py      get_embedding() — Ollama over httpx, or in-process sentence-transformers
-app/core/chunking.py        chunk_text() — sliding window; reads settings.chunk_size/overlap
+app/api/v1/router.py        Aggregates the search, ingest and notes routers; applies API-key auth
+app/api/v1/ingest.py        POST /api/v1/ingest — split, embed in batches, write note + passages
+app/api/v1/notes.py         GET / DELETE /api/v1/notes/{id}
+app/api/v1/search.py        POST /api/v1/search — embed query, hybrid search, degrade to FTS-only
+app/core/db.py              Lazy SQLAlchemy engine and session dependency
+app/core/embeddings.py      get_embeddings() (batched), get_query_embedding() — Ollama or in-process
+app/core/embedding_validation.py  Validates vectors before they are stored or searched with
+app/core/splitter.py        Markdown note -> passages (frontmatter, headings, size limits)
+app/core/pipeline.py        Content hash, pipeline version, FTS / embedding-input composition
+app/core/errors.py          Exception handlers mapping embedding and DB failures to 4xx/5xx
+app/core/security.py        API-key lookup -> ApiKey (client_name)
+app/core/body_limit.py      Request-body size limit
+app/core/schema_checks.py   Startup check: EMBEDDING_DIMENSION vs passages.embedding
+app/models/                 SQLAlchemy models: Note, Passage, ApiKey
+app/repositories/note.py    Tenant-scoped note and passage reads/writes
+app/repositories/passage_search.py  The one-statement hybrid RRF query
+app/repositories/search_guards.py   Per-transaction hnsw / statement_timeout settings, read back
+app/schemas/ingest.py       IngestRequest, IngestResponse
+app/schemas/note.py         NoteResponse
 app/schemas/search.py       SearchRequest, SearchResult, SearchResponse
-app/schemas/ingest.py       IngestResponse
 app/schemas/pagination.py   PaginationResponse — unused by design, see Known Gaps
+alembic/                    Migrations; the head revision defines the schema
+scripts/                    create_api_key, reingest, eval_queries, check_embedding_dimension, ...
+tests/                      Integration suite (testcontainers pgvector, deterministic fake embeddings)
 export_openapi.py           Regenerates openapi.json + openapi.yaml from the live app
 openapi.json / openapi.yaml Committed API contract; drift-checked in CI
 .spectral.yaml              Spectral ruleset used by the OpenAPI lint step
-README.md                   Primary user-facing docs: setup, SQL schema, API examples, limitations
+README.md                   Primary user-facing docs: setup, API examples, configuration, limitations
+CHANGELOG.md                Generated by release-please — never edited by hand
+docs/                       Design specs (docs/superpowers/specs) and audit reports — frozen records
 LICENSE                     MIT
 pyproject.toml              Metadata + runtime deps + [dependency-groups] dev
                             + [project.optional-dependencies] local-embeddings
@@ -67,7 +88,7 @@ pyproject.toml              Metadata + runtime deps + [dependency-groups] dev
 uv.lock                     Locked dependency graph — committed on purpose, never hand-edited
 .env.example                Documented configuration template
 release-please-config.json  Release automation config
-.release-please-manifest.json  Current released version ("0.2.1")
+.release-please-manifest.json  Current released version
 .github/workflows/          ci.yml, openapi.yml, release-please.yml
 .github/dependabot.yml      Weekly update PRs for the uv and github-actions ecosystems
 .gitattributes              Line-ending normalization (LF for .sh/.yml/.yaml/uv.lock)
@@ -84,6 +105,12 @@ uv sync --locked
 
 # Copy and fill in configuration — REQUIRED, see note below
 cp .env.example .env
+
+# Create / upgrade the schema (needs DATABASE_URL)
+uv run alembic upgrade head
+
+# Run the integration suite (needs Docker)
+uv run --locked --no-build pytest -q
 
 # Run the dev server — MUST be launched from the repository root
 uv run uvicorn app.main:app --reload --port 8000
@@ -111,30 +138,28 @@ to importing `app` at all: launch uvicorn, pytest and `export_openapi.py` from t
 
 | Service              | Purpose                        | Notes                                                        |
 | -------------------- | ------------------------------ | ------------------------------------------------------------ |
-| PostgreSQL + pgvector | storage                        | `CREATE EXTENSION IF NOT EXISTS vector;` must be run manually |
-| Ollama               | embeddings                     | model + `EMBEDDING_DIMENSION` must agree (0.6b=384, 4b=1024, 8b=4096) |
+| PostgreSQL + pgvector >= 0.8 | storage                | `alembic upgrade head` creates the extension, tables and indexes |
+| Ollama               | embeddings                     | model + `EMBEDDING_DIMENSION` must agree (0.6b=1024, 4b=2560, 8b=4096) |
 | Langfuse             | tracing                        | optional; disabled when keys are empty                       |
 
 ## Database Schema
 
-There are **no migration files** — the table must already exist. The canonical `CREATE TABLE` that
-users are told to run lives in the README ("Quick start" → step 2); the shape the code actually
-relies on is:
+Alembic owns the schema: `uv run alembic upgrade head`. Do not create tables by hand; the models
+and migrations are checked against each other (`tests/test_schema_drift.py`). In outline:
 
-```sql
-learnings (
-  repo_name  text,          -- written as a column by /api/v1/ingest
-  file_path  text,          -- written as a column by /api/v1/ingest
-  content    text,          -- one chunk
-  metadata   json/jsonb,    -- {"file_name", "relative_path", "chunk_index"}
-  embedding  vector(N)      -- N == EMBEDDING_DIMENSION
-)
-```
+- `notes` — one row per `(client_name, scope, path_or_uri)`: frontmatter fields, `content_hash`,
+  `pipeline_version`, `body`, `meta`, timestamps.
+- `passages` — the splits of a note: `client_name`, `scope`, `ordinal`, `heading_path`, `content`,
+  `tsv` (FTS, GIN-indexed), `embedding vector(N)` (HNSW-indexed, `N == EMBEDDING_DIMENSION`) and
+  `embedding_degenerate`, a stored generated flag for vectors whose self-distance is NaN.
+- `api_keys` — hashed API keys and their `client_name`.
 
-`/api/v1/search` orders by `embedding <=> %s` (cosine distance) and reports `1 - distance` as
-`similarity`. Rows come back from a **plain psycopg2 cursor**, i.e. as tuples in `SELECT` order
-(`content`, `metadata`, `similarity`), not as dicts — `search.py` unpacks them positionally into
-`SearchResult`. There is no `RealDictCursor`.
+The authoritative definitions are `alembic/versions/` and `app/models/`; the design rationale is in
+`docs/superpowers/specs/2026-10-29-notes-passages-slice-1-design.md`. Every query carries a
+`client_name` predicate. Search is `app/repositories/passage_search.py`: one statement with a
+keyword arm and a vector arm, each filtered by client and scope before its own `LIMIT`, fused by
+RRF. Repository code sets per-transaction GUCs with `set_config(..., true)` and reads them back,
+raising if they did not take effect.
 
 ## Configuration
 
@@ -143,21 +168,30 @@ tolerated). The `settings` object is instantiated **at import time**.
 
 | Setting               | Default                                      | Used by                     |
 | --------------------- | -------------------------------------------- | --------------------------- |
-| `database_url`        | *(required)*                                 | `get_db_connection()`       |
-| `embedding_backend`   | `ollama`                                     | `get_embedding()` — `Literal["ollama", "local"]`, so a typo fails at startup |
-| `local_embedding_model` | `sentence-transformers/all-MiniLM-L6-v2`   | `get_embedding()`, only when the backend is `local` |
-| `ollama_url`          | `http://localhost:11434/api/embeddings`       | `get_embedding()`, `ollama` backend |
-| `ollama_model`        | `qwen3-embedding:0.6b`                        | `get_embedding()`, `/health` |
-| `embedding_dimension` | `384`                                        | *not read in code* — must match the DB column |
+| `database_url`        | *(required)*                                 | the SQLAlchemy engine in `app/core/db.py` |
+| `statement_timeout_ms` / `db_connect_timeout_s` | `5000` / `10`        | validated ranges, see `app/config.py` |
+| `embedding_backend`   | `ollama`                                     | embeddings — `Literal["ollama", "local"]`, so a typo fails at startup |
+| `local_embedding_model` | `sentence-transformers/all-MiniLM-L6-v2`   | only when the backend is `local` (384-wide, unlike the 1024 column) |
+| `ollama_url`          | `http://localhost:11434/api/embed`           | `ollama` backend; must be the batch `/api/embed` endpoint — the legacy `/api/embeddings` is rejected at startup |
+| `ollama_model`        | `qwen3-embedding:0.6b`                        | embeddings, `/health` |
+| `embedding_dimension` | `1024`                                       | checked against `passages.embedding` at startup (`app/core/schema_checks.py`) |
+| `search_candidates`   | `50`                                         | candidates per search arm before fusion (1..1000) |
+| `rrf_k`               | `60`                                         | RRF damping constant (>= 1) |
+| `fts_weight` / `vector_weight` | `1.0` / `1.0`                       | per-arm multipliers; 0 switches an arm off, both 0 is rejected |
+| `query_instruction`   | Qwen3 retrieval instruction                  | prefix for **query** embeddings only; empty disables |
+| `query_embed_timeout_s` | `5`                                        | query-embedding timeout (0 < x <= 30); on transient failure the search degrades |
+| `embed_batch_size`    | `16`                                         | passages per `/api/embed` call at ingest (1..256) |
 | `langfuse_public_key` / `_secret_key` / `_host` | empty / `https://cloud.langfuse.com` | *not read in code* — see Known Gaps |
 | `app_name`            | `Nescio Semantic Memory API`                  | `FastAPI(title=...)`        |
 | `log_level`           | `INFO`                                       | *not read in code*          |
-| `chunk_size` / `chunk_overlap` | `1000` / `200`                       | `chunk_text()` in `app/core/chunking.py` |
 | `host` / `port`       | `localhost` / `8080`                          | *not read in code* — no `uvicorn.run()` block exists |
 
-Note the `.env.example` / `app/config.py` mismatch: the template ships `OLLAMA_MODEL=qwen3-embedding:4b`
-with `EMBEDDING_DIMENSION=1024`, while the code defaults to `0.6b` / `384`. Changing the model
-**requires** recreating the `embedding` column at the matching dimension.
+Removed in 0.6.0: `CHUNK_SIZE`, `CHUNK_OVERLAP`, `MAX_CONTEXT_CHARS`, `MAX_CONTEXT_DOCUMENTS`. They
+are harmless in an old `.env` (unknown keys are ignored). When you add, remove or change a setting,
+update `.env.example`, the README configuration table and — for a breaking change — the README's
+"Upgrading to" note.
+
+Changing the model or width **requires** a migration of `passages.embedding` and a re-ingest.
 
 ## CI, Releases, and Commit Conventions
 
@@ -166,8 +200,7 @@ Three GitHub Actions workflows:
 - **`ci.yml`** — on push to `main` and all PRs. Runs `uv sync --locked` on Python **3.12, 3.13 and 3.14**
   (floor + current), then an import check of the runtime deps, then
   `uv sync --locked --extra local-embeddings --dry-run` so the opt-in extra stays resolvable without
-  anyone paying for a torch download. The test step is a deliberate `TODO` because pytest exits 5 on
-  an empty suite. This workflow is the guard against `uv.lock` drift: **adding or changing a
+  anyone paying for a torch download. It also runs the pytest suite, which needs Docker for the pgvector testcontainer. This workflow is the guard against `uv.lock` drift: **adding or changing a
   dependency without re-running `uv lock` breaks CI.**
 - **`openapi.yml`** — on push to `main` and all PRs. Syncs the **dev** dependency group, regenerates
   the spec, validates it with `openapi-spec-validator`, fails if `git diff` shows
@@ -185,7 +218,7 @@ Three GitHub Actions workflows:
 - **`release-please.yml`** — on push to `main`. Maintains a release PR from conventional commits;
   merging it tags the release. `bump-minor-pre-major: true` means that in 0.x a breaking or feature
   change bumps the **minor** instead of the major — a plain `fix:` still bumps the patch, which is
-  why the chunk_text fix produced 0.2.1 rather than 0.3.0. Three
+  why an early splitter fix produced 0.2.1 rather than 0.3.0. Three
   `extra-files` entries rewrite the version via jsonpath: **inside `uv.lock`** (toml), and at
   `$.info.version` in **`openapi.json`** (json) and **`openapi.yaml`** (yaml). Keep the two spec
   files in that list — `get_app_version()` feeds `info.version`, so a release that bumps
@@ -218,7 +251,7 @@ Keep messages lowercase and imperative.
 - **Dependencies:** edit `pyproject.toml`, then run `uv lock`; commit `pyproject.toml` **and**
   `uv.lock` together. Never hand-edit `uv.lock`. It is marked `linguist-generated=true` so GitHub
   collapses it in diffs, but lock changes are supply-chain relevant and should still be reviewed.
-- **Dev-only tooling** goes in `[dependency-groups] dev` (currently `openapi-spec-validator`), not
+- **Dev-only tooling** goes in `[dependency-groups] dev` (currently `openapi-spec-validator`, `pytest`, `testcontainers`), not
   in `[project] dependencies` — it must not ship to runtime. Note that `uv sync` installs the `dev`
   group by default, so `ci.yml` picks it up even though only `openapi.yml` asks for it explicitly.
 - **Heavy opt-in runtime features** go in `[project.optional-dependencies]` (currently
@@ -239,17 +272,22 @@ Keep messages lowercase and imperative.
   publishing moving major tags in v8, so `@v10` does not even resolve. The pin on
   `release-please-action` matters most — it is the one action handed a write-scoped PAT.
 - **Code style:** type hints on public helpers and Pydantic models, `X | None` union syntax,
-  parameterized SQL via `%s` placeholders (no string interpolation of user input). One concern per
-  module: endpoints in `app/api/v1/`, infrastructure in `app/core/`, request/response models in
-  `app/schemas/`. Handlers are decorated with `@observe(name="...")` for Langfuse tracing, and
+  SQLAlchemy with bound parameters (no string interpolation of user input), and a `client_name`
+  predicate in every query. One concern per module: endpoints in `app/api/v1/`, infrastructure in
+  `app/core/`, queries in `app/repositories/`, ORM models in `app/models/`, request/response models
+  in `app/schemas/`. Comments explain why and cite issue numbers; keep files under 400 lines. Handlers are decorated with `@observe(name="...")` for Langfuse tracing, and
   endpoints declare `summary=`/`description=` plus `tags=[...]` so the generated spec passes the
   Spectral lint step. The old `""" ... """` section banners are gone — they belonged to the
   single-file layout.
-- **Tests:** none exist yet. `ci.yml` has a placeholder showing the intended command
-  (`uv run --locked pytest`). If you add the first test, also enable that CI step.
-- **Docs:** `README.md` is the user-facing contract (setup, schema SQL, API examples, limitations);
-  this file is the agent-facing one. When behaviour changes, update the README too — especially the
-  `CREATE TABLE` block, the configuration table, and the "Current limitations" list.
+- **Tests:** `uv run --locked --no-build pytest -q` (needs Docker). The `client` fixture in
+  `tests/conftest.py` patches the embedding functions with the deterministic fakes in
+  `tests/fakes.py`; the `fts_only` fixture sets `vector_weight=0`. Cross-cutting behaviour (auth,
+  error mapping, statement timeout, transaction guard) is tested against the passages API.
+- **Docs:** `README.md` is the user-facing contract (setup, API examples, configuration,
+  limitations); this file is the agent-facing one. When behaviour changes, update the README too —
+  especially the configuration table, the "Upgrading to" note for breaking changes, and the "Current
+  limitations" list. `CHANGELOG.md` is generated by release-please, and `docs/superpowers/*` and
+  `docs/reports/*` are dated records: do not edit them.
 - **Licensing:** MIT. New files need no license header, but any vendored third-party code must be
   MIT-compatible and attributed.
 
@@ -260,46 +298,33 @@ them as context so you don't build on a false assumption, and don't fix them unp
 user-facing subset is published in the README under "Current limitations", so if you *do* fix one,
 update both places.
 
-1. **`chunk_text()`'s `or` fallbacks treat an explicit `0` as "unset".** `size = chunk_size or
-   settings.chunk_size` means `chunk_text(text, chunk_size=0)` silently uses the configured size
-   instead of erroring, and `overlap=0` — a legitimate "no overlap" request — silently falls back to
-   `settings.chunk_overlap`. Switch to `is None` checks if that ever matters; the only current
-   caller (`ingest.py`) passes neither argument.
-   The non-termination hazard is **fixed**: `chunk_text()` raises `ValueError` unless
-   `0 <= overlap < size`, and `Settings` enforces the same relationship in a `model_validator`, so a
-   bad `.env` crash-loops the pod at startup instead of 500-ing every ingest request.
-   Behavioural note: the sliding window emits a trailing short chunk (`"abcdefghij"` at size 10 /
-   overlap 3 gives `['abcdefghij', 'hij']`), and it is `ingest.py` — not `chunk_text()` — that drops
-   chunks under 50 characters, so `ingested` can be lower than the number of chunks produced.
-2. **`app/helper.py` holds the only version-sensitive import.** `tomllib` is stdlib only since
+1. **`app/helper.py` holds the only version-sensitive import.** `tomllib` is stdlib only since
    Python **3.11** and is imported unconditionally at module scope, so lowering `requires-python`
    below 3.11 would fail with `ModuleNotFoundError` at import time — *outside* the function's own
    `except Exception` guard, which cannot catch it. Supporting an older floor needs
    `tomli>=2.0; python_version < "3.11"` plus a guarded import. Inside the current `>=3.12` floor
    this is a non-issue, and the comment there now says so accurately. (`importlib.metadata`, also
    used in that module, has been stdlib since 3.8.)
-3. **The `local` embeddings backend has never run against the real library.**
+2. **The `local` embeddings backend has never run against the real library.**
    `sentence-transformers` now lives in the `local-embeddings` optional extra and `get_embedding()`
    branches on `settings.embedding_backend`, but that branch has only been exercised with a stubbed
    `SentenceTransformer`. Nothing in CI installs the extra — deliberately, since torch is ~530 MB of
    Linux wheels — so a change to the real `.encode()` signature or its return dtype would go
    unnoticed until someone opts in. Verify against the real library before relying on it.
-4. **Langfuse keys are not wired.** `@observe` relies on the SDK picking up `LANGFUSE_*` from the
+3. **Langfuse keys are not wired.** `@observe` relies on the SDK picking up `LANGFUSE_*` from the
    process environment; `settings.langfuse_*` are never passed to the SDK, and pydantic-settings
    does **not** export `.env` values into `os.environ`. Tracing from a `.env`-only setup will not
    attach.
-5. **No pooling and no error handling.** Connections *are* closed properly now (`try/finally` plus
-   a cursor context manager), but a fresh `psycopg2` connection is still opened per request with
-   no pool, and nothing catches DB or Ollama failures — any error surfaces as a bare 500.
-   `/api/v1/ingest` calls Ollama once **per chunk**, serially, inside an open transaction.
-6. **`settings.host` / `port` / `log_level` / `embedding_dimension` are unused.** The server must
-   be started with an explicit `uvicorn` command line, and `EMBEDDING_DIMENSION` is documentation
-   only — it is never checked against the actual `vector(N)` column, so a mismatch surfaces as a
-   database error at insert time rather than at startup.
+4. **Unmapped errors are still bare 500s.** `app/core/errors.py` maps embedding-backend, operational
+   and data errors to documented responses, but there is no catch-all `Exception` handler. Ingest
+   embeds in batches of `EMBED_BATCH_SIZE` with no retry or backoff.
+5. **`settings.host` / `port` / `log_level` are unused.** The server must be started with an
+   explicit `uvicorn` command line. (`embedding_dimension` is *not* unused: it is checked against
+   `passages.embedding` at startup.)
 
 **Not a gap:** `app/schemas/pagination.py` (`PaginationResponse`) has no importers and looks like
-dead code, but it is deliberate scaffolding for paged retrieval — the planned `ai-os/nescio-ai`
-learning loop is expected to consume bounded result sets rather than one large batch. Do **not**
+dead code, but it is deliberate scaffolding for paged retrieval — downstream
+agent clients are expected to consume bounded result sets rather than one large batch. Do **not**
 remove it during cleanup or simplification passes. Its camelCase aliases (`totalCount`,
 `pageSize`) differ from `IngestResponse`'s short-form aliases (`file`, `ingested`) and from
 `SearchResult`, which has none; reconcile that deliberately when pagination is wired in.

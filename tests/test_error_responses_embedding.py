@@ -1,4 +1,4 @@
-"""Embedding-backend failures at the /api/v2 routes: status, body, Retry-After.
+"""Embedding-backend failures at the /api/v1 routes: status, body, Retry-After.
 
 Split from tests/test_error_responses.py by concern: this module pins what the
 CALLER sees for each EmbeddingBackendError class; test_error_responses.py pins
@@ -107,14 +107,14 @@ UNUSABLE_BATCHES = [
 
 def _search(http, key):
     return http.post(
-        "/api/v2/search",
+        "/api/v1/search",
         json={"q": "pelicanium", "top_k": 5},
         headers={"X-API-Key": key},
     )
 
 
 def _ingest(http, key):
-    return http.post("/api/v2/ingest", json=INGEST_PAYLOAD, headers={"X-API-Key": key})
+    return http.post("/api/v1/ingest", json=INGEST_PAYLOAD, headers={"X-API-Key": key})
 
 
 def _nothing_persisted(db_session) -> bool:
@@ -149,7 +149,7 @@ def test_ingest_returns_503_with_retry_after_when_the_backend_is_down(
 def test_search_with_the_backend_down_degrades_instead_of_returning_503(
     http, db_session, monkeypatch
 ):
-    # The v1 contract here was 503 + Retry-After. On /api/v2/search the exact
+    # The learnings API's contract here was 503 + Retry-After. On /api/v1/search the exact
     # transient class degrades to full-text results instead; the full contract
     # (FTS-only body, the warning, subclasses that must NOT degrade) lives in
     # tests/test_search_degraded.py. This one assertion only pins that the

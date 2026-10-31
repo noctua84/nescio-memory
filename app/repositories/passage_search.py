@@ -1,4 +1,4 @@
-"""Passage hybrid search (v2). Reads only: ingest and passage writes live in note.py.
+"""Passage hybrid search. Reads only: ingest and passage writes live in note.py.
 
 Tenant discipline, as stated in app/repositories/note.py's module docstring and
 held to here: every statement carries `client_name == client_name` as a
@@ -122,7 +122,8 @@ def hybrid_statement(
         # exclusion is embedding_degenerate, a generated column holding the
         # stored row's self-distance-is-NaN test, computed once by Postgres at
         # write time instead of per candidate per query (measured at 29-35% of
-        # v1 search time when it was computed per query). `d != NaN` is kept as
+        # the removed learnings API's search time when it was computed per
+        # query). `d != NaN` is kept as
         # cheap defence -- the query vector is validated before it gets here,
         # so it should never itself exclude a row -- and since Postgres treats
         # NaN = NaN as TRUE it removes exactly the NaN rows. Both are filters

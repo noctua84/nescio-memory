@@ -1,7 +1,7 @@
 """Proves the harness itself, then one end-to-end pass over the passages API.
 
 If the harness checks fail, nothing else in the suite can be trusted. The
-end-to-end test at the bottom is the shortest path through every /api/v2
+end-to-end test at the bottom is the shortest path through every /api/v1
 route in the order a client would use them: ingest, search, get, delete.
 """
 from sqlalchemy import inspect, select, text
@@ -152,7 +152,7 @@ def test_ingest_search_get_delete_round_trip(client, db_session):
 
     # 1. Ingest.
     ingested = client.post(
-        "/api/v2/ingest",
+        "/api/v1/ingest",
         json={
             "scope": "repo_a",
             "path_or_uri": "docs/pelican-ledger.md",
@@ -171,7 +171,7 @@ def test_ingest_search_get_delete_round_trip(client, db_session):
 
     # 2. Search finds a passage of that note.
     searched = client.post(
-        "/api/v2/search",
+        "/api/v1/search",
         json={"q": "pelican throughput", "top_k": 5},
         headers=headers,
     )
@@ -188,7 +188,7 @@ def test_ingest_search_get_delete_round_trip(client, db_session):
     assert top["fts_rank"] is not None
 
     # 3. Get returns the note as stored, with its passage count.
-    fetched = client.get(f"/api/v2/notes/{note_id}", headers=headers)
+    fetched = client.get(f"/api/v1/notes/{note_id}", headers=headers)
     assert fetched.status_code == 200, fetched.text
     note = fetched.json()
     assert note["id"] == note_id
@@ -200,19 +200,19 @@ def test_ingest_search_get_delete_round_trip(client, db_session):
     assert note["content_hash"] == content_hash(SMOKE_NOTE)
 
     # 4. Delete, then the note and its passages are gone.
-    deleted = client.delete(f"/api/v2/notes/{note_id}", headers=headers)
+    deleted = client.delete(f"/api/v1/notes/{note_id}", headers=headers)
     assert deleted.status_code == 204
     assert deleted.content == b""
 
-    gone = client.get(f"/api/v2/notes/{note_id}", headers=headers)
+    gone = client.get(f"/api/v1/notes/{note_id}", headers=headers)
     assert gone.status_code == 404
     assert gone.json() == {"detail": "Note not found"}
 
-    deleted_again = client.delete(f"/api/v2/notes/{note_id}", headers=headers)
+    deleted_again = client.delete(f"/api/v1/notes/{note_id}", headers=headers)
     assert deleted_again.status_code == 404
 
     after = client.post(
-        "/api/v2/search",
+        "/api/v1/search",
         json={"q": "pelican throughput", "top_k": 5},
         headers=headers,
     )

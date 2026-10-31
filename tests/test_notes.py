@@ -1,6 +1,6 @@
-"""GET and DELETE /api/v2/notes/{note_id}: the read and erase paths.
+"""GET and DELETE /api/v1/notes/{note_id}: the read and erase paths.
 
-Tenant isolation for these routes lives in tests/test_isolation_v2.py and is
+Tenant isolation for these routes lives in tests/test_isolation.py and is
 deliberately not duplicated here; everything below runs as a single client and
 asserts the non-isolation contract -- which fields come back, what the 404
 covers, and that a delete really erases the passages rather than orphaning
@@ -35,21 +35,21 @@ def _ingest(client, key, **overrides):
         "content": NOTE_WITH_FRONTMATTER,
     }
     payload.update(overrides)
-    return client.post("/api/v2/ingest", json=payload, headers={"X-API-Key": key})
+    return client.post("/api/v1/ingest", json=payload, headers={"X-API-Key": key})
 
 
 def _get(client, key, note_id):
-    return client.get(f"/api/v2/notes/{note_id}", headers={"X-API-Key": key})
+    return client.get(f"/api/v1/notes/{note_id}", headers={"X-API-Key": key})
 
 
 def _delete(client, key, note_id):
-    return client.delete(f"/api/v2/notes/{note_id}", headers={"X-API-Key": key})
+    return client.delete(f"/api/v1/notes/{note_id}", headers={"X-API-Key": key})
 
 
 def _search(client, key, q, **overrides):
     payload = {"q": q, "top_k": 10}
     payload.update(overrides)
-    return client.post("/api/v2/search", json=payload, headers={"X-API-Key": key})
+    return client.post("/api/v1/search", json=payload, headers={"X-API-Key": key})
 
 
 def test_get_note_returns_every_stored_field(client, db_session):
@@ -127,12 +127,12 @@ def test_get_note_returns_404_for_an_unknown_id(client, db_session):
 def test_get_note_rejects_a_non_integer_id(client, db_session):
     key = make_api_key(db_session, "acme")
 
-    response = client.get("/api/v2/notes/not-an-int", headers={"X-API-Key": key})
+    response = client.get("/api/v1/notes/not-an-int", headers={"X-API-Key": key})
 
     assert response.status_code == 422
 
 
-def test_a_note_ingested_through_v2_is_retrievable_by_the_returned_id(
+def test_a_note_ingested_is_retrievable_by_the_returned_id(
     client, db_session
 ):
     key = make_api_key(db_session, "acme")
@@ -209,7 +209,7 @@ def test_deleting_twice_returns_404_the_second_time(client, db_session):
 def test_delete_note_rejects_a_non_integer_id(client, db_session):
     key = make_api_key(db_session, "acme")
 
-    response = client.delete("/api/v2/notes/not-an-int", headers={"X-API-Key": key})
+    response = client.delete("/api/v1/notes/not-an-int", headers={"X-API-Key": key})
 
     assert response.status_code == 422
 

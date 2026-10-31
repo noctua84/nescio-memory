@@ -60,7 +60,7 @@ def _run(monkeypatch, queries_file, degraded_by_query, *, hit=True, extra=()):
     seen: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/v2/search"
+        assert request.url.path == "/api/v1/search"
         body = json.loads(request.content)
         seen.append(body)
         expected = QUERIES[body["q"]]

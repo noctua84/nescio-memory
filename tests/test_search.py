@@ -1,4 +1,4 @@
-"""POST /api/v2/search: what it finds and in what order.
+"""POST /api/v1/search: what it finds and in what order.
 
 Search is hybrid -- a full-text arm and a vector arm fused by reciprocal rank
 -- so a test that asserts pure full-text semantics (which words match, the
@@ -10,7 +10,7 @@ wrong reason. Tests with no such dependency run hybrid, as production does.
 The fused ranking itself is pinned at the repository level in
 tests/test_search_hybrid.py; the stop-word query answered by the vector arm
 and the transaction guards are in tests/test_search_contract.py (split out
-for length); tenant isolation is in tests/test_isolation_v2*.py.
+for length); tenant isolation is in tests/test_isolation*.py.
 Every response here is asserted non-degraded: the `client` fixture fakes the
 query embedder, so a degraded answer would mean the vector arm silently
 dropped out.
@@ -30,7 +30,7 @@ from tests.factories import make_api_key, make_note, make_passage
 def _search(client, key, q, **overrides):
     payload = {"q": q, "top_k": 10}
     payload.update(overrides)
-    return client.post("/api/v2/search", json=payload, headers={"X-API-Key": key})
+    return client.post("/api/v1/search", json=payload, headers={"X-API-Key": key})
 
 
 def _results(response):

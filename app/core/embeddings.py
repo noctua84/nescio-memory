@@ -153,7 +153,7 @@ def _embed(texts: list[str], timeout: float) -> list[list[float]]:
         return []
     # Sub-batches bound each request under the 30 s timeout on a CPU Ollama,
     # and bound how long ingest holds its FOR UPDATE lock across these calls
-    # (see app/api/v2/ingest.py).
+    # (see app/api/v1/ingest.py).
     size = settings.embed_batch_size
     vectors: list[list[float]] = []
     for start in range(0, len(texts), size):

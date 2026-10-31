@@ -1,8 +1,8 @@
-"""app.core.body_limit.BodySizeLimitMiddleware: the /api/v2 request-byte bound.
+"""app.core.body_limit.BodySizeLimitMiddleware: the /api/v1 request-byte bound.
 
 The contract under test (see the module docstring in app/core/body_limit.py):
 
-- only paths under ``/api/v2/`` are inspected at all;
+- only paths under ``/api/v1/`` are inspected at all;
 - an over-limit ``Content-Length`` is rejected with 413 and the exact detail
   string, *without* the wrapped app ever being entered -- which is the whole
   point, because FastAPI parses a JSON body before any dependency, including
@@ -24,7 +24,7 @@ import json
 from fastapi import Depends, FastAPI, Request
 from fastapi.testclient import TestClient
 
-from app.core.body_limit import MAX_V2_BODY_BYTES, BodySizeLimitMiddleware
+from app.core.body_limit import MAX_BODY_BYTES, BodySizeLimitMiddleware
 from tests.factories import make_api_key
 
 LIMIT = 100
@@ -69,13 +69,13 @@ def _build_app(max_bytes: int = LIMIT) -> tuple[TestClient, Recorder]:
         return {"received": len(recorder.body)}
 
     app.add_api_route(
-        "/api/v2/echo",
+        "/api/v1/echo",
         echo,
         methods=["POST"],
         dependencies=[Depends(record_dependency)],
     )
     # Outside the limited prefix, for the scoping tests. Deliberately not an
-    # /api/<version> path: the scoping contract is "only /api/v2/ is
+    # /api/<version> path: the scoping contract is "only /api/v1/ is
     # inspected", and a neutral path keeps that true whatever the API prefix
     # is later renamed to.
     app.add_api_route(
@@ -160,7 +160,7 @@ def _chunks(total_bytes: int, chunk_size: int = 32):
 def test_an_over_limit_content_length_is_rejected_with_413():
     client, recorder = _build_app()
 
-    response = client.post("/api/v2/echo", content=b"x" * (LIMIT + 1))
+    response = client.post("/api/v1/echo", content=b"x" * (LIMIT + 1))
 
     assert response.status_code == 413
     assert response.json() == {"detail": TOO_LARGE_DETAIL}
@@ -170,7 +170,7 @@ def test_an_over_limit_content_length_never_reaches_the_app():
     """The rejection must precede the wrapped app, hence any dependency."""
     client, recorder = _build_app()
 
-    client.post("/api/v2/echo", content=b"x" * (LIMIT + 1))
+    client.post("/api/v1/echo", content=b"x" * (LIMIT + 1))
 
     assert not recorder.entered, (
         "the wrapped app was entered for an oversized body; in the real app "
@@ -181,7 +181,7 @@ def test_an_over_limit_content_length_never_reaches_the_app():
 def test_the_detail_reports_the_configured_limit_not_the_default():
     client, _ = _build_app(max_bytes=64)
 
-    response = client.post("/api/v2/echo", content=b"x" * 65)
+    response = client.post("/api/v1/echo", content=b"x" * 65)
 
     assert response.json() == {
         "detail": "Request body too large: limit is 64 bytes."
@@ -192,7 +192,7 @@ def test_a_body_exactly_at_the_limit_passes_through_intact():
     client, recorder = _build_app()
     body = b"y" * LIMIT
 
-    response = client.post("/api/v2/echo", content=body)
+    response = client.post("/api/v1/echo", content=body)
 
     assert response.status_code == 200
     assert response.json() == {"received": LIMIT}
@@ -203,7 +203,7 @@ def test_a_body_under_the_limit_passes_through_intact():
     client, recorder = _build_app()
     body = b"under the limit" * 3
 
-    response = client.post("/api/v2/echo", content=body)
+    response = client.post("/api/v1/echo", content=body)
 
     assert response.status_code == 200
     assert recorder.body == body
@@ -214,7 +214,7 @@ def test_a_body_under_the_limit_passes_through_intact():
 def test_an_empty_body_passes_through():
     client, recorder = _build_app()
 
-    response = client.post("/api/v2/echo", content=b"")
+    response = client.post("/api/v1/echo", content=b"")
 
     assert response.status_code == 200
     assert recorder.body == b""
@@ -222,7 +222,7 @@ def test_an_empty_body_passes_through():
 
 def test_a_malformed_content_length_is_rejected_with_400():
     status, payload, recorder = _raw_asgi_post(
-        "/api/v2/echo",
+        "/api/v1/echo",
         [(b"content-length", b"not-a-number")],
         b"",
     )
@@ -234,7 +234,7 @@ def test_a_malformed_content_length_is_rejected_with_400():
 
 def test_a_negative_content_length_is_rejected_with_400():
     status, payload, recorder = _raw_asgi_post(
-        "/api/v2/echo",
+        "/api/v1/echo",
         [(b"content-length", b"-1")],
         b"",
     )
@@ -247,7 +247,7 @@ def test_a_negative_content_length_is_rejected_with_400():
 def test_a_forged_under_limit_content_length_does_not_buy_a_bigger_body():
     """A client that lies about its length is still bounded by real bytes."""
     status, payload, recorder = _raw_asgi_post(
-        "/api/v2/echo",
+        "/api/v1/echo",
         [(b"content-length", b"10")],
         b"z" * (LIMIT + 1),
     )
@@ -264,7 +264,7 @@ def test_a_streamed_body_really_arrives_without_a_content_length():
     """Guards the premise of the chunked tests below."""
     client, recorder = _build_app()
 
-    response = client.post("/api/v2/echo", content=_chunks(LIMIT))
+    response = client.post("/api/v1/echo", content=_chunks(LIMIT))
 
     assert response.status_code == 200
     assert recorder.saw_content_length is False, (
@@ -276,7 +276,7 @@ def test_a_streamed_body_really_arrives_without_a_content_length():
 def test_an_over_limit_chunked_body_is_rejected_with_413():
     client, recorder = _build_app()
 
-    response = client.post("/api/v2/echo", content=_chunks(LIMIT * 4))
+    response = client.post("/api/v1/echo", content=_chunks(LIMIT * 4))
 
     assert response.status_code == 413
     assert response.json() == {"detail": TOO_LARGE_DETAIL}
@@ -286,7 +286,7 @@ def test_an_over_limit_chunked_body_is_rejected_with_413():
 def test_a_chunked_body_under_the_limit_passes_through_intact():
     client, recorder = _build_app()
 
-    response = client.post("/api/v2/echo", content=_chunks(LIMIT - 4))
+    response = client.post("/api/v1/echo", content=_chunks(LIMIT - 4))
 
     assert response.status_code == 200
     assert response.json() == {"received": LIMIT - 4}
@@ -318,10 +318,10 @@ def test_a_path_outside_the_prefix_with_a_bad_content_length_is_not_intercepted(
 
 
 def test_the_prefix_match_is_on_the_whole_segment():
-    """``/api/v2/`` with its trailing slash: a sibling such as ``/api/v2x/``
+    """``/api/v1/`` with its trailing slash: a sibling such as ``/api/v1x/``
     shares the leading characters but is outside the limited prefix."""
     status, _, recorder = _raw_asgi_post(
-        "/api/v2x/echo",
+        "/api/v1x/echo",
         [(b"content-length", str(LIMIT * 5).encode())],
         b"x" * (LIMIT * 5),
     )
@@ -341,17 +341,17 @@ def test_the_limit_admits_the_largest_body_the_content_cap_allows():
     -- two \\uXXXX escapes, 12 bytes. The byte limit must not reject a body the
     character check would have accepted.
     """
-    from app.api.v2.ingest import MAX_CONTENT_CHARS
+    from app.api.v1.ingest import MAX_CONTENT_CHARS
 
     worst_case = json.dumps({"content": "\U0001F600" * MAX_CONTENT_CHARS})
 
-    assert len(worst_case.encode("utf-8")) <= MAX_V2_BODY_BYTES
+    assert len(worst_case.encode("utf-8")) <= MAX_BODY_BYTES
 
 
 # --- through the real application --------------------------------------------
 
 
-OVERSIZE = MAX_V2_BODY_BYTES + 1
+OVERSIZE = MAX_BODY_BYTES + 1
 
 
 def test_an_unauthenticated_oversized_ingest_gets_413_not_401(client):
@@ -363,7 +363,7 @@ def test_an_unauthenticated_oversized_ingest_gets_413_not_401(client):
     before reading the body at all. No X-API-Key is sent.
     """
     response = client.post(
-        "/api/v2/ingest",
+        "/api/v1/ingest",
         content=b"{}",
         headers={
             "Content-Type": "application/json",
@@ -376,7 +376,7 @@ def test_an_unauthenticated_oversized_ingest_gets_413_not_401(client):
         f"{response.text}"
     )
     assert response.json() == {
-        "detail": f"Request body too large: limit is {MAX_V2_BODY_BYTES} bytes."
+        "detail": f"Request body too large: limit is {MAX_BODY_BYTES} bytes."
     }
 
 
@@ -385,7 +385,7 @@ def test_a_normal_authenticated_ingest_still_succeeds(client, db_session):
     key = make_api_key(db_session, "acme")
 
     response = client.post(
-        "/api/v2/ingest",
+        "/api/v1/ingest",
         json={
             "scope": "repo_a",
             "path_or_uri": "docs/note.md",
@@ -400,7 +400,7 @@ def test_a_normal_authenticated_ingest_still_succeeds(client, db_session):
 
 
 def test_health_is_not_intercepted(client):
-    """A non-/api/v2 route keeps working with the middleware installed."""
+    """A non-/api/v1 route keeps working with the middleware installed."""
     response = client.get("/health")
 
     assert response.status_code == 200

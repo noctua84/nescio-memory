@@ -169,7 +169,7 @@ def test_a_bad_db_connect_timeout_in_the_environment_fails_at_startup(monkeypatc
 def test_an_env_var_for_a_removed_setting_is_ignored(
     monkeypatch, stale_env_var, stale_field
 ):
-    # These four settings went with the removed v1 API. A deployment whose
+    # These four settings went with the removed learnings API. A deployment whose
     # .env still carries them must keep booting, so Settings relies on
     # extra="ignore": the stale variable is neither rejected as an unknown
     # field nor bound to an attribute anything could still read. A value that

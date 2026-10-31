@@ -16,7 +16,7 @@ header to an arbitrary host. --queries must resolve to an existing .yaml/
 .yml file, so a crafted path cannot make the script read an arbitrary file.
 
 Loads tests/fixtures/golden_queries.yaml (or --queries), POSTs each query to
-`{url}/api/v2/search`, and reports hits@top_k against the file's gate. The
+`{url}/api/v1/search`, and reports hits@top_k against the file's gate. The
 gate is "15 of 20 queries hit in the top 5" by default. The baseline is
 measured with `VECTOR_WEIGHT=0` against the same build, so the FTS-only
 result set is scored by the same harness as the hybrid one.
@@ -232,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
                 if args.repo_filter:
                     payload["repo_filter"] = args.repo_filter
 
-                response = client.post("/api/v2/search", json=payload)
+                response = client.post("/api/v1/search", json=payload)
                 response.raise_for_status()
                 body = response.json()
                 results = body.get("results", [])

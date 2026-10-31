@@ -1,6 +1,6 @@
-"""POST /api/v2/ingest: input validation, the content cap, and large bodies.
+"""POST /api/v1/ingest: input validation, the content cap, and large bodies.
 
-The other half of tests/test_ingest_v2.py, split out to keep each module under
+The other half of tests/test_ingest.py, split out to keep each module under
 the length the plan asks for; the `_ingest` helper and the small readers are
 repeated here rather than shared, so neither module depends on the other.
 
@@ -9,7 +9,7 @@ so every rejection here must also leave the database untouched.
 """
 from sqlalchemy import func, select
 
-from app.api.v2.ingest import MAX_CONTENT_CHARS
+from app.api.v1.ingest import MAX_CONTENT_CHARS
 from app.models.note import Note
 from app.models.passage import Passage
 from tests.factories import make_api_key
@@ -24,7 +24,7 @@ def _ingest(client, key, **overrides):
         "content": BODY,
     }
     payload.update(overrides)
-    return client.post("/api/v2/ingest", json=payload, headers={"X-API-Key": key})
+    return client.post("/api/v1/ingest", json=payload, headers={"X-API-Key": key})
 
 
 def _note(db, note_id) -> Note:
@@ -111,7 +111,7 @@ def test_content_exactly_at_the_cap_is_accepted(client, db_session):
 
 
 def test_a_large_multibyte_body_is_accepted(client, db_session):
-    # What justifies the JSON body: v1's form route could not take this at all
+    # What justifies the JSON body: the removed learnings API's form route could not take this at all
     # (Starlette's 1024KB per-field limit fires first, and urlencoding inflates
     # multi-byte characters further). Here MAX_CONTENT_CHARS counts characters
     # and is the only limit that applies.

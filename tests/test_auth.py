@@ -1,5 +1,5 @@
-"""Authentication is enforced on the api_router itself (app/api/v2/router.py),
-so these assertions hold for every /api/v2 route. They are run against each
+"""Authentication is enforced on the api_router itself (app/api/v1/router.py),
+so these assertions hold for every /api/v1 route. They are run against each
 protected route rather than one representative, so a route that is ever
 mounted outside the authenticated router fails here by name.
 """
@@ -17,10 +17,10 @@ INGEST_PAYLOAD = {
 # (method, path, json body). The notes routes take no body; a note id that
 # cannot exist is fine because auth must reject before the lookup runs.
 PROTECTED_ROUTES = [
-    pytest.param("POST", "/api/v2/search", SEARCH_PAYLOAD, id="search"),
-    pytest.param("POST", "/api/v2/ingest", INGEST_PAYLOAD, id="ingest"),
-    pytest.param("GET", "/api/v2/notes/999999", None, id="get-note"),
-    pytest.param("DELETE", "/api/v2/notes/999999", None, id="delete-note"),
+    pytest.param("POST", "/api/v1/search", SEARCH_PAYLOAD, id="search"),
+    pytest.param("POST", "/api/v1/ingest", INGEST_PAYLOAD, id="ingest"),
+    pytest.param("GET", "/api/v1/notes/999999", None, id="get-note"),
+    pytest.param("DELETE", "/api/v1/notes/999999", None, id="delete-note"),
 ]
 
 
@@ -59,7 +59,7 @@ def test_revoked_api_key_is_rejected(client, db_session, method, path, payload):
 def test_valid_api_key_reaches_the_search_endpoint(client, db_session):
     key = make_api_key(db_session, "acme")
     response = client.post(
-        "/api/v2/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": key}
+        "/api/v1/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": key}
     )
     assert response.status_code == 200
     # An exact match rather than a subset check: the point of this test is
@@ -72,7 +72,7 @@ def test_valid_api_key_reaches_the_search_endpoint(client, db_session):
 def test_valid_api_key_reaches_the_ingest_endpoint(client, db_session):
     key = make_api_key(db_session, "acme")
     response = client.post(
-        "/api/v2/ingest", json=INGEST_PAYLOAD, headers={"X-API-Key": key}
+        "/api/v1/ingest", json=INGEST_PAYLOAD, headers={"X-API-Key": key}
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -86,7 +86,7 @@ def test_valid_api_key_reaches_the_notes_endpoint(client, db_session):
     # A 404 with the route's own detail proves auth passed and the handler
     # ran; a rejected request would have been a 401 instead.
     key = make_api_key(db_session, "acme")
-    response = client.get("/api/v2/notes/999999", headers={"X-API-Key": key})
+    response = client.get("/api/v1/notes/999999", headers={"X-API-Key": key})
     assert response.status_code == 404
     assert response.json() == {"detail": "Note not found"}
 

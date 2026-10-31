@@ -33,7 +33,7 @@ os.environ.setdefault(
     "postgresql+psycopg://placeholder:placeholder@localhost:1/placeholder",
 )
 
-# The route handlers in app/api/v2/ (ingest.py, search.py, notes.py) are
+# The route handlers in app/api/v1/ (ingest.py, search.py, notes.py) are
 # wrapped in Langfuse's @observe(...) decorator, which reads its configuration directly from the
 # process environment (nothing in app/ or tests/ feeds it settings.langfuse_*
 # explicitly). Confirmed from the installed langfuse==4.15.4 source
@@ -61,8 +61,8 @@ from testcontainers.community.postgres import PostgresContainer  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app.api.v2 import ingest as ingest_v2_module  # noqa: E402
-from app.api.v2 import search as search_v2_module  # noqa: E402
+from app.api.v1 import ingest as ingest_module  # noqa: E402
+from app.api.v1 import search as search_module  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.core.db import get_db  # noqa: E402
 from app.main import app  # noqa: E402
@@ -180,9 +180,9 @@ def db_session(connection):
 def client(db_session, monkeypatch):
     """A TestClient wired to the test transaction, with embeddings faked.
 
-    The patch targets matter. app/api/v2/ingest.py does
+    The patch targets matter. app/api/v1/ingest.py does
     `from app.core.embeddings import get_embeddings` (one batched call per
-    note) and app/api/v2/search.py does
+    note) and app/api/v1/search.py does
     `from app.core.embeddings import get_query_embedding` (called whenever
     settings.vector_weight > 0). A from-import binds the name into the route
     module's own namespace, so patching app.core.embeddings would have no
@@ -195,8 +195,8 @@ def client(db_session, monkeypatch):
     pass for the wrong reason. Adding a route that embeds means adding a line
     below.
     """
-    monkeypatch.setattr(ingest_v2_module, "get_embeddings", fake_embeddings)
-    monkeypatch.setattr(search_v2_module, "get_query_embedding", fake_embedding)
+    monkeypatch.setattr(ingest_module, "get_embeddings", fake_embeddings)
+    monkeypatch.setattr(search_module, "get_query_embedding", fake_embedding)
 
     # get_current_client resolves through Depends(get_db) too, so overriding
     # get_db means a factory-created ApiKey row is immediately visible to
@@ -216,7 +216,7 @@ def fts_only(monkeypatch):
 
     This is VECTOR_WEIGHT=0 -- the same switch the FTS-only baseline
     measurement uses (scripts/eval_queries.py) -- not a test-only code path.
-    With it, app/api/v2/search.py never calls the embedder and
+    With it, app/api/v1/search.py never calls the embedder and
     PassageSearchRepository builds no vector arm.
 
     The patch target is the one `settings` object in app.config. Both the

@@ -1,4 +1,4 @@
-"""Database failures at the /api/v2 routes: the OperationalError and DataError handlers.
+"""Database failures at the /api/v1 routes: the OperationalError and DataError handlers.
 
 Split from tests/test_error_responses.py by concern (see that module). A real
 statement cancellation by Postgres, and the guard that sets the timeout, are
@@ -12,8 +12,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.exc import DataError, OperationalError
 
-from app.api.v2 import ingest as ingest_v2_module
-from app.api.v2 import search as search_v2_module
+from app.api.v1 import ingest as ingest_module
+from app.api.v1 import search as search_module
 from app.core import errors as errors_module
 from app.core.db import get_db
 from app.core.errors import INVALID_DATA_DETAIL, QUERY_TIMEOUT_DETAIL, RETRY_AFTER_SECONDS
@@ -49,8 +49,8 @@ def http(db_session, monkeypatch):
     claimed would raise out of client.post(); with it off, removing the handler
     shows up as `assert 500 == 400`, a statement about the contract.
     """
-    monkeypatch.setattr(ingest_v2_module, "get_embeddings", fake_embeddings)
-    monkeypatch.setattr(search_v2_module, "get_query_embedding", fake_embedding)
+    monkeypatch.setattr(ingest_module, "get_embeddings", fake_embeddings)
+    monkeypatch.setattr(search_module, "get_query_embedding", fake_embedding)
     app.dependency_overrides[get_db] = lambda: db_session
     try:
         yield TestClient(app, raise_server_exceptions=False)
@@ -77,7 +77,7 @@ def handler_log(monkeypatch, caplog):
 
 
 def _post(http, key, route, body):
-    return http.post(f"/api/v2/{route}", json=body, headers={"X-API-Key": key})
+    return http.post(f"/api/v1/{route}", json=body, headers={"X-API-Key": key})
 
 
 # --- OperationalError ---------------------------------------------------------
@@ -97,7 +97,7 @@ def test_database_failure_returns_503_with_retry_after(db_session):
     app.dependency_overrides[get_db] = lambda: _FailingSession()
     try:
         response = TestClient(app).post(
-            "/api/v2/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": "nm_irrelevant"}
+            "/api/v1/search", json=SEARCH_PAYLOAD, headers={"X-API-Key": "nm_irrelevant"}
         )
     finally:
         app.dependency_overrides.clear()
@@ -131,7 +131,7 @@ def test_a_canceled_search_statement_is_503_with_no_retry_after(
     assert "Retry-After" not in response.headers
     # The warning is the only operator-facing signal of timeout starvation.
     messages = handler_log()
-    assert any("57014" in m and "/api/v2/search" in m for m in messages), messages
+    assert any("57014" in m and "/api/v1/search" in m for m in messages), messages
 
 
 # --- DataError ----------------------------------------------------------------
@@ -164,7 +164,7 @@ def test_a_nul_byte_in_an_ingest_field_is_a_400_with_no_retry_after(
     ],
 )
 def test_a_nul_byte_in_a_search_field_is_a_400(http, db_session, body):
-    # Unlike the v1 vector-only search, `q` is now a bound SQL parameter too:
+    # Unlike the removed learnings API's vector-only search, `q` is now a bound SQL parameter too:
     # the full-text arm passes it to websearch_to_tsquery.
     key = make_api_key(db_session, "acme")
 
@@ -202,7 +202,7 @@ def test_a_client_side_rejection_is_logged_with_the_path_and_an_unknown_sqlstate
 
     assert response.status_code == 400
     messages = handler_log()
-    assert any("/api/v2/ingest" in m for m in messages), messages
+    assert any("/api/v1/ingest" in m for m in messages), messages
     assert any("SQLSTATE unknown" in m for m in messages), messages
     # The log may carry internal detail, but must not be the response's source.
     assert all(INVALID_DATA_DETAIL not in m for m in messages)
@@ -232,14 +232,14 @@ def test_a_server_side_22xxx_is_also_a_400_and_its_sqlstate_is_logged(
     assert response.json() == {"detail": INVALID_DATA_DETAIL}
     assert "Retry-After" not in response.headers
     messages = handler_log()
-    assert any("22003" in m and "/api/v2/search" in m for m in messages), messages
+    assert any("22003" in m and "/api/v1/search" in m for m in messages), messages
     assert all("unknown" not in m for m in messages), messages
 
 
 def test_a_rejected_reingest_leaves_the_previous_note_and_passages_intact(
     http, db_session
 ):
-    # Ported from the v1 commit-time rejection test, which test_ingest_v2*.py
+    # Ported from the learnings API's commit-time rejection test, which test_ingest*.py
     # does not cover: there, only an EMBEDDING failure is shown to leave the
     # previous passages intact. Here the failure is a DataError after
     # lock_note has taken the row lock on the existing note, i.e. inside the

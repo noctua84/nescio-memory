@@ -1,4 +1,4 @@
-"""POST /api/v2/search -- hybrid keyword, phrase and semantic search over passages.
+"""POST /api/v1/search -- hybrid keyword, phrase and semantic search over passages.
 
 Two arms (full-text and vector) are fused by reciprocal rank in the repository.
 With VECTOR_WEIGHT=0 the vector arm is off and the query is never embedded.
@@ -17,13 +17,14 @@ from app.core.errors import EmbeddingBackendError
 from app.core.security import get_current_client
 from app.models import ApiKey
 from app.repositories.passage_search import PassageSearchRepository
-from app.schemas.search_v2 import SearchV2Request, SearchV2Response, SearchV2Result
+from app.schemas.search import SearchRequest, SearchResponse, SearchResult
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Input and output capture are OFF, unlike v1. Note bodies are the user's own
+# Input and output capture are OFF, unlike the removed learnings API. Note
+# bodies are the user's own
 # memory notes and may contain personal data (the corpus has a people/ bucket),
 # and Langfuse may be cloud-hosted -- @observe reads its configuration from the
 # process environment, so a deployment that sets LANGFUSE_* ships whatever is
@@ -33,7 +34,7 @@ router = APIRouter()
 
 @router.post(
     "/search",
-    response_model=SearchV2Response,
+    response_model=SearchResponse,
     summary="Hybrid keyword and semantic search over passages",
     description=(
         "Hybrid search over note passages: a full-text arm "
@@ -47,14 +48,14 @@ router = APIRouter()
         "backend is briefly unavailable, the response is full-text only and "
         "degraded is true."
     ),
-    operation_id="searchPassagesV2",
+    operation_id="searchPassages",
 )
 @observe(name="passage-search", capture_input=False, capture_output=False)
 def search_passages(
-    request: SearchV2Request,
+    request: SearchRequest,
     db: Session = Depends(get_db),
     client: ApiKey = Depends(get_current_client),
-) -> SearchV2Response:
+) -> SearchResponse:
     # Embed BEFORE the repository's first statement so no search work (and no
     # statement_timeout window) overlaps the HTTP call. NOTE: get_current_client
     # has already run a SELECT on this session, which autobegins a transaction,
@@ -90,7 +91,7 @@ def search_passages(
     # directly -- the response shape is the contract, not whatever columns
     # the search happens to select.
     results = [
-        SearchV2Result(
+        SearchResult(
             passage_id=row.id,
             note_id=row.note_id,
             ordinal=row.ordinal,
@@ -109,4 +110,4 @@ def search_passages(
         )
         for row in rows
     ]
-    return SearchV2Response(results=results, degraded=degraded)
+    return SearchResponse(results=results, degraded=degraded)

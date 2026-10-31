@@ -282,7 +282,7 @@ class TestInvariants:
 
     @pytest.mark.parametrize("name", ALL_FIXTURES)
     def test_passages_do_not_overlap(self, name):
-        """v1 emitted overlapping windows; v2 must not."""
+        """The removed learnings chunker emitted overlapping windows; this must not."""
         result = split_note(read_fixture(name))
         for left, right in zip(result.passages, result.passages[1:]):
             if not left.content or not right.content:

@@ -44,7 +44,7 @@ def pipeline_version() -> str:
 
     What this string deliberately CANNOT see: a change in the embedding model
     behind an unchanged backend name and dimension (e.g. a re-pulled Ollama
-    tag). That is what the `force` flag on POST /api/v2/ingest and
+    tag). That is what the `force` flag on POST /api/v1/ingest and
     scripts/reingest.py --force exist for.
     """
     return (

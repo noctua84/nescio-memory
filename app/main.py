@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.v2.router import api_router as api_router_v2
+from app.api.v1.router import api_router
 from app.config import settings
 from app.core.body_limit import BodySizeLimitMiddleware
 from app.core.db import get_engine
@@ -33,13 +33,13 @@ def create_app() -> FastAPI:
 
     register_exception_handlers(app)
 
-    # Bounds /api/v2 request bytes before FastAPI buffers and parses the JSON
+    # Bounds /api/v1 request bytes before FastAPI buffers and parses the JSON
     # body (which otherwise happens ahead of every dependency, including
     # auth). Added as ASGI middleware, not a Depends(...), precisely so it
     # runs before dependency resolution rather than as part of it.
     app.add_middleware(BodySizeLimitMiddleware)
 
-    app.include_router(api_router_v2, prefix="/api/v2")
+    app.include_router(api_router, prefix="/api/v1")
 
     @app.get("/health", tags=["Ops"])
     def health():

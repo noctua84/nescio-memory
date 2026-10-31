@@ -1,5 +1,5 @@
-"""POST /api/v2/search and PassageSearchRepository.search: the parts of the
-hybrid contract tests/test_search_v2.py has no room for.
+"""POST /api/v1/search and PassageSearchRepository.search: the parts of the
+hybrid contract tests/test_search.py has no room for.
 
 Split out of that module only to keep each under the length the plan asks for;
 its docstring explains the `fts_only` fixture and why every route response is
@@ -21,7 +21,7 @@ from tests.factories import make_api_key, make_note, make_passage
 def _search(client, key, q, **overrides):
     payload = {"q": q, "top_k": 10}
     payload.update(overrides)
-    return client.post("/api/v2/search", json=payload, headers={"X-API-Key": key})
+    return client.post("/api/v1/search", json=payload, headers={"X-API-Key": key})
 
 
 def _results(response):
@@ -51,7 +51,7 @@ def test_a_stop_word_only_query_is_answered_by_the_vector_arm(client, db_session
 def test_search_applies_the_configured_statement_timeout_to_its_transaction(
     db_session, monkeypatch
 ):
-    # Modelled on the v1 test of the same name. A distinctive value, unlikely
+    # Modelled on the removed learnings API's test of the same name. A distinctive value, unlikely
     # to collide with either the default (5000) or the Postgres server default
     # (0), so this fails loudly if the set_config('statement_timeout', ...)
     # guard PassageSearchRepository.search applies is ever removed or stops

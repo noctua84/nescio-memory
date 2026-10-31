@@ -1,15 +1,15 @@
-"""The tenant boundary for /api/v2 -- ingest and get.
+"""The tenant boundary for /api/v1 -- ingest and get.
 
 Delete and search are the other half, in
-tests/test_isolation_v2_delete_search.py; the suite was split to keep each
+tests/test_isolation_delete_search.py; the suite was split to keep each
 module under the length the plan asks for.
 
-The v1 counterpart (tests/test_isolation.py) states the stakes and they are
+The stakes, as the removed learnings API's isolation suite put them, are
 unchanged here: every failure mode in this module is silent in production. No
 exception, no error response, just one client reading or destroying another
 client's notes.
 
-Two things give an isolation test teeth, both borrowed from that module:
+Two things give an isolation test teeth, both borrowed from that suite:
 
 1. The non-owner must itself hold data at the contested identity. A tenant
    with no rows at all cannot detect a missing filter -- its query matches
@@ -27,8 +27,6 @@ carries a sentinel that cannot appear in the other's, and the assertion is
 against `response.text` -- the WHOLE body -- so a leak through any field,
 including one added later, fails the test rather than slipping past a
 field-by-field check.
-
-v1 is untouched; nothing here modifies tests/test_isolation.py.
 """
 from sqlalchemy import select
 
@@ -36,7 +34,7 @@ from app.models.note import Note
 from app.models.passage import Passage
 from tests.factories import make_api_key, make_note, make_passage
 
-# Single lowercase tokens, deliberately: v2 search is full text, and
+# Single lowercase tokens, deliberately: search has a full-text arm, and
 # to_tsvector/websearch_to_tsquery must agree on the token for a marker to be
 # both findable by the owner and assertable-absent for everyone else.
 ACME_MARKER = "xenofluxacme"
@@ -67,20 +65,20 @@ def _ingest(client, key, **overrides):
         "content": _body(ACME_MARKER),
     }
     payload.update(overrides)
-    return client.post("/api/v2/ingest", json=payload, headers={"X-API-Key": key})
+    return client.post("/api/v1/ingest", json=payload, headers={"X-API-Key": key})
 
 
 def _get_note(client, key, note_id):
-    return client.get(f"/api/v2/notes/{note_id}", headers={"X-API-Key": key})
+    return client.get(f"/api/v1/notes/{note_id}", headers={"X-API-Key": key})
 
 
 
 # ---------------------------------------------------------------------------
-# POST /api/v2/ingest
+# POST /api/v1/ingest
 # ---------------------------------------------------------------------------
 
 
-def test_ingest_v2_stamps_the_authenticated_clients_name(client, db_session):
+def test_ingest_stamps_the_authenticated_clients_name(client, db_session):
     # upsert_note and replace_passages stamp client_name from the repository's
     # own field; the route never passes one. Both tables are checked because
     # they are stamped by two different statements.
@@ -97,7 +95,7 @@ def test_ingest_v2_stamps_the_authenticated_clients_name(client, db_session):
     assert set(passage_owners) == {"acme"}
 
 
-def test_ingest_v2_of_a_shared_path_does_not_touch_another_tenants_note(
+def test_ingest_of_a_shared_path_does_not_touch_another_tenants_note(
     client, db_session
 ):
     # The upsert's ON CONFLICT target is (client_name, scope, path_or_uri).
@@ -132,7 +130,7 @@ def test_ingest_v2_of_a_shared_path_does_not_touch_another_tenants_note(
     assert GLOBEX_MARKER not in survivor.body
 
 
-def test_ingest_v2_of_a_shared_path_does_not_delete_another_tenants_passages(
+def test_ingest_of_a_shared_path_does_not_delete_another_tenants_passages(
     client, db_session
 ):
     """The destructive failure mode: replace_passages' DELETE.
@@ -172,7 +170,7 @@ def test_ingest_v2_of_a_shared_path_does_not_delete_another_tenants_passages(
     assert surviving == acme_passage_ids
 
 
-def test_the_same_path_or_uri_coexists_under_two_clients_in_v2(client, db_session):
+def test_the_same_path_or_uri_coexists_under_two_clients(client, db_session):
     acme_key = make_api_key(db_session, "acme")
     globex_key = make_api_key(db_session, "globex")
 
@@ -192,11 +190,11 @@ def test_the_same_path_or_uri_coexists_under_two_clients_in_v2(client, db_sessio
 
 
 # ---------------------------------------------------------------------------
-# GET /api/v2/notes/{note_id}
+# GET /api/v1/notes/{note_id}
 # ---------------------------------------------------------------------------
 
 
-def test_get_note_v2_returns_404_for_another_tenants_note_id(client, db_session):
+def test_get_note_returns_404_for_another_tenants_note_id(client, db_session):
     acme_note = make_note(db_session, "acme", body=_body(ACME_MARKER))
     globex_key = make_api_key(db_session, "globex")
 
@@ -227,7 +225,7 @@ def test_the_client_filter_is_what_withholds_the_note(client, db_session):
     assert ACME_MARKER not in other_view.text
 
 
-def test_get_note_v2_404_is_identical_for_a_missing_and_a_foreign_note(
+def test_get_note_404_is_identical_for_a_missing_and_a_foreign_note(
     client, db_session
 ):
     """No existence oracle: the two 404s must be indistinguishable.
@@ -247,7 +245,7 @@ def test_get_note_v2_404_is_identical_for_a_missing_and_a_foreign_note(
     assert foreign.json() == {"detail": "Note not found"}
 
 
-def test_get_note_v2_passage_count_counts_only_the_owners_passages(
+def test_get_note_passage_count_counts_only_the_owners_passages(
     client, db_session
 ):
     """`passage_count` is the owner's own volume, not a global one.

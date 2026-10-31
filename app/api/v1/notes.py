@@ -1,4 +1,4 @@
-"""GET and DELETE /api/v2/notes/{note_id} -- one note by id.
+"""GET and DELETE /api/v1/notes/{note_id} -- one note by id.
 
 Both routes share NOTE_NOT_FOUND_DETAIL and neither branches on *why* a note
 did not resolve: NoteRepository.get_note/delete_note return None/False for a
@@ -19,11 +19,12 @@ from app.core.db import get_db
 from app.core.security import get_current_client
 from app.models import ApiKey
 from app.repositories.note import NoteRepository
-from app.schemas.note_v2 import NoteV2Response
+from app.schemas.note import NoteResponse
 
 router = APIRouter()
 
-# Input and output capture are OFF, unlike v1. Note bodies are the user's own
+# Input and output capture are OFF, unlike the removed learnings API. Note
+# bodies are the user's own
 # memory notes and may contain personal data (the corpus has a people/ bucket),
 # and Langfuse may be cloud-hosted -- @observe reads its configuration from the
 # process environment, so a deployment that sets LANGFUSE_* ships whatever is
@@ -35,14 +36,14 @@ NOTE_NOT_FOUND_DETAIL = "Note not found"
 
 @router.get(
     "/notes/{note_id}",
-    response_model=NoteV2Response,
+    response_model=NoteResponse,
     summary="Get a note by id",
     description=(
         "Fetch one note and its passage count. Returns 404 for a note that "
         "does not exist and for another tenant's note alike -- see the "
         "module docstring."
     ),
-    operation_id="getNoteV2",
+    operation_id="getNote",
     responses={404: {"description": "No such note for this client."}},
 )
 @observe(name="note-fetch", capture_input=False, capture_output=False)
@@ -50,7 +51,7 @@ def get_note(
     note_id: int,
     db: Session = Depends(get_db),
     client: ApiKey = Depends(get_current_client),
-) -> NoteV2Response:
+) -> NoteResponse:
     repo = NoteRepository(db, client_name=client.client_name)
     row = repo.get_note(note_id)
     if row is None:
@@ -59,7 +60,7 @@ def get_note(
     # Mapped field by field to the DTO. Never return a `Row`/model instance
     # directly -- the response shape is the contract, not whatever columns
     # get_note happens to select.
-    return NoteV2Response(
+    return NoteResponse(
         id=row.id,
         scope=row.scope,
         path_or_uri=row.path_or_uri,
@@ -88,7 +89,7 @@ def get_note(
         "for a note that does not exist and for another tenant's note alike "
         "-- see the module docstring."
     ),
-    operation_id="deleteNoteV2",
+    operation_id="deleteNote",
     responses={404: {"description": "No such note for this client."}},
 )
 @observe(name="note-delete", capture_input=False, capture_output=False)

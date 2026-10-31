@@ -1,12 +1,12 @@
-"""POST /api/v2/ingest: persistence, the versioned skip, force, and embedding.
+"""POST /api/v1/ingest: persistence, the versioned skip, force, and embedding.
 
-Shaped like tests/test_ingest.py -- one local `_ingest` helper, then one
-behaviour per test named after the behaviour.
+One local `_ingest` helper, then one behaviour per test named after the
+behaviour.
 
 Input validation (path_or_uri, the content cap) lives in
-tests/test_ingest_v2_validation.py, and what ingest hands the embedder (one
+tests/test_ingest_validation.py, and what ingest hands the embedder (one
 batched call, the skip spending none, a failure persisting nothing) in
-tests/test_ingest_v2_embeddings.py -- both split out only to keep each module
+tests/test_ingest_embeddings.py -- both split out only to keep each module
 under the length the plan asks for.
 """
 from types import SimpleNamespace
@@ -33,7 +33,7 @@ FRONTMATTER_NOTE = (
 def _ingest(client, key, **overrides):
     payload = {"scope": "repo_a", "path_or_uri": "docs/note.md", "content": BODY}
     payload.update(overrides)
-    return client.post("/api/v2/ingest", json=payload, headers={"X-API-Key": key})
+    return client.post("/api/v1/ingest", json=payload, headers={"X-API-Key": key})
 
 
 def _structured_body(marker: str) -> str:
@@ -101,7 +101,7 @@ def _stale_pipeline_settings(monkeypatch, **changes) -> None:
     monkeypatch.setattr(pipeline, "settings", stand_in)
 
 
-def test_ingest_v2_persists_a_note_and_its_passages(client, db_session):
+def test_ingest_persists_a_note_and_its_passages(client, db_session):
     key = make_api_key(db_session, "acme")
 
     response = _ingest(client, key)
@@ -270,7 +270,7 @@ def test_scope_defaults_to_the_empty_string(client, db_session):
     key = make_api_key(db_session, "acme")
 
     response = client.post(
-        "/api/v2/ingest",
+        "/api/v1/ingest",
         json={"path_or_uri": "docs/note.md", "content": BODY},
         headers={"X-API-Key": key},
     )
@@ -283,7 +283,7 @@ def test_repo_name_is_accepted_as_an_alias_for_scope(client, db_session):
     key = make_api_key(db_session, "acme")
 
     response = client.post(
-        "/api/v2/ingest",
+        "/api/v1/ingest",
         json={"repo_name": "repo_b", "path_or_uri": "docs/note.md", "content": BODY},
         headers={"X-API-Key": key},
     )

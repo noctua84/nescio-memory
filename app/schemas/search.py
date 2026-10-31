@@ -3,7 +3,7 @@ from datetime import date
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
-class SearchV2Request(BaseModel):
+class SearchRequest(BaseModel):
     """Request to search notes and passages."""
 
     q: str = Field(
@@ -35,7 +35,7 @@ class SearchV2Request(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
-class SearchV2Result(BaseModel):
+class SearchResult(BaseModel):
     """A passage result from a search query."""
 
     passage_id: int = Field(..., description="Unique identifier for the passage.")
@@ -102,10 +102,10 @@ class SearchV2Result(BaseModel):
     )
 
 
-class SearchV2Response(BaseModel):
+class SearchResponse(BaseModel):
     """Response containing search results."""
 
-    results: list[SearchV2Result] = Field(
+    results: list[SearchResult] = Field(
         ...,
         description="List of passages matching the search query, ordered by relevance.",
     )

@@ -46,8 +46,8 @@ MAX_CHARS = 4_000
 MIN_SECTION_CHARS = 300
 
 # There is no *minimum passage length*. The MIN_CONTENT_CHARS = 50 floor that
-# the removed v1 chunker applied is deliberately absent here: it silently
-# dropped short notes, and a short note is still worth finding.
+# the removed learnings API's chunker applied is deliberately absent here:
+# it silently dropped short notes, and a short note is still worth finding.
 
 # `#` (H1) is not a split point. A document opening with `# ADR-0003: ...`
 # followed by a status block keeps that text as the preamble.

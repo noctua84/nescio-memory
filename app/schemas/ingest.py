@@ -1,7 +1,7 @@
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
-class IngestV2Request(BaseModel):
+class IngestRequest(BaseModel):
     """Request to ingest a note with passages."""
 
     scope: str = Field(
@@ -46,7 +46,7 @@ class IngestV2Request(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
-class IngestV2Response(BaseModel):
+class IngestResponse(BaseModel):
     """Response after ingesting a note."""
 
     note_id: int = Field(..., description="ID of the ingested note.")

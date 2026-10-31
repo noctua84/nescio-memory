@@ -1,6 +1,6 @@
 """Endpoint-level tests for dependency failure responses: the embedding handler's log.
 
-These go through the real /api/v2 routes, so they verify the wiring in
+These go through the real /api/v1 routes, so they verify the wiring in
 create_app() as well as the mapping itself. Split by concern:
 
 - this module: what an embedding-backend failure logs for the operator, and that
@@ -103,7 +103,7 @@ def _logged_traceback(record) -> str:
 # classes and ERROR for the misconfiguration is a deliberate split: a
 # misconfiguration never self-heals and maps to a 500, so at WARNING it would
 # read exactly like routine backend flakiness and sit unnoticed in that noise.
-# Driven through /api/v2/ingest because ingest maps all three; search degrades
+# Driven through /api/v1/ingest because ingest maps all three; search degrades
 # on the transient class instead (tests/test_search_degraded.py).
 EMBEDDING_FAILURE_CASES = [
     pytest.param(
@@ -139,7 +139,7 @@ def test_an_embedding_backend_failure_is_logged_and_the_response_is_unchanged(
     key = make_api_key(db_session, "acme")
     _fail_fetch_with(monkeypatch, exception_class(INTERNAL))
 
-    response = http.post("/api/v2/ingest", json=INGEST_PAYLOAD, headers={"X-API-Key": key})
+    response = http.post("/api/v1/ingest", json=INGEST_PAYLOAD, headers={"X-API-Key": key})
 
     assert response.status_code == status_code
     assert response.json() == {"detail": detail}
@@ -159,7 +159,7 @@ def test_an_embedding_backend_failure_is_logged_and_the_response_is_unchanged(
     # Without the class name a reader cannot tell a transient 503 from a 500
     # that will not recover without a deployment change.
     assert exception_class.__name__ in record.getMessage()
-    assert "/api/v2/ingest" in record.getMessage()
+    assert "/api/v1/ingest" in record.getMessage()
     assert detail not in record.getMessage()
     # `is`, not isinstance: the subclasses carry different status codes, and a
     # traceback naming the parent would misdirect the reader.
@@ -177,13 +177,13 @@ def test_the_logged_path_is_the_request_that_failed(
     _fail_fetch_with(monkeypatch, EmbeddingBackendBadResponse("garbled"))
 
     response = http.post(
-        "/api/v2/search", json={"q": "pelicanium"}, headers={"X-API-Key": key}
+        "/api/v1/search", json={"q": "pelicanium"}, headers={"X-API-Key": key}
     )
 
     assert response.status_code == 503
     messages = [record.getMessage() for record in handler_records()]
-    assert any("/api/v2/search" in m for m in messages), messages
-    assert all("/api/v2/ingest" not in m for m in messages), messages
+    assert any("/api/v1/search" in m for m in messages), messages
+    assert all("/api/v1/ingest" not in m for m in messages), messages
 
 
 def test_a_degenerate_embedding_is_logged_with_the_component_that_was_wrong(
@@ -203,7 +203,7 @@ def test_a_degenerate_embedding_is_logged_with_the_component_that_was_wrong(
     )
 
     response = http.post(
-        "/api/v2/search", json={"q": "pelicanium"}, headers={"X-API-Key": key}
+        "/api/v1/search", json={"q": "pelicanium"}, headers={"X-API-Key": key}
     )
 
     assert response.status_code == 503

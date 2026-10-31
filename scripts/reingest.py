@@ -104,7 +104,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         prog="python -m scripts.reingest",
         description=(
             "Re-ingest a directory tree of Markdown notes via POST "
-            "/api/v2/ingest. Exclusion is additive: the defaults "
+            "/api/v1/ingest. Exclusion is additive: the defaults "
             f"{DEFAULT_EXCLUDES!r} are always applied unless "
             "--no-default-excludes is passed, and every --exclude adds to "
             "them rather than replacing them."
@@ -246,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_USAGE_ERROR
 
-    ingest_url = f"{base_url}/api/v2/ingest"
+    ingest_url = f"{base_url}/api/v1/ingest"
 
     ingested = skipped = failed = 0
     total_passages = 0

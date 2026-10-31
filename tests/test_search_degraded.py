@@ -1,4 +1,4 @@
-"""POST /api/v2/search: when it degrades to full-text, and when it must not.
+"""POST /api/v1/search: when it degrades to full-text, and when it must not.
 
 Only the exact transient class, EmbeddingBackendError, degrades: the backend is
 briefly unreachable and keyword results are still a useful answer. Its
@@ -17,8 +17,8 @@ import httpx
 import pytest
 from sqlalchemy import event, func, select
 
-from app.api.v2 import ingest as ingest_v2_module
-from app.api.v2 import search as search_v2_module
+from app.api.v1 import ingest as ingest_module
+from app.api.v1 import search as search_module
 from app.config import settings
 from app.core import embeddings as embeddings_module
 from app.core.errors import (
@@ -43,7 +43,7 @@ SECRET_QUERY = "pelicanium quokkasecret"
 
 def _search(client, key, q="pelicanium", top_k=10):
     return client.post(
-        "/api/v2/search",
+        "/api/v1/search",
         json={"q": q, "top_k": top_k},
         headers={"X-API-Key": key},
     )
@@ -110,7 +110,7 @@ def _use_real_query_chain(monkeypatch):
     """Undo the `client` fixture's fake so the real embedding chain runs."""
     monkeypatch.setattr(settings, "embedding_backend", "ollama")
     monkeypatch.setattr(
-        search_v2_module, "get_query_embedding", embeddings_module.get_query_embedding
+        search_module, "get_query_embedding", embeddings_module.get_query_embedding
     )
 
 
@@ -123,7 +123,7 @@ def test_a_transient_failure_returns_200_degraded_with_fts_only_results(
     key = make_api_key(db_session, "acme")
     keyword, _ = _seed(db_session)
     embedder = _raising(EmbeddingBackendError("backend down"))
-    monkeypatch.setattr(search_v2_module, "get_query_embedding", embedder)
+    monkeypatch.setattr(search_module, "get_query_embedding", embedder)
 
     response = _search(client, key)
 
@@ -144,7 +144,7 @@ def test_a_bad_response_is_503_with_retry_after_and_not_degraded(
     key = make_api_key(db_session, "acme")
     _seed(db_session)
     monkeypatch.setattr(
-        search_v2_module,
+        search_module,
         "get_query_embedding",
         _raising(EmbeddingBackendBadResponse("garbled")),
     )
@@ -162,7 +162,7 @@ def test_a_misconfiguration_is_500_without_retry_after_and_not_degraded(
     key = make_api_key(db_session, "acme")
     _seed(db_session)
     monkeypatch.setattr(
-        search_v2_module,
+        search_module,
         "get_query_embedding",
         _raising(EmbeddingBackendMisconfigured("wrong model")),
     )
@@ -247,7 +247,7 @@ def test_vector_weight_zero_never_calls_the_embedder_and_is_not_degraded(
     keyword, _ = _seed(db_session)
     # It would raise if called, so a call would show up as a degraded body.
     embedder = _raising(EmbeddingBackendError("must not be called"))
-    monkeypatch.setattr(search_v2_module, "get_query_embedding", embedder)
+    monkeypatch.setattr(search_module, "get_query_embedding", embedder)
 
     response = _search(client, key)
 
@@ -266,24 +266,24 @@ def test_the_degraded_warning_names_the_class_and_never_the_query(
 ):
     # alembic/env.py's fileConfig() disables every logger that already exists
     # when the engine fixture migrates (see tests/test_error_responses.py).
-    monkeypatch.setattr(search_v2_module.logger, "disabled", False)
+    monkeypatch.setattr(search_module.logger, "disabled", False)
     key = make_api_key(db_session, "acme")
     _seed(db_session)
     # The exception text carries the query too, so logging str(exc) would leak
     # it just as surely as logging the request.
     monkeypatch.setattr(
-        search_v2_module,
+        search_module,
         "get_query_embedding",
         _raising(EmbeddingBackendError(f"failed embedding {SECRET_QUERY!r}")),
     )
 
-    with caplog.at_level(logging.WARNING, logger=search_v2_module.logger.name):
+    with caplog.at_level(logging.WARNING, logger=search_module.logger.name):
         response = _search(client, key, q=SECRET_QUERY)
 
     assert response.status_code == 200, response.text
     assert response.json()["degraded"] is True
     route_records = [
-        r for r in caplog.records if r.name == search_v2_module.logger.name
+        r for r in caplog.records if r.name == search_module.logger.name
     ]
     assert len(route_records) == 1
     assert route_records[0].levelno == logging.WARNING
@@ -311,7 +311,7 @@ def test_the_query_is_embedded_before_any_search_guard_statement(
     def record_statement(conn, cursor, statement, parameters, context, many):
         events.append(("sql", statement))
 
-    monkeypatch.setattr(search_v2_module, "get_query_embedding", recording_embedder)
+    monkeypatch.setattr(search_module, "get_query_embedding", recording_embedder)
     event.listen(connection, "before_cursor_execute", record_statement)
     try:
         response = _search(client, key)
@@ -342,7 +342,7 @@ def test_ingest_with_a_transient_embedding_failure_is_503_and_persists_nothing(
     key = make_api_key(db_session, "acme")
     monkeypatch.setattr(settings, "embedding_backend", "ollama")
     monkeypatch.setattr(
-        ingest_v2_module, "get_embeddings", embeddings_module.get_embeddings
+        ingest_module, "get_embeddings", embeddings_module.get_embeddings
     )
 
     def refuse():
@@ -354,7 +354,7 @@ def test_ingest_with_a_transient_embedding_failure_is_503_and_persists_nothing(
     monkeypatch.setattr(embeddings_module.httpx, "Client", stub)
 
     response = client.post(
-        "/api/v2/ingest",
+        "/api/v1/ingest",
         json={
             "scope": "repo_a",
             "path_or_uri": "docs/note.md",

@@ -133,7 +133,7 @@ def _seed_skewed_corpus(db_session, bulk_rows: int = BULK_ROWS) -> None:
     # Opt back in here: without this the HNSW path -- the one production takes
     # -- would not be exercised at all, which is how #12 stayed invisible.
     #
-    # Rebuilding the index refreshes pg_class's row estimate, and on v1 that
+    # Rebuilding the index refreshes pg_class's row estimate, and on the removed learnings table that
     # alone made the planner abandon HNSW for an exact btree scan + Sort,
     # under which the query without iterative_scan has perfect recall by
     # construction: green, proving nothing about #12. Disabling sort, bitmap

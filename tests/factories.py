@@ -66,12 +66,12 @@ def make_note(
     pipeline_version: str | None = None,
     meta: dict[str, Any] | None = None,
 ) -> Note:
-    """Insert a Note row directly, bypassing POST /api/v2/ingest.
+    """Insert a Note row directly, bypassing POST /api/v1/ingest.
 
     client_name is set explicitly here precisely because this bypasses
     NoteRepository.upsert_note, which is what stamps it from the authenticated
     client in production. Seeding another client's data is the whole point of
-    the v2 isolation tests, and no route will ever write a tenant it was not
+    the isolation tests, and no route will ever write a tenant it was not
     authenticated as.
 
     `content_hash` and `pipeline_version` default to exactly what the ingest

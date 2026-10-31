@@ -1,19 +1,19 @@
-"""POST /api/v2/ingest: what it hands the embedder, and what an embedding
+"""POST /api/v1/ingest: what it hands the embedder, and what an embedding
 failure leaves behind.
 
-Split out of tests/test_ingest_v2.py only to keep each module under the length
+Split out of tests/test_ingest.py only to keep each module under the length
 the plan asks for; the request helpers are repeated here rather than shared,
 so neither module depends on the other.
 
 The route embeds through get_embeddings, ONE batched call per ingest carrying
 every passage's embedding input in order. These tests patch that name in the
-route's own namespace (app.api.v2.ingest), the binding the route actually
+route's own namespace (app.api.v1.ingest), the binding the route actually
 calls -- see the `client` fixture in tests/conftest.py for why patching
 app.core.embeddings would have no effect.
 """
 from sqlalchemy import select
 
-from app.api.v2 import ingest as ingest_v2
+from app.api.v1 import ingest as ingest_module
 from app.config import settings
 from app.core.errors import EmbeddingBackendError
 from app.models.note import Note
@@ -33,7 +33,7 @@ FRONTMATTER_NOTE = (
 def _ingest(client, key, **overrides):
     payload = {"scope": "repo_a", "path_or_uri": "docs/note.md", "content": BODY}
     payload.update(overrides)
-    return client.post("/api/v2/ingest", json=payload, headers={"X-API-Key": key})
+    return client.post("/api/v1/ingest", json=payload, headers={"X-API-Key": key})
 
 
 def _structured_body(marker: str) -> str:
@@ -66,7 +66,7 @@ def _recorder(monkeypatch):
         calls.append(list(texts))
         return [[0.0] * (settings.embedding_dimension - 1) + [1.0] for _ in texts]
 
-    monkeypatch.setattr(ingest_v2, "get_embeddings", record)
+    monkeypatch.setattr(ingest_module, "get_embeddings", record)
     return calls
 
 
@@ -102,7 +102,7 @@ def test_an_embedding_failure_leaves_the_previous_passages_intact(
     def boom(texts: list[str]) -> list[list[float]]:
         raise EmbeddingBackendError("backend down")
 
-    monkeypatch.setattr(ingest_v2, "get_embeddings", boom)
+    monkeypatch.setattr(ingest_module, "get_embeddings", boom)
     response = _ingest(client, key, content="a different body entirely")
 
     assert response.status_code == 503
@@ -142,7 +142,7 @@ def test_an_embedding_failure_on_a_first_ingest_persists_no_note(
     def boom(texts: list[str]) -> list[list[float]]:
         raise EmbeddingBackendError("backend down")
 
-    monkeypatch.setattr(ingest_v2, "get_embeddings", boom)
+    monkeypatch.setattr(ingest_module, "get_embeddings", boom)
     response = _ingest(client, key, path_or_uri="docs/never-stored.md")
 
     assert response.status_code == 503

@@ -336,7 +336,7 @@ def test_deleting_a_note_cascades_only_to_its_own_passages(db_session):
 
 
 def test_ingest_stamps_each_passage_with_the_request_scope(client, db_session):
-    """POST /api/v2/ingest writes passages.scope from the request's scope.
+    """POST /api/v1/ingest writes passages.scope from the request's scope.
 
     The same path under two scopes, so a route that stamped a constant, or
     reused the first note's scope, gets one of the two wrong. The FK would turn
@@ -347,7 +347,7 @@ def test_ingest_stamps_each_passage_with_the_request_scope(client, db_session):
     note_ids = {}
     for scope in ("repo_a", "repo_b"):
         response = client.post(
-            "/api/v2/ingest",
+            "/api/v1/ingest",
             json={
                 "scope": scope,
                 "path_or_uri": "docs/note.md",

@@ -100,7 +100,7 @@ def test_a_slow_passages_search_is_canceled_with_sqlstate_57014(
 def test_a_search_canceled_by_its_timeout_returns_503_with_no_retry_after(
     client, engine, db_session, monkeypatch
 ):
-    # The same real cancellation, through POST /api/v2/search. 503 with no
+    # The same real cancellation, through POST /api/v1/search. 503 with no
     # Retry-After: the timeout is deterministic for the same input, so a retry
     # hint would be untrue -- unlike the generic OperationalError branch,
     # which does send one.
@@ -111,7 +111,7 @@ def test_a_search_canceled_by_its_timeout_returns_503_with_no_retry_after(
 
     with _passages_locked(engine):
         response = client.post(
-            "/api/v2/search",
+            "/api/v1/search",
             json={"q": "pelicanium", "top_k": 5},
             headers={"X-API-Key": key},
         )

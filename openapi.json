@@ -6,19 +6,19 @@
     "version": "0.5.0"
   },
   "paths": {
-    "/api/v2/search": {
+    "/api/v1/search": {
       "post": {
         "tags": [
-          "Search v2"
+          "Search"
         ],
         "summary": "Hybrid keyword and semantic search over passages",
         "description": "Hybrid search over note passages: a full-text arm (websearch_to_tsquery: phrases, words, exclusions) and a vector arm (semantic similarity), fused by reciprocal rank. Returns individual matching passages, never whole notes, ordered by the fused score. Always fills up to top_k when that many passages exist -- there is no relevance floor -- and fts_rank null marks a semantic-only match. A query with no usable keywords (stop words only) is answered by the vector arm. If the query cannot be embedded because the embedding backend is briefly unavailable, the response is full-text only and degraded is true.",
-        "operationId": "searchPassagesV2",
+        "operationId": "searchPassages",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SearchV2Request"
+                "$ref": "#/components/schemas/SearchRequest"
               }
             }
           },
@@ -30,7 +30,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SearchV2Response"
+                  "$ref": "#/components/schemas/SearchResponse"
                 }
               }
             }
@@ -53,19 +53,19 @@
         ]
       }
     },
-    "/api/v2/ingest": {
+    "/api/v1/ingest": {
       "post": {
         "tags": [
-          "Ingest v2"
+          "Ingest"
         ],
         "summary": "Ingest a note",
         "description": "Splits Markdown content into heading-aware passages, embeds them, and upserts the note and its passages. Skips re-splitting and re-embedding when the content and pipeline version are unchanged, unless force=True.",
-        "operationId": "ingestNoteV2",
+        "operationId": "ingestNote",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/IngestV2Request"
+                "$ref": "#/components/schemas/IngestRequest"
               }
             }
           },
@@ -77,7 +77,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/IngestV2Response"
+                  "$ref": "#/components/schemas/IngestResponse"
                 }
               }
             }
@@ -100,14 +100,14 @@
         ]
       }
     },
-    "/api/v2/notes/{note_id}": {
+    "/api/v1/notes/{note_id}": {
       "get": {
         "tags": [
-          "Notes v2"
+          "Notes"
         ],
         "summary": "Get a note by id",
         "description": "Fetch one note and its passage count. Returns 404 for a note that does not exist and for another tenant's note alike -- see the module docstring.",
-        "operationId": "getNoteV2",
+        "operationId": "getNote",
         "security": [
           {
             "APIKeyHeader": []
@@ -130,7 +130,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/NoteV2Response"
+                  "$ref": "#/components/schemas/NoteResponse"
                 }
               }
             }
@@ -152,11 +152,11 @@
       },
       "delete": {
         "tags": [
-          "Notes v2"
+          "Notes"
         ],
         "summary": "Delete a note and its passages",
         "description": "Delete one note. Its passages go with it via cascade. Returns 404 for a note that does not exist and for another tenant's note alike -- see the module docstring.",
-        "operationId": "deleteNoteV2",
+        "operationId": "deleteNote",
         "security": [
           {
             "APIKeyHeader": []
@@ -228,7 +228,7 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
-      "IngestV2Request": {
+      "IngestRequest": {
         "properties": {
           "scope": {
             "type": "string",
@@ -290,10 +290,10 @@
           "path_or_uri",
           "content"
         ],
-        "title": "IngestV2Request",
+        "title": "IngestRequest",
         "description": "Request to ingest a note with passages."
       },
-      "IngestV2Response": {
+      "IngestResponse": {
         "properties": {
           "note_id": {
             "type": "integer",
@@ -317,10 +317,10 @@
           "passages",
           "skipped"
         ],
-        "title": "IngestV2Response",
+        "title": "IngestResponse",
         "description": "Response after ingesting a note."
       },
-      "NoteV2Response": {
+      "NoteResponse": {
         "properties": {
           "id": {
             "type": "integer",
@@ -481,10 +481,10 @@
           "created_at",
           "updated_at"
         ],
-        "title": "NoteV2Response",
+        "title": "NoteResponse",
         "description": "Response containing a note and its passage count."
       },
-      "SearchV2Request": {
+      "SearchRequest": {
         "properties": {
           "q": {
             "type": "string",
@@ -523,14 +523,14 @@
         "required": [
           "q"
         ],
-        "title": "SearchV2Request",
+        "title": "SearchRequest",
         "description": "Request to search notes and passages."
       },
-      "SearchV2Response": {
+      "SearchResponse": {
         "properties": {
           "results": {
             "items": {
-              "$ref": "#/components/schemas/SearchV2Result"
+              "$ref": "#/components/schemas/SearchResult"
             },
             "type": "array",
             "title": "Results",
@@ -547,10 +547,10 @@
           "results",
           "degraded"
         ],
-        "title": "SearchV2Response",
+        "title": "SearchResponse",
         "description": "Response containing search results."
       },
-      "SearchV2Result": {
+      "SearchResult": {
         "properties": {
           "passage_id": {
             "type": "integer",
@@ -704,7 +704,7 @@
           "content",
           "score"
         ],
-        "title": "SearchV2Result",
+        "title": "SearchResult",
         "description": "A passage result from a search query."
       },
       "ValidationError": {

@@ -29,8 +29,9 @@ class Note(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     client_name: Mapped[str] = mapped_column(Text, nullable=False)
-    # Holds what v1 calls repo_name. '' rather than NULL because a NULL
-    # would defeat the uniqueness of uq_notes_client_scope_path.
+    # Holds what the removed learnings API called repo_name. '' rather than
+    # NULL because a NULL would defeat the uniqueness of
+    # uq_notes_client_scope_path.
     scope: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     path_or_uri: Mapped[str] = mapped_column(Text, nullable=False)
     name: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -1,6 +1,6 @@
-"""Revision 3d67961c1596: drop the v1 `learnings` table, reversibly.
+"""Revision 3d67961c1596: drop the `learnings` table, reversibly.
 
-The v1 API was never deployed, so the upgrade has no data to preserve. The
+The removed learnings API was never deployed, so the upgrade has no data to preserve. The
 downgrade is still load-bearing: every revision below this one -- 9439c6362bb3
 above all, whose own downgrade alters `learnings` -- expects to find the table,
 so a downgrade that recreated it in any other shape would break the stack for

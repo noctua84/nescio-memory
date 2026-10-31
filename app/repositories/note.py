@@ -1,4 +1,4 @@
-"""All notes/passages SQL (v2) for writes and single-note reads. Nothing outside
+"""All notes/passages SQL for writes and single-note reads. Nothing outside
 this module and passage_search.py touches those tables.
 
 Tenant discipline, stated once so it is not re-argued per method: every statement

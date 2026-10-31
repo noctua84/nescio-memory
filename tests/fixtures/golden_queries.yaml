@@ -17,7 +17,7 @@
 #   minimum_queries: below this many queries, the gate is void (exit 3).
 #
 # queries: each entry has
-#   query: the text sent to /api/v2/search.
+#   query: the text sent to /api/v1/search.
 #   expect_path_or_uri: the expected note's path_or_uri, or a list of any of
 #     the path_or_uri values that would count as a correct hit (for a
 #     question two notes could legitimately answer).

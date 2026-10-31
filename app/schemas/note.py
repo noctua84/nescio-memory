@@ -3,7 +3,7 @@ from datetime import date, datetime
 from pydantic import BaseModel, Field
 
 
-class NoteV2Response(BaseModel):
+class NoteResponse(BaseModel):
     """Response containing a note and its passage count."""
 
     id: int = Field(..., description="Unique identifier for the note.")

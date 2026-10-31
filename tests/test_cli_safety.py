@@ -104,7 +104,7 @@ def test_the_hostname_is_matched_case_insensitively():
         "javascript:fetch('http://evil.example')",
         # No host at all.
         "http://",
-        "/api/v2/search",
+        "/api/v1/search",
         "",
     ],
 )
