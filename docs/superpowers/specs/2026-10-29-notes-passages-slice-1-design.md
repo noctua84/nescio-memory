@@ -114,10 +114,11 @@ of a note toward the same vector regardless of what that passage actually says.
 
 ### D7. `status` and `meta` are request-body inputs, not derived from frontmatter
 
-ai-os is the authority on what a note's `status` is; the service stores what it is told,
-rather than trying to infer status from the document body. **Rejected:** parsing `status`
-out of frontmatter or a convention line the way `name`/`description`/`type` are, which would
-make the service second-guess ai-os's own classification instead of just recording it.
+The calling client is the authority on what a note's `status` is; the service stores what it
+is told, rather than trying to infer status from the document body. **Rejected:** parsing
+`status` out of frontmatter or a convention line the way `name`/`description`/`type` are,
+which would make the service second-guess the client's own classification instead of just
+recording it.
 
 ### D8. `scope` defaults to `""`, accepted under either `scope` or `repo_name`; the search filter stays `repo_filter`
 
@@ -184,9 +185,9 @@ without requiring an unrelated bump to, say, the FTS weights.
 
 ### D13. `DELETE /api/v2/notes/{id}` exists in slice 1
 
-Erasure is not deferrable: the corpus may contain personal data (ai-os's corpus has a
-people/ bucket), and a service that can ingest personal data must be able to remove it from
-the first slice that can ingest it at all. Passages go with the note through the existing
+Erasure is not deferrable: the corpus may contain personal data (a personal-knowledge corpus
+can hold notes about people), and a service that can ingest personal data must be able to
+remove it from the first slice that can ingest it at all. Passages go with the note through the existing
 `ON DELETE CASCADE` on the composite FK — the route does not delete passages explicitly, so
 there is no second place for the tenant filter on that deletion to be wrong. **Rejected:**
 deferring `DELETE` to a later slice alongside the vector branch, which would ship an ingest
