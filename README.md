@@ -326,7 +326,7 @@ curl -X POST http://localhost:8000/api/v1/search \
 | ------------- | ------- | ----------------------------------------------------------------------- |
 | `q`           | —       | also accepted as `query` (required); parsed with `websearch_to_tsquery` semantics for the keyword branch — quoted phrases, `OR`, leading `-` to exclude a word — and embedded for the vector branch |
 | `top_k`       | `5`     | maximum number of results, 1–50, otherwise `422`                        |
-| `repo_filter` | `null`  | restrict to notes with that `scope`                                     |
+| `repo_filter` | `null`  | restrict to notes with that `scope`; `null` or an empty string `""` both mean no filter (all scopes). Notes ingested without a scope have scope `""` and cannot be selected on their own |
 
 How a result is scored:
 
@@ -342,9 +342,9 @@ How a result is scored:
 - There is **no relevance floor**: the vector branch always returns its nearest neighbours, so
   results fill up to `top_k` whenever that many passages exist and trailing ones can be weak.
 - `degraded` is always present. It is `true` when the query could not be embedded because the
-  embedding backend was transiently unavailable (bounded by `QUERY_EMBED_TIMEOUT_S`); the results
-  are then keyword-only and every `vector_rank` is `null`. Other embedding failures still return
-  an error.
+  embedding backend was transiently unavailable (bounded by `QUERY_EMBED_TIMEOUT_S`; HTTP 408, 429,
+  500, 502, 503, 504, a timeout or a connection failure); the results are then keyword-only and
+  every `vector_rank` is `null`. Any other embedding failure still returns an error.
 
 The keyword branch ranks by `ts_rank_cd` over three FTS weights: `A` (note name + heading path), `B`
 (passage content) and `C` (note description). `description` is deliberately weighted below
@@ -389,7 +389,7 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `STATEMENT_TIMEOUT_MS` | `5000`                                     | caps each statement, not the whole request; must be `1..60000`; a hybrid search is one statement under this cap; **breaking in 0.5.0**: values above 60000 now refuse to start |
 | `EMBEDDING_BACKEND`   | `ollama`                                    | `ollama` (HTTP) or `local` (in-process); any other value fails at startup |
 | `LOCAL_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2`  | model for the `local` backend only — see [Embedding backends](#embedding-backends) |
-| `OLLAMA_URL`          | `http://localhost:11434/api/embed`          | Ollama batch embedding endpoint (local or remote); must end in `/api/embed` — the legacy `/api/embeddings` fails at startup |
+| `OLLAMA_URL`          | `http://localhost:11434/api/embed`          | Ollama batch embedding endpoint (local or remote); must end in `/api/embed`, with no trailing slash — the legacy `/api/embeddings` and a trailing slash (`/api/embed/`) fail at startup |
 | `OLLAMA_MODEL`        | `qwen3-embedding:0.6b`                      | embedding model name                                 |
 | `EMBEDDING_DIMENSION` | `1024`                                      | must match the model **and** the `vector(N)` column — the default is the width `qwen3-embedding:0.6b` actually emits; verify with [`scripts/check_embedding_dimension.py`](scripts/check_embedding_dimension.py) |
 | `LANGFUSE_PUBLIC_KEY` | *(empty → tracing off)*                     | Langfuse credentials                                 |
@@ -400,7 +400,7 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `SEARCH_CANDIDATES`   | `50`                                        | candidates each search branch (keyword, vector) contributes before fusion; `1..1000`; the effective number is `max(SEARCH_CANDIDATES, top_k)` |
 | `RRF_K`               | `60`                                        | reciprocal-rank-fusion damping constant, `>= 1`; a passage scores `weight / (RRF_K + rank)` per branch |
 | `FTS_WEIGHT` / `VECTOR_WEIGHT` | `1.0` / `1.0`                      | per-branch multipliers on the fused score, finite and `>= 0`; `0` switches that branch off (`VECTOR_WEIGHT=0` is the keyword-only baseline); both `0` is rejected at startup |
-| `QUERY_INSTRUCTION`   | *(Qwen3 retrieval instruction)*             | prefix added to **query** embeddings only, never to passages, for instruction-tuned models such as Qwen3-Embedding; empty string disables it |
+| `QUERY_INSTRUCTION`   | *(Qwen3 retrieval instruction)*             | prefix added to **query** embeddings only, never to passages, for instruction-tuned models such as Qwen3-Embedding; empty string disables it. Set `QUERY_INSTRUCTION=""` for a model that is not instruction-tuned (the `local` backend's sentence-transformers model, or any non-Qwen3 Ollama model): the prefix is applied to queries only and would skew ranking |
 | `QUERY_EMBED_TIMEOUT_S` | `5`                                       | seconds a search waits to embed the query, `0 < x <= 30`; on a transient failure the search degrades to keyword-only (`degraded: true`) |
 | `EMBED_BATCH_SIZE`    | `16`                                        | passages per `/api/embed` call at ingest, `1..256` |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
@@ -416,7 +416,9 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | Best for         | clusters that already run Ollama      | single-process or offline deployments          |
 
 Select the backend with `EMBEDDING_BACKEND`. The `local` backend loads its model once and caches
-it for the lifetime of the process. Selecting `local` without installing the extra fails on the
+it for the lifetime of the process. The default `QUERY_INSTRUCTION` targets Qwen3-Embedding, so
+with the `local` backend or any other non-instruction-tuned model, set `QUERY_INSTRUCTION=""`.
+Selecting `local` without installing the extra fails on the
 first embedding call with an error naming the install command — it does **not** silently fall back
 to Ollama.
 
@@ -600,9 +602,11 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
   matches. A result with `fts_rank: null` is a semantic-only match. `score` is comparable only
   within one response.
 - **`degraded: true` responses are keyword-only.** When the query cannot be embedded because the
-  embedding backend is briefly unavailable (a timeout or connection failure), search answers from
-  the full-text arm alone instead of failing. A malformed backend response or a misconfigured
-  backend is not transient and still returns an error. Treat `degraded: true` as a weaker result,
+  embedding backend is briefly unavailable (a timeout, a connection failure, or HTTP 408, 429, 500,
+  502, 503 or 504), search answers from the full-text arm alone instead of failing. A malformed
+  backend response or a misconfigured backend is not transient and still returns an error: every
+  other non-2xx status (a 404 for a model that is not pulled, a 501 for a non-embedding model, a
+  redirect such as the 307 from a trailing-slash `OLLAMA_URL`) returns a `500` with no `Retry-After`. Treat `degraded: true` as a weaker result,
   not an error; `scripts/eval_queries.py` refuses to score one.
 - **Langfuse keys in `.env` are ignored.** `@observe` relies on the SDK reading `LANGFUSE_*` from
   the process environment, and pydantic-settings does not export `.env` values into it. Export the

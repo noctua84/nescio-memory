@@ -184,7 +184,9 @@ embedding calls (slice-1 spec, transaction shape); batching shortens that hold.
 
 - `OLLAMA_URL` keeps its name; the default is now `.../api/embed`. A startup validator in
   `app/config.py` fails fast on the legacy `/api/embeddings` URL and names the replacement. It
-  does not rewrite the URL silently.
+  does not rewrite the URL silently. The same validator rejects an `OLLAMA_URL` whose path ends
+  in a trailing slash (`/api/embed/`): Ollama answers that with a 307 redirect, so the URL fails
+  fast at startup instead of rewriting.
 - `get_embeddings(texts)` sub-batches by `EMBED_BATCH_SIZE`, checks the returned count,
   validates every vector, and sends `"truncate": true` explicitly (plan P6). With `false`, an
   over-long passage would fail as an HTTP 400, and that 400 would otherwise be misread as a
@@ -237,16 +239,24 @@ condition were transient. So `_fetch_batch` classifies:
 
 | Failure | Class | Effect |
 |---|---|---|
-| 4xx other than 408/429 (for example 400, 404) | `EmbeddingBackendMisconfigured` | 500, no `Retry-After`, logged at `error`; search fails |
-| 408, 429, 5xx | `EmbeddingBackendError` | 503 + `Retry-After`; search degrades |
+| Any non-2xx other than 408, 429, 500, 502, 503, 504 (redirects 301/302/307/308; 4xx such as 400, 404; 501) | `EmbeddingBackendMisconfigured` | 500, no `Retry-After`, logged at `error`; search fails, ingest fails fast |
+| 408, 429, 500, 502, 503, 504 | `EmbeddingBackendError` | 503 + `Retry-After`; search degrades |
 | Connection error, timeout | `EmbeddingBackendError` | 503 + `Retry-After`; search degrades |
 | Local backend: model fails to load (bad `LOCAL_EMBEDDING_MODEL`) | `EmbeddingBackendMisconfigured` | search fails |
 | Local backend: `encode()` runtime failure | `EmbeddingBackendError` | search degrades |
 
 Why `Misconfigured` and not `BadResponse`: `BadResponse` maps to 503 with `Retry-After`, which
-promises a retry that cannot help. A 404 means a model was never pulled or the Ollama build has
-no `/api/embed`; a 400 means a non-embedding model. Each needs a deployment change, which is
-exactly what `Misconfigured` means.
+promises a retry that cannot help. Observed on Ollama 0.40.6: an un-pulled model returns 404; a
+chat (non-embedding) model returns 501 "server does not support embeddings"; an `OLLAMA_URL` with a
+trailing slash (`/api/embed/`) returns 307. Each needs a deployment change, which is exactly what
+`Misconfigured` means.
+
+The allow-list of transient statuses replaced the original rule, which treated only 4xx as
+misconfiguration. A pre-merge audit found that 501 and redirects fell outside 4xx and were misread
+as transient, so search would have degraded indefinitely.
+
+When a search degrades, the warning log carries the exception message as well as the class name
+(never the query).
 
 ## Result semantics
 
@@ -313,3 +323,8 @@ ships with the default weights (`FTS_WEIGHT=1.0`, `VECTOR_WEIGHT=1.0`, `RRF_K=60
 the decision point did not trigger. Off-topic spot-check: observed as documented (each
 query returned `top_k` rows, all with `fts_rank: null`). The same table is recorded in the slice-1 spec, whose
 baseline section this result completes.
+
+**Embedding endpoint check (U1).** On 16 real passages from the private corpus, the vectors from
+the legacy `/api/embeddings` and from the batch `/api/embed` were identical (minimum cosine
+1.000000), and a batch of 16 took 0.26 s locally. So `EMBED_INPUT_VERSION` stayed `"1"` (no
+re-embed needed) and the `EMBED_BATCH_SIZE` default of 16 stands.
