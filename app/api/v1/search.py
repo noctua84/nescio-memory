@@ -57,10 +57,21 @@ def search_passages(
     client: ApiKey = Depends(get_current_client),
 ) -> SearchResponse:
     # Embed BEFORE the repository's first statement so no search work (and no
-    # statement_timeout window) overlaps the HTTP call. NOTE: get_current_client
-    # has already run a SELECT on this session, which autobegins a transaction,
-    # so the connection is idle-in-transaction during the embed regardless.
+    # statement_timeout window) overlaps the HTTP call. get_current_client has
+    # already run a SELECT on this session, which autobegins a transaction and
+    # checks a pool connection out, and the embed can wait up to
+    # QUERY_EMBED_TIMEOUT_S on Ollama (a cold model load is the slow case). So
+    # the auth read is ended first, or every in-flight embed would pin one
+    # idle-in-transaction connection and a slow Ollama would exhaust the pool.
+    # commit(), not rollback()/close(): it ends the read-only transaction and
+    # returns the connection to the pool, and under the test fixture it releases
+    # only the SAVEPOINT, whereas rollback would discard the seeded rows.
+    # client_name is read first because commit() expires the ORM instance. The
+    # repository's first statement re-begins a transaction, which its set_config
+    # read-back guard relies on.
     # VECTOR_WEIGHT=0 is the FTS-only baseline mode: the embedder is never called.
+    client_name = client.client_name
+    db.commit()
     query_vector: list[float] | None = None
     degraded = False
     if settings.vector_weight > 0:
@@ -90,7 +101,7 @@ def search_passages(
             )
             degraded = True
 
-    repo = PassageSearchRepository(db, client_name=client.client_name)
+    repo = PassageSearchRepository(db, client_name=client_name)
     rows = repo.search(request.q, query_vector, request.top_k, request.repo_filter)
 
     # Mapped field by field to the DTO. Never return a `Row`/model instance
