@@ -3,6 +3,10 @@
 These exist so a configuration error fails the deploy rather than the first
 request that happens to touch it.
 """
+from pathlib import Path
+
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
@@ -103,3 +107,63 @@ def verify_pgvector_version(engine: Engine) -> None:
             "reserved 'hnsw' prefix, so every search would fail. Upgrade the "
             "extension."
         )
+
+
+# Resolved from this file, not the working directory: the service may be started
+# from anywhere, and alembic.ini's script_location is itself relative to the ini
+# (%(here)s/alembic), so locating the ini is enough to locate the migrations.
+_ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
+
+_ALEMBIC_VERSION_TABLE_QUERY = text("SELECT to_regclass('alembic_version') IS NOT NULL")
+_ALEMBIC_VERSION_QUERY = text("SELECT version_num FROM alembic_version")
+
+
+def _script_heads() -> set[str]:
+    if not _ALEMBIC_INI.is_file():
+        raise RuntimeError(
+            f"Could not find {_ALEMBIC_INI} to read the expected migration "
+            "revision. The application must run from a checkout that includes "
+            "alembic.ini and the alembic/ directory."
+        )
+    return set(ScriptDirectory.from_config(Config(str(_ALEMBIC_INI))).get_heads())
+
+
+def verify_migration_head(engine: Engine) -> None:
+    """Fail fast if the database is not at the code's Alembic head.
+
+    The other startup checks only probe individual objects (the embedding
+    column, the pgvector version), so a database that is merely behind on
+    migrations -- a new column or index not yet applied -- would start cleanly
+    and fail on the first request that touches it. Comparing revisions turns
+    that into a failed deploy that names the remedy.
+    """
+    expected = _script_heads()
+
+    try:
+        with engine.connect() as connection:
+            # Probed first because selecting from a missing alembic_version
+            # would raise; an unmigrated database should report "no revision".
+            has_table = connection.execute(_ALEMBIC_VERSION_TABLE_QUERY).scalar()
+            current = (
+                set(connection.execute(_ALEMBIC_VERSION_QUERY).scalars().all())
+                if has_table
+                else set()
+            )
+    except OperationalError as exc:
+        raise RuntimeError(
+            "Could not connect to the database. Check DATABASE_URL and that "
+            "the database is reachable."
+        ) from exc
+
+    if current == expected:
+        return
+
+    current_text = ", ".join(sorted(current)) or "none (no alembic_version row)"
+    expected_text = ", ".join(sorted(expected))
+    raise RuntimeError(
+        f"The database is at migration revision {current_text} but this "
+        f"application expects {expected_text}. "
+        "Run `alembic upgrade head` before starting the application. If the "
+        "database revision is newer than the code, deploy the matching code "
+        "instead."
+    )
