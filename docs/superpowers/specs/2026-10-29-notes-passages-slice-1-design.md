@@ -2,6 +2,9 @@
 
 **Date:** 2026-10-29
 **Status:** Approved, implementing on this branch
+
+> **Superseded in part:** the `/api/v2` routes, the FTS-only `ts_rank_cd` search and the "v1 untouched" described here were replaced in 0.6.0 — the notes/passages API is served at `/api/v1`, with hybrid RRF search, and the v1 learnings API was removed. See [hybrid search and v1 removal](2026-10-31-hybrid-search-v1-removal-design.md).
+
 **Supersedes:** nothing. `/api/v1`, `learnings`, `app/core/context.py`, `app/core/reassembly.py`
 and `app/repositories/learning.py` are untouched by this slice.
 
