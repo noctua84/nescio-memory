@@ -5,7 +5,7 @@ the style of tests/test_embeddings.py, so every request the module would make
 is captured -- its timeout, URL and JSON payload -- and answered locally. That
 is also what keeps OLLAMA_URL irrelevant here: nothing is ever dialled.
 """
-import re
+
 import sys
 import types
 
@@ -262,40 +262,8 @@ def test_ingest_embeddings_use_the_thirty_second_timeout(monkeypatch):
     assert client.timeouts == [30, 30]
 
 
-# --- HTTP status classification (P9) ---
-
-MISCONFIGURED_STATUSES = [400, 401, 403, 404, 405, 413, 422]
-TRANSIENT_STATUSES = [408, 429, 500, 502, 503]
-
-
-@pytest.mark.parametrize("status", MISCONFIGURED_STATUSES)
-def test_a_non_retryable_4xx_is_a_misconfiguration(monkeypatch, status):
-    _install(
-        monkeypatch, lambda payload: _response({"error": "nope"}, status_code=status)
-    )
-
-    with pytest.raises(EmbeddingBackendMisconfigured) as excinfo:
-        get_embeddings([SECRET])
-    # Exact type: retrying never fixes an un-pulled model or a missing
-    # endpoint, so this must not degrade as if it were transient.
-    assert type(excinfo.value) is EmbeddingBackendMisconfigured
-    message = str(excinfo.value)
-    # Word-bounded so a port such as 11434 cannot satisfy it by accident.
-    assert re.search(rf"\b{status}\b", message)
-    assert SECRET not in message
-
-
-@pytest.mark.parametrize("status", TRANSIENT_STATUSES)
-def test_a_retryable_status_stays_on_the_base_class(monkeypatch, status):
-    _install(
-        monkeypatch, lambda payload: _response({"error": "busy"}, status_code=status)
-    )
-
-    with pytest.raises(EmbeddingBackendError) as excinfo:
-        get_embeddings(["anything"])
-    # Exact type: pytest.raises matches subclasses, so this is what catches a
-    # 429 or 503 wrongly reported as a misconfiguration.
-    assert type(excinfo.value) is EmbeddingBackendError
+# --- transport failures ---
+# HTTP status classification lives in tests/test_embeddings_status.py.
 
 
 @pytest.mark.parametrize(

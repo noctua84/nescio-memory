@@ -11,8 +11,6 @@ _validated chain in place and stub only httpx.Client or _fetch_batch, so the
 classification is exercised end to end rather than restated. No test here
 reaches the network: every path that could is stubbed.
 """
-import logging
-
 import httpx
 import pytest
 from sqlalchemy import event, func, select
@@ -35,10 +33,6 @@ from tests.fakes import fake_embedding
 BAD_RESPONSE_DETAIL = "Embedding backend returned an unexpected response"
 MISCONFIGURED_DETAIL = "Embedding backend is misconfigured"
 UNAVAILABLE_DETAIL = "Embedding backend unavailable"
-
-# Distinctive enough that finding it in a log line can only mean the query
-# text leaked there.
-SECRET_QUERY = "pelicanium quokkasecret"
 
 
 def _search(client, key, q="pelicanium", top_k=10):
@@ -174,13 +168,16 @@ def test_a_misconfiguration_is_500_without_retry_after_and_not_degraded(
     assert "Retry-After" not in response.headers
 
 
-@pytest.mark.parametrize("code", [404, 400])
-def test_a_4xx_from_ollama_on_the_real_chain_is_500_and_never_degraded(
+@pytest.mark.parametrize("code", [404, 501, 307, 308])
+def test_a_permanent_status_from_ollama_on_the_real_chain_is_500_not_degraded(
     client, db_session, monkeypatch, code
 ):
-    # Ollama answers 404 for a model that was never pulled and 400 for a
-    # non-embedding model. Neither is ever fixed by retrying, so degrading here
-    # would serve keyword results for good while claiming to be transient.
+    # What Ollama was observed to answer: 404 for a model that was never
+    # pulled, 501 for a chat (non-embedding) model, 307 for an OLLAMA_URL with
+    # a trailing slash; 308 is the http->https proxy redirect. httpx follows
+    # neither redirect. None is ever fixed by retrying, so degrading here would
+    # serve keyword results for good while claiming to be transient. The full
+    # status allow-list is in tests/test_embeddings_status.py.
     key = make_api_key(db_session, "acme")
     _seed(db_session)
     _use_real_query_chain(monkeypatch)
@@ -258,41 +255,8 @@ def test_vector_weight_zero_never_calls_the_embedder_and_is_not_degraded(
     assert [r["passage_id"] for r in body["results"]] == [keyword.id]
 
 
-# --- the warning, and when the embed happens ---------------------------------
-
-
-def test_the_degraded_warning_names_the_class_and_never_the_query(
-    client, db_session, monkeypatch, caplog
-):
-    # alembic/env.py's fileConfig() disables every logger that already exists
-    # when the engine fixture migrates (see tests/test_error_responses.py).
-    monkeypatch.setattr(search_module.logger, "disabled", False)
-    key = make_api_key(db_session, "acme")
-    _seed(db_session)
-    # The exception text carries the query too, so logging str(exc) would leak
-    # it just as surely as logging the request.
-    monkeypatch.setattr(
-        search_module,
-        "get_query_embedding",
-        _raising(EmbeddingBackendError(f"failed embedding {SECRET_QUERY!r}")),
-    )
-
-    with caplog.at_level(logging.WARNING, logger=search_module.logger.name):
-        response = _search(client, key, q=SECRET_QUERY)
-
-    assert response.status_code == 200, response.text
-    assert response.json()["degraded"] is True
-    route_records = [
-        r for r in caplog.records if r.name == search_module.logger.name
-    ]
-    assert len(route_records) == 1
-    assert route_records[0].levelno == logging.WARNING
-    assert "EmbeddingBackendError" in route_records[0].getMessage()
-    app_messages = [
-        r.getMessage() for r in caplog.records if r.name.startswith("app")
-    ]
-    assert all("quokkasecret" not in message for message in app_messages)
-    assert all("pelicanium" not in message for message in app_messages)
+# --- when the embed happens ---------------------------------------------------
+# The degraded warning's content is tested in tests/test_search_degraded_log.py.
 
 
 def test_the_query_is_embedded_before_any_search_guard_statement(

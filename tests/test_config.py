@@ -64,6 +64,44 @@ def test_the_legacy_embeddings_endpoint_fails_at_startup(legacy_url):
     assert re.search(r"/api/embed(?!dings)", message)
 
 
+@pytest.mark.parametrize(
+    "slashed_url",
+    [
+        "http://h:11434/api/embed/",
+        "https://ollama.internal:11434/api/embed/",
+        "http://h:11434/",
+    ],
+)
+def test_an_ollama_url_with_a_trailing_slash_fails_at_startup(slashed_url):
+    # Ollama answers a trailing slash with a 307 that httpx does not follow, so
+    # every request would otherwise fail as a misconfiguration at runtime.
+    with pytest.raises(ValueError) as excinfo:
+        _settings(ollama_url=slashed_url)
+    message = str(excinfo.value)
+    assert "OLLAMA_URL" in message
+    assert "trailing slash" in message.lower()
+
+
+def test_the_legacy_endpoint_with_a_trailing_slash_gets_the_legacy_message():
+    # The more useful diagnosis wins: stripping the slash alone would still
+    # leave a URL that fails, so the remedy named must be /api/embed.
+    with pytest.raises(ValueError) as excinfo:
+        _settings(ollama_url="http://h:11434/api/embeddings/")
+    message = str(excinfo.value)
+    assert "legacy" in message
+    assert re.search(r"/api/embed(?!dings)", message)
+
+
+def test_the_batch_endpoint_without_a_trailing_slash_is_accepted():
+    settings = _settings(ollama_url="http://h:11434/api/embed")
+    assert settings.ollama_url == "http://h:11434/api/embed"
+
+
+def test_a_trailing_slash_is_ignored_by_the_local_backend():
+    # The local backend never reads OLLAMA_URL, so a stale value is harmless.
+    assert _settings(embedding_backend="local", ollama_url="http://h:11434/api/embed/")
+
+
 def test_the_legacy_endpoint_is_ignored_by_the_local_backend():
     # The local backend never reads OLLAMA_URL, so a stale value is harmless.
     assert _settings(
