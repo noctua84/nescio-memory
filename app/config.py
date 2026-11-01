@@ -62,7 +62,15 @@ class Settings(BaseSettings):
     )
     # A search is interactive, so waiting the 30 s ingest timeout on a dead
     # Ollama would be worse than degrading; this bounds the query embedding.
-    query_embed_timeout_s: float = 5.0
+    # 15 s, not 5: Ollama unloads an idle model after its keep_alive (5 min by
+    # default), and the first query after that waits for a cold model load,
+    # which outlasted 5 s and degraded to keyword-only. A boot-time warm-up
+    # would only cover the first load after a deploy, not this reload after an
+    # idle unload, so the wait is raised instead; the operator remedy for
+    # avoiding the reload altogether is OLLAMA_KEEP_ALIVE on the Ollama server.
+    # The longer wait is cheap because the search endpoint ends its auth
+    # transaction before embedding, so no pool connection is held meanwhile.
+    query_embed_timeout_s: float = 15.0
     # Texts per /api/embed request. Bounds each request under the 30 s ingest
     # timeout on a CPU Ollama and bounds how long ingest holds its row lock.
     embed_batch_size: int = 16
