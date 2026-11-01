@@ -131,6 +131,16 @@ class Settings(BaseSettings):
                 "with a redirect that is not followed; remove the trailing "
                 f"slash, got {self.ollama_url!r}"
             )
+        # Checked last so the specific messages above keep winning. A bare host
+        # (http://host:11434) has an empty path, so every request would POST to
+        # the server root and fail as a bad response at runtime. endswith, not
+        # equality, so a reverse-proxy prefix (/ollama/api/embed) stays valid.
+        if not parsed.path.endswith("/api/embed"):
+            raise ValueError(
+                "OLLAMA_URL must end with the batch endpoint /api/embed "
+                "(a reverse-proxy prefix before it is fine), "
+                f"got {self.ollama_url!r}"
+            )
         return self
 
     # libpq silently raises any connect_timeout below 2 to 2 seconds, so a
