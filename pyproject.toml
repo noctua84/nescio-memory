@@ -35,6 +35,7 @@ local-embeddings = [
 dev = [
     "openapi-spec-validator>=0.9.0",
     "pytest>=8.0",
+    "pytest-cov>=6.0",
     "pyyaml>=6.0.3",
     "testcontainers[postgres]>=4.15.0",
 ]
