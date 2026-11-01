@@ -84,9 +84,8 @@ def test_a_slow_passages_search_is_canceled_with_sqlstate_57014(
     _bound_the_wait(db_session)
     repo = PassageSearchRepository(db_session, "acme")
 
-    with _passages_locked(engine):
-        with pytest.raises(OperationalError) as exc_info:
-            repo.search("pelicanium", query_vector, 5)
+    with _passages_locked(engine), pytest.raises(OperationalError) as exc_info:
+        repo.search("pelicanium", query_vector, 5)
 
     assert isinstance(exc_info.value.orig, psycopg.errors.QueryCanceled)
     assert exc_info.value.orig.sqlstate == "57014"

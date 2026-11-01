@@ -1,9 +1,9 @@
 """Tests for app.core.pipeline module."""
 
 import re
-import pytest
-from app.core import pipeline
+
 from app.config import settings
+from app.core import pipeline
 
 
 class TestContentHash:

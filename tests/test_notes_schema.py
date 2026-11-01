@@ -25,13 +25,14 @@ outer transaction is rolled back, except `test_the_migration_is_reversible`,
 which needs DDL on the shared schema and therefore takes its own connection --
 see that test for why that cannot disturb the rest of the run.
 """
-import pytest
-from alembic import command
-from alembic.config import Config
 from pathlib import Path
+
+import pytest
+from alembic.config import Config
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from alembic import command
 from app.config import settings
 from tests.factories import make_note, make_passage
 

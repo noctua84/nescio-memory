@@ -158,7 +158,7 @@ def test_reingesting_changed_content_replaces_the_passages(client, db_session):
     assert second["note_id"] == first["note_id"]
     assert second["skipped"] is False
     rows = _passages(db_session, first["note_id"])
-    assert set(passage.id for passage in rows).isdisjoint(before)
+    assert {passage.id for passage in rows}.isdisjoint(before)
     assert [passage.ordinal for passage in rows] == list(range(len(rows)))
 
 

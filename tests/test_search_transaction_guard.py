@@ -80,9 +80,11 @@ def test_the_guard_names_the_one_setting_that_did_not_take_effect(
     monkeypatch.setattr(config_module.settings, "statement_timeout_ms", _TIMEOUT_MS)
     preset = [name for name in _SESSION_SETS if name != missing]
 
-    with _autocommit_session(engine, preset) as session:
-        with pytest.raises(RuntimeError) as exc_info:
-            PassageSearchRepository(session, "acme").search("pelicanium", None, 5)
+    with (
+        _autocommit_session(engine, preset) as session,
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        PassageSearchRepository(session, "acme").search("pelicanium", None, 5)
 
     message = str(exc_info.value)
     assert re.match(rf"{re.escape(missing)} setting did not take effect", message)

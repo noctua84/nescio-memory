@@ -52,21 +52,20 @@ os.environ.setdefault(
 # and defeat the fix.
 os.environ["LANGFUSE_TRACING_ENABLED"] = "false"
 
-import pytest  # noqa: E402
-from alembic import command  # noqa: E402
-from alembic.config import Config  # noqa: E402
-from sqlalchemy import create_engine, text  # noqa: E402
-from sqlalchemy.orm import Session  # noqa: E402
-from testcontainers.community.postgres import PostgresContainer  # noqa: E402
+import pytest
+from alembic.config import Config
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
+from testcontainers.community.postgres import PostgresContainer
 
-from fastapi.testclient import TestClient  # noqa: E402
-
-from app.api.v1 import ingest as ingest_module  # noqa: E402
-from app.api.v1 import search as search_module  # noqa: E402
-from app.config import settings  # noqa: E402
-from app.core.db import get_db  # noqa: E402
-from app.main import app  # noqa: E402
-from tests.fakes import fake_embedding, fake_embeddings  # noqa: E402
+from alembic import command
+from app.api.v1 import ingest as ingest_module
+from app.api.v1 import search as search_module
+from app.config import settings
+from app.core.db import get_db
+from app.main import app
+from tests.fakes import fake_embedding, fake_embeddings
 
 # testcontainers.postgres is a deprecation shim as of 4.15.0; the import above
 # is the live path.
