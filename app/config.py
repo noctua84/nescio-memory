@@ -114,6 +114,15 @@ class Settings(BaseSettings):
                 "/api/embed, which takes `input` and returns `embeddings`; "
                 f"set OLLAMA_URL=<same host>/api/embed, got {self.ollama_url!r}"
             )
+        # A trailing slash makes Ollama answer 307, which httpx does not follow;
+        # every request would then fail as a misconfiguration. Rejected rather
+        # than stripped, so the .env is corrected instead of silently rewritten.
+        if parsed.path.endswith("/"):
+            raise ValueError(
+                "OLLAMA_URL must not end with a trailing slash: Ollama answers it "
+                "with a redirect that is not followed; remove the trailing "
+                f"slash, got {self.ollama_url!r}"
+            )
         return self
 
     # libpq silently raises any connect_timeout below 2 to 2 seconds, so a

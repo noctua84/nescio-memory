@@ -77,10 +77,16 @@ def search_passages(
             # be silently unsearchable by meaning.
             if type(exc) is not EmbeddingBackendError:
                 raise
-            # Class name only: the exception text may carry request details.
+            # The message is safe to log: on this path (exact base class) it is
+            # built only from the HTTP status, httpx's transport error text, or
+            # the local model's runtime error -- never the query. The query
+            # text is in the request body, which none of them echo. Without the
+            # message the log cannot tell a timeout from a reset connection.
             logger.warning(
-                "query embedding unavailable (%s); serving full-text results only",
+                "query embedding unavailable (%s: %s); serving full-text "
+                "results only",
                 type(exc).__name__,
+                exc,
             )
             degraded = True
 

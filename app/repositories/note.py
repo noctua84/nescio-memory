@@ -176,8 +176,9 @@ class NoteRepository:
         against. Returns the number inserted. Does not commit.
         """
         # The tenant filter is here even though the composite FK
-        # (note_id, client_name) -> notes(id, client_name) already guarantees
-        # every passage under this note belongs to this tenant: a filter
+        # (note_id, client_name, scope) -> notes(id, client_name, scope)
+        # already guarantees every passage under this note belongs to this
+        # tenant: a filter
         # correct only because another constraint is correct is one migration
         # away from being wrong. It is free too -- client_name leads
         # ix_passages_client_note.

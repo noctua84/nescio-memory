@@ -24,6 +24,11 @@ _local_model = None
 # bounds a failed ingest at roughly one timeout rather than one per chunk.
 OLLAMA_TIMEOUT_SECONDS = 30.0
 
+# The only HTTP statuses worth retrying: request timeout, rate limit, and the
+# server-side faults that mean "overloaded or restarting". 501 and 505 are
+# deliberately absent -- they are permanent capability answers.
+_TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
 
 def _get_local_model():
     global _local_model
@@ -73,8 +78,11 @@ def _fetch_batch(texts: list[str], timeout: float) -> list[object]:
             # Everything else here is a runtime fault in the in-process model --
             # memory pressure, for one. Treated as transient: unlike a missing
             # extra or a bad model name, a later attempt may succeed.
+            # WHY the class name only: this message is logged on the degraded
+            # search path, and a model runtime error may quote the input text.
+            # The cause stays in the traceback chain via `from exc`.
             raise EmbeddingBackendError(
-                f"Local embedding backend failed: {exc}"
+                f"Local embedding backend failed: {type(exc).__name__}"
             ) from exc
 
     # truncate=True matches the silent truncation of the legacy endpoint. With
@@ -93,19 +101,24 @@ def _fetch_batch(texts: list[str], timeout: float) -> list[object]:
             f"OLLAMA_URL is not a valid URL: {settings.ollama_url!r}"
         ) from exc
     except httpx.HTTPStatusError as exc:
-        # Must precede the generic clause. Ollama answers 404 for a model that
-        # was never pulled and for a build without /api/embed, and 400 for a
-        # non-embedding model; retrying never fixes either. Left on the base
-        # class they would make search degrade to FTS-only for good while
-        # claiming to be transient. 408 and 429 are the 4xx codes that do mean
-        # "try again later". The message carries the status and URL, never the
-        # input texts.
+        # Must precede the generic clause. An allow-list, not a deny-list: only
+        # the statuses that mean "try again later" are transient, and every
+        # other non-2xx is a fault that retrying never fixes. Observed against
+        # Ollama: 404 for a model that was never pulled or a build without
+        # /api/embed, 501 ("server does not support embeddings") for a chat
+        # model, and 307/308 when OLLAMA_URL has a trailing slash or sits
+        # behind an http->https proxy (httpx does not follow redirects, and
+        # raise_for_status() raises for 3xx). Left on the base class these
+        # would make search degrade to FTS-only for good while claiming to be
+        # transient, and make every ingest answer "retry later". The message
+        # carries the status and URL, never the input texts.
         code = exc.response.status_code
-        if 400 <= code < 500 and code not in (408, 429):
+        if code not in _TRANSIENT_STATUSES:
             raise EmbeddingBackendMisconfigured(
-                f"Ollama rejected the request with HTTP {code} at "
-                f"{settings.ollama_url!r}; check that OLLAMA_MODEL is pulled "
-                "and is an embedding model, and that Ollama supports /api/embed"
+                f"Ollama answered HTTP {code} at {settings.ollama_url!r}; likely "
+                "causes: OLLAMA_MODEL is not pulled or is not an embedding "
+                "model, the server lacks /api/embed, or the URL redirects "
+                "(trailing slash, http->https); check OLLAMA_URL and OLLAMA_MODEL"
             ) from exc
         raise EmbeddingBackendError(f"Ollama request failed: HTTP {code}") from exc
     except httpx.HTTPError as exc:
