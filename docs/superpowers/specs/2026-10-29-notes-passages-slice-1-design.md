@@ -51,6 +51,11 @@ A post-join tenant filter would worsen the HNSW post-filtering issues already op
 this service (#12, #74); keeping the predicate single-table keeps that path clean for slice
 2's vector branch.
 
+*Update:* migration `17be352b1a4c` (see `2026-10-31-hybrid-search-v1-removal-design.md`)
+superseded this key. It is now the 3-column `fk_passages_note (note_id, client_name, scope) →
+notes(id, client_name, scope)`, backed by `UNIQUE(id, client_name, scope)`, so `scope` is a
+single-table predicate on `passages` too. The 2-column form above is what slice 1 shipped.
+
 ## Design decisions
 
 ### D1. `notes.id` is `Integer` autoincrement, not a UUID
@@ -261,20 +266,29 @@ PDF extraction, and reconciling notes whose source files were deleted. `/api/v1`
 a major version with no deprecation window. Vector search and RRF are slice 2's work, and
 the baseline recorded below is what that work has to beat.
 
+Slices 2 and 3 were delivered together, on the same branch, and are recorded in
+`2026-10-31-hybrid-search-v1-removal-design.md`: hybrid RRF search, the move of the passages
+API to `/api/v1`, and the removal of the v1 learnings API and the `learnings` table.
+
 ## Retrieval quality baseline
 
-`scripts/eval_queries.py` reports hits@5 against `tests/fixtures/golden_queries.yaml` once
-the user has loaded the real ai-os corpus through `scripts/reingest.py` and populated the
-golden-query file with the real 15–20 queries (slice 1 ships only 2–3 examples). Fill in
-this table after running it:
+`scripts/eval_queries.py` reports hits@5 for a set of golden queries against a corpus loaded
+through `scripts/reingest.py`. `tests/fixtures/golden_queries.yaml` ships only 2–3 synthetic
+examples; the real 15–20 queries are kept in a local, uncommitted file passed with
+`--queries`, and only counts are recorded here. `mode` is `FTS-only` for a run with
+`VECTOR_WEIGHT=0` and `hybrid` for a run with the default weights.
 
-| date | corpus | notes ingested | passages | queries | hits@5 | gate (15/20) |
-|---|---|---|---|---|---|---|
-| | | | | | | |
+| date | mode | corpus | notes ingested | passages | queries | hits@5 | gate (15/20) |
+|---|---|---|---|---|---|---|---|
+| 2026-11-01 | FTS-only (`VECTOR_WEIGHT=0`) | private corpus | 555 | 1631 | 20 | 7/20 | fail |
+| 2026-11-01 | hybrid (defaults) | private corpus | 555 | 1631 | 20 | 18/20 | pass |
 
-The recorded number here is the **baseline slice 2's RRF work must beat** — slice 2's vector
-branch and rank fusion are only justified if they improve on this FTS-only number, not just
-on introducing a vector branch for its own sake. A number below the 15/20 gate is a signal to
-fix FTS weighting (decision D9) or the splitter's thresholds (decision D11) before adding a
-vector branch, not a signal to add the vector branch sooner — slice 2 compounds whatever
-retrieval quality slice 1 established; it does not replace it.
+Both runs used the same build, and neither returned a degraded response. The comparison
+verdict is in `2026-10-31-hybrid-search-v1-removal-design.md`.
+
+The FTS-only number was the baseline slice 2's RRF work had to beat: the vector branch and
+rank fusion were only justified if they improved on it, not just by introducing a vector
+branch for its own sake. A number below the 15/20 gate would have been a signal to fix FTS
+weighting (decision D9) or the splitter's thresholds (decision D11) before adding a vector
+branch. In the event FTS-only fell short of the gate and hybrid cleared it, which is the
+improvement slice 2 needed to justify itself.
