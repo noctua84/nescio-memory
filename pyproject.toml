@@ -28,7 +28,7 @@ dependencies = [
 # backend. Opt-in because it pulls torch (~530 MB of wheels on Linux):
 #   uv sync --extra local-embeddings
 local-embeddings = [
-    "sentence-transformers==6.1.0",
+    "sentence-transformers==6.2.0",
 ]
 
 [dependency-groups]
