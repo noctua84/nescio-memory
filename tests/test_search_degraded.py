@@ -6,10 +6,11 @@ subclasses mean the backend answered wrongly (BadResponse, 503 + Retry-After) or
 cannot work as deployed (Misconfigured, 500, no Retry-After), and serving
 FTS-only there would hide a fault that needs attention. Ingest never degrades.
 
-Two tests leave the real get_query_embedding -> _embed -> _fetch_batch ->
-_validated chain in place and stub only httpx.Client or _fetch_batch, so the
-classification is exercised end to end rather than restated. No test here
-reaches the network: every path that could is stubbed.
+Two search tests leave the real get_query_embedding -> _embed -> _fetch_batch ->
+_validated chain in place and stub only httpx.Client or _fetch_batch (the
+permanent-status test is parametrized over four codes), so the classification is
+exercised end to end rather than restated. No test here reaches the network:
+every path that could is stubbed.
 """
 import httpx
 import pytest
