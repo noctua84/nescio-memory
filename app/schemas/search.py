@@ -1,134 +1,118 @@
-from typing import Literal
+from datetime import date
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(
-        ...,
-        description=(
-            "The natural language search query. Rejected with 422 if it is "
-            "blank or whitespace-only after stripping; otherwise forwarded "
-            "unchanged, surrounding whitespace included."
-        ),
-        examples=["How do we handle API authentication across repos?"],
-        validation_alias="query",
-    )
+    """Request to search notes and passages."""
 
-    @field_validator("query")
-    @classmethod
-    def _validate_query_not_blank(cls, value: str) -> str:
-        # #56: a blank query carries no meaning to search for, and if the
-        # embedding backend answers it with a zero-norm vector, _validated()
-        # turns that into a 503 with Retry-After -- a retry no client can ever
-        # make succeed. Reject it here as a 422 instead: the request is
-        # invalid, the backend is fine. Non-blank queries pass through
-        # unchanged (no stripping).
-        if value.strip() == "":
-            raise ValueError("query must contain non-whitespace characters")
-        return value
-    top_k: int = Field(5, ge=1, le=50, description="Max chunks to return.")
+    q: str = Field(
+        ...,
+        min_length=1,
+        validation_alias=AliasChoices("q", "query"),
+        description=(
+            "Search query, matched by keyword/phrase and by meaning. Accepts "
+            "both 'q' and 'query' aliases."
+        ),
+        examples=["invoice-first checkout"],
+    )
+    top_k: int = Field(
+        5,
+        ge=1,
+        le=50,
+        description=(
+            "Number of passages to return. Hybrid search always fills up to "
+            "top_k when that many passages exist (there is no relevance "
+            "floor), so trailing results can be weak matches."
+        ),
+    )
     repo_filter: str | None = Field(
         None,
-        description="Optional filter by repository name.",
-        examples=["repo_a"],
-        validation_alias="repo_filter",
-    )
-    context: Literal["none", "neighbors", "document"] = Field(
-        "none",
-        description=(
-            "How much surrounding text to return alongside each matched "
-            "chunk. \"none\" (the default) returns matched chunks only and "
-            "runs no extra query. \"neighbors\" expands each hit by "
-            "`context_chunks` chunks either side. \"document\" expands to the "
-            "whole note the hit came from. Expanded text is returned in the "
-            "response's `contexts` list, not inline, so two hits in the same "
-            "note share one region."
-        ),
-    )
-    context_chunks: int = Field(
-        1,
-        ge=1,
-        le=5,
-        description=(
-            "Chunks to include either side of a hit. Only meaningful when "
-            "`context` is \"neighbors\" -- ignored for \"none\" and "
-            "\"document\"."
-        ),
+        description="Optional filter on the note's scope.",
+        examples=["project-a"],
     )
 
-
-# Field names below are snake_case with no serialization_alias, matching
-# SearchResult's existing style rather than IngestResponse's aliased one.
-class ContextRegion(BaseModel):
-    repo_name: str = Field(..., description="Repository the region's note belongs to.")
-    file_path: str = Field(..., description="Relative path of the region's note.")
-    # Nullable on purpose. A hole in the chunk index sequence leaves the
-    # dropped chunk's characters in no neighbouring chunk, so there is no safe
-    # text to join at all; null says so, where "" would look like a genuinely
-    # empty passage.
-    content: str | None = Field(
-        None,
-        description=(
-            "The expanded text, with the chunks' shared overlap stripped at "
-            "each join. Null when the stored chunks admit no safe join (see "
-            "`note`)."
-        ),
-    )
-    chunk_index_from: int = Field(
-        ..., description="Lowest chunk index included in this region."
-    )
-    chunk_index_to: int = Field(
-        ..., description="Highest chunk index included in this region."
-    )
-    covers: str = Field(
-        ...,
-        description=(
-            "The `context` mode this region was requested under: "
-            "\"neighbors\" or \"document\"."
-        ),
-    )
-    exact: bool = Field(
-        ...,
-        description=(
-            "Whether this region provably reproduces the corresponding span "
-            "of the original note. False means the text is best-effort and "
-            "`note` says why."
-        ),
-    )
-    note: str | None = Field(
-        None,
-        description=(
-            "Why the region is not exactly what was asked for -- truncated at "
-            "a dropped chunk, or joined under an unverifiable window. Null "
-            "when there is nothing to report."
-        ),
-    )
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class SearchResult(BaseModel):
-    content: str = Field(..., description="The retrieved markdown chunk.")
-    metadata: dict = Field(..., description="File path, repo name, chunk index.")
-    similarity: float = Field(..., description="Cosine similarity score (0-1).")
-    context_ref: int | None = Field(
+    """A passage result from a search query."""
+
+    passage_id: int = Field(..., description="Unique identifier for the passage.")
+    note_id: int = Field(..., description="Unique identifier of the note this passage belongs to.")
+    ordinal: int = Field(..., description="Position of this passage within the note.")
+    name: str | None = Field(
+        None,
+        description="Optional name of the note from frontmatter.",
+    )
+    description: str | None = Field(
+        None,
+        description="Optional description of the note from frontmatter. Contributes to FTS ranking at weight C.",
+    )
+    type: str | None = Field(
+        None,
+        description="Optional type classification from note frontmatter.",
+    )
+    path_or_uri: str = Field(
+        ...,
+        description="Unique path or URI of the note within its scope.",
+    )
+    heading_path: str | None = Field(
+        None,
+        description="Optional heading hierarchy path within the note.",
+        examples=["Architecture › API Design"],
+    )
+    content: str = Field(
+        ...,
+        description="The passage text.",
+    )
+    provenance_kind: str | None = Field(
+        None,
+        description="Optional provenance source kind from the note.",
+    )
+    provenance_date: date | None = Field(
+        None,
+        description="Optional date associated with provenance from the note.",
+    )
+    status: str | None = Field(
+        None,
+        description="Optional status label from the note.",
+    )
+    score: float = Field(
+        ...,
+        description=(
+            "Reciprocal-rank-fusion score; comparable only within one "
+            "response; higher is more relevant."
+        ),
+    )
+    fts_rank: int | None = Field(
         None,
         description=(
-            "Index into the response's `contexts` list of the region "
-            "containing this chunk. Null when no region was built for it -- "
-            "`context` was \"none\", the note's chunks could not be resolved, "
-            "or the region did not fit the response's character budget."
+            "1-based rank in that arm's candidate list, null if the passage "
+            "was not among that arm's candidates or the arm did not run. "
+            "A null fts_rank means a semantic-only match."
+        ),
+    )
+    vector_rank: int | None = Field(
+        None,
+        description=(
+            "1-based rank in that arm's candidate list, null if the passage "
+            "was not among that arm's candidates or the arm did not run."
         ),
     )
 
 
 class SearchResponse(BaseModel):
-    results: list[SearchResult]
-    contexts: list[ContextRegion] = Field(
-        default_factory=list,
+    """Response containing search results."""
+
+    results: list[SearchResult] = Field(
+        ...,
+        description="List of passages matching the search query, ordered by relevance.",
+    )
+    degraded: bool = Field(
+        ...,
         description=(
-            "Expanded regions referenced by the results' `context_ref`. "
-            "Deduplicated and merged: two hits in the same note share one "
-            "region rather than repeating its text. Empty when `context` is "
-            "\"none\" or when expansion produced nothing."
+            "true when the query could not be embedded and the results are "
+            "full-text only"
         ),
     )

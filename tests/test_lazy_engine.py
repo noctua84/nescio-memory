@@ -139,6 +139,85 @@ def test_the_engine_honours_a_changed_connect_timeout_setting(monkeypatch):
     assert calls[0]["connect_args"]["connect_timeout"] == 23
 
 
+def test_the_engine_hides_bound_parameters(monkeypatch):
+    """get_engine() must build the engine with hide_parameters on.
+
+    SQLAlchemy exposes the flag as Engine.hide_parameters (verified against the
+    installed sqlalchemy 2.1.x; it defaults to False). Without it, the string
+    form of any StatementError carries the bound parameters, and this service
+    hands exception strings to Langfuse as a span status_message -- where the
+    bound parameters are note bodies.
+    """
+    import app.core.db as db_module
+
+    db_module.get_engine.cache_clear()
+    try:
+        engine = db_module.get_engine()
+        assert engine.hide_parameters is True
+    finally:
+        db_module.get_engine.cache_clear()
+
+
+# A marker that could only reach a log line via the bound parameters: the
+# statement below fails on an undefined table, so Postgres's own message never
+# echoes the value. An error that did echo it (a failed integer cast, say)
+# would leak the marker through the server message no matter what
+# hide_parameters is set to, and would prove nothing.
+PARAM_MARKER = "nescio-note-body-must-not-leak-6f21"
+
+FAILING_SQL = (
+    "SELECT 1 FROM no_such_table_nescio_hide_parameters WHERE body = :marker"
+)
+
+
+def test_a_failed_statement_does_not_leak_bound_parameters(
+    pg_container, monkeypatch
+):
+    """str(exc) of a real DBAPIError must not contain a bound parameter value.
+
+    The engine is the application's own: settings.database_url is pointed at
+    the test container and get_engine() is called for real, so the kwargs under
+    test are exactly the production ones. Dropping hide_parameters=True from
+    app/core/db.py makes this test fail.
+
+    Its own connection, not the `connection`/`db_session` fixtures: those are
+    bound to the session-scoped test engine, which is built without these
+    kwargs, so an error raised through them would say nothing about
+    get_engine().
+    """
+    import app.core.db as db_module
+    from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
+    from app.config import settings
+
+    monkeypatch.setattr(
+        settings, "database_url", pg_container.get_connection_url()
+    )
+
+    db_module.get_engine.cache_clear()
+    try:
+        engine = db_module.get_engine()
+        try:
+            with engine.connect() as connection:
+                connection.execute(text(FAILING_SQL), {"marker": PARAM_MARKER})
+        except DBAPIError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("the statement was expected to fail")
+        finally:
+            engine.dispose()
+    finally:
+        db_module.get_engine.cache_clear()
+
+    assert "no_such_table_nescio_hide_parameters" in message, (
+        f"not the expected failure; got: {message}"
+    )
+    assert PARAM_MARKER not in message, (
+        "a bound parameter value appeared in the exception string, which is "
+        f"what reaches Langfuse and the logs: {message}"
+    )
+
+
 def test_get_engine_is_cached():
     """get_engine() must return the same Engine object on repeated calls.
 

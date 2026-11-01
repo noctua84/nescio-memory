@@ -1,203 +1,331 @@
-"""Ingest behaviour: persistence, replacement, and input validation."""
-from sqlalchemy import func, select
+"""POST /api/v1/ingest: persistence, the versioned skip, force, and embedding.
+
+One local `_ingest` helper, then one behaviour per test named after the
+behaviour.
+
+Input validation (path_or_uri, the content cap) lives in
+tests/test_ingest_validation.py, and what ingest hands the embedder (one
+batched call, the skip spending none, a failure persisting nothing) in
+tests/test_ingest_embeddings.py -- both split out only to keep each module
+under the length the plan asks for.
+"""
+from types import SimpleNamespace
+
+from sqlalchemy import Text, cast, select
 
 from app.config import settings
-from app.models.learning import Learning
+from app.core import pipeline
+from app.models.note import Note
+from app.models.passage import Passage
 from tests.factories import make_api_key
 
-LONG_ENOUGH = (
-    "This content comfortably exceeds the fifty character minimum that the "
-    "ingest endpoint applies to each chunk."
+# Short enough to stay a single passage (under the splitter's TARGET_CHARS) and
+# deliberately free of the sentinel words the frontmatter tests use.
+BODY = "The marmoset throughput ledger for the quarter, with no headings at all."
+
+FRONTMATTER_NOTE = (
+    "---\nname: Quokka Ledger\n"
+    "description: Pangolin accounting commentary\ntype: adr\n---\n\n"
+    "The marmoset throughput ledger. [Source: empirical — 2026-03-04]\n"
 )
 
 
 def _ingest(client, key, **overrides):
-    payload = {
-        "repo_name": "repo_a",
-        "file_path": "docs/note.md",
-        "content": LONG_ENOUGH,
-    }
+    payload = {"scope": "repo_a", "path_or_uri": "docs/note.md", "content": BODY}
     payload.update(overrides)
-    return client.post("/api/v1/ingest", data=payload, headers={"X-API-Key": key})
+    return client.post("/api/v1/ingest", json=payload, headers={"X-API-Key": key})
 
 
-def test_ingest_persists_a_chunk(client, db_session):
+def _structured_body(marker: str) -> str:
+    """A body over TARGET_CHARS whose four `##` sections each clear
+    MIN_SECTION_CHARS, so the splitter yields four passages rather than one."""
+    return "\n\n".join(
+        f"## Section {i}\n\n{marker} section {i}. " + "filler text here. " * 30
+        for i in range(4)
+    )
+
+
+def _note(db, note_id) -> Note:
+    db.expire_all()
+    return db.execute(select(Note).where(Note.id == note_id)).scalar_one()
+
+
+def _passages(db, note_id):
+    db.expire_all()
+    return db.execute(
+        select(Passage).where(Passage.note_id == note_id).order_by(Passage.ordinal)
+    ).scalars().all()
+
+
+def _passage_ids(db, note_id) -> list[int]:
+    return [passage.id for passage in _passages(db, note_id)]
+
+
+def _tsv_weights(db, passage_id, lexeme) -> set[str]:
+    """The weight labels Postgres stored for `lexeme` in that passage's tsv.
+
+    Reads the column back as text (`'quokka':1A,7B`) and returns {'A', 'B'}.
+    An unweighted (default D) entry carries no label and yields an empty set,
+    so this fails on a tsv built without setweight at all.
+    """
+    db.expire_all()
+    tsv_text = db.execute(
+        select(cast(Passage.tsv, Text)).where(Passage.id == passage_id)
+    ).scalar_one()
+    for entry in tsv_text.split(" "):
+        lex, _, positions = entry.partition(":")
+        if lex == f"'{lexeme}'":
+            return {character for character in positions if character.isalpha()}
+    return set()
+
+
+def _stale_pipeline_settings(monkeypatch, **changes) -> None:
+    """Rebind app.core.pipeline's own `settings` to a stand-in.
+
+    pipeline_version() dereferences that module global at call time, so this is
+    the binding the route actually reads -- patching a re-exported copy
+    elsewhere would pass against a broken implementation. A stand-in rather
+    than app.config.settings in place because embedding_dimension is ALSO what
+    types the `embedding` bindparam in replace_passages and what the vector(N)
+    column was migrated to: changing it globally would fail the INSERT on a
+    width mismatch instead of exercising the skip key. In production a
+    dimension change comes with a column migration; here only the version
+    string moves.
+    """
+    stand_in = SimpleNamespace(
+        embedding_backend=settings.embedding_backend,
+        embedding_dimension=settings.embedding_dimension,
+    )
+    for attribute, value in changes.items():
+        setattr(stand_in, attribute, value)
+    monkeypatch.setattr(pipeline, "settings", stand_in)
+
+
+def test_ingest_persists_a_note_and_its_passages(client, db_session):
     key = make_api_key(db_session, "acme")
 
     response = _ingest(client, key)
 
     assert response.status_code == 200
     body = response.json()
-    # Aliases, not field names: IngestResponse sets serialization_alias and
-    # FastAPI serialises by_alias.
-    assert body["status"] == "success"
-    assert body["file"] == "docs/note.md"
-    assert body["ingested"] == 1
-
-    db_session.expire_all()
-    rows = db_session.scalars(select(Learning)).all()
-    assert len(rows) == 1
-    assert rows[0].content == LONG_ENOUGH
-    assert rows[0].repo_name == "repo_a"
-    assert rows[0].meta["relative_path"] == "docs/note.md"
-    assert rows[0].meta["file_name"] == "note.md"
-    assert rows[0].meta["chunk_index"] == 0
-    assert len(rows[0].embedding) == settings.embedding_dimension
+    note = _note(db_session, body["note_id"])
+    assert (note.client_name, note.scope, note.path_or_uri) == (
+        "acme",
+        "repo_a",
+        "docs/note.md",
+    )
+    assert note.body == BODY.rstrip()
+    assert [passage.content for passage in _passages(db_session, note.id)] == [
+        BODY.rstrip()
+    ]
+    assert body["passages"] == 1
 
 
-def test_reingesting_the_same_file_replaces_rather_than_duplicates(client, db_session):
+def test_a_first_ingest_writes_passages(client, db_session):
+    # The fresh-insert path specifically: a naive skip check would see the
+    # matching hash on the row it just inserted and write no passages at all.
     key = make_api_key(db_session, "acme")
 
-    _ingest(client, key, content=LONG_ENOUGH)
-    _ingest(client, key, content=LONG_ENOUGH + " Revised.")
+    body = _ingest(client, key).json()
 
-    db_session.expire_all()
-    rows = db_session.scalars(select(Learning)).all()
-    assert len(rows) == 1
-    assert rows[0].content.endswith("Revised.")
+    assert body["skipped"] is False
+    assert body["passages"] >= 1
+    assert len(_passages(db_session, body["note_id"])) == body["passages"]
 
 
-def test_reingesting_does_not_disturb_another_file_in_the_same_repo(client, db_session):
+def test_reingesting_identical_content_is_skipped(client, db_session):
     key = make_api_key(db_session, "acme")
+    first = _ingest(client, key).json()
+    before = _passage_ids(db_session, first["note_id"])
 
-    _ingest(client, key, file_path="docs/one.md")
-    _ingest(client, key, file_path="docs/two.md")
-    _ingest(client, key, file_path="docs/one.md", content=LONG_ENOUGH + " Again.")
+    second = _ingest(client, key).json()
 
-    db_session.expire_all()
-    paths = db_session.scalars(select(Learning.file_path)).all()
-    assert sorted(paths) == ["docs/one.md", "docs/two.md"]
+    assert second["note_id"] == first["note_id"]
+    assert second["skipped"] is True
+    # The ids, not merely the count: a rewrite that happened to produce the
+    # same number of passages would pass a count assertion.
+    assert _passage_ids(db_session, first["note_id"]) == before
+    assert second["passages"] == len(before)
 
 
-def test_content_shorter_than_the_minimum_is_skipped(client, db_session):
+def test_reingesting_changed_content_replaces_the_passages(client, db_session):
     key = make_api_key(db_session, "acme")
+    first = _ingest(client, key, content=_structured_body("alpha")).json()
+    before = set(_passage_ids(db_session, first["note_id"]))
 
-    response = _ingest(client, key, content="too short to keep")
+    second = _ingest(client, key, content=_structured_body("beta")).json()
 
-    assert response.status_code == 200
-    assert response.json()["ingested"] == 0
-    db_session.expire_all()
-    assert db_session.scalar(select(func.count()).select_from(Learning)) == 0
+    assert second["note_id"] == first["note_id"]
+    assert second["skipped"] is False
+    rows = _passages(db_session, first["note_id"])
+    assert set(passage.id for passage in rows).isdisjoint(before)
+    assert [passage.ordinal for passage in rows] == list(range(len(rows)))
 
 
-def test_long_content_is_split_into_several_chunks(client, db_session):
-    # chunk_size 1000 with overlap 200 advances 800 characters per chunk, so
-    # 2000 characters yields 3 windows.
+def test_a_splitter_version_bump_forces_a_reingest(client, db_session, monkeypatch):
     key = make_api_key(db_session, "acme")
+    first = _ingest(client, key).json()
+    stale = _note(db_session, first["note_id"]).pipeline_version
 
-    response = _ingest(client, key, content="x" * 2000)
+    monkeypatch.setattr(pipeline, "SPLITTER_VERSION", "99")
+    second = _ingest(client, key).json()
 
-    assert response.json()["ingested"] == 3
-    db_session.expire_all()
-    rows = db_session.scalars(select(Learning)).all()
-    assert len(rows) == 3
-    # chunk_index is what a consumer uses to reassemble the file in order, so
-    # assert the actual values rather than just the count.
-    assert sorted(row.meta["chunk_index"] for row in rows) == [0, 1, 2]
+    assert second["skipped"] is False
+    assert _note(db_session, first["note_id"]).pipeline_version != stale
 
 
-def test_an_absolute_file_path_is_rejected(client, db_session):
+def test_an_fts_version_bump_forces_a_reingest(client, db_session, monkeypatch):
     key = make_api_key(db_session, "acme")
+    first = _ingest(client, key).json()
+    stale = _note(db_session, first["note_id"]).pipeline_version
 
-    response = _ingest(client, key, file_path="/etc/passwd")
+    monkeypatch.setattr(pipeline, "FTS_VERSION", "99")
+    second = _ingest(client, key).json()
 
-    assert response.status_code == 400
-    assert "relative path" in response.json()["detail"]
-    db_session.expire_all()
-    assert db_session.scalar(select(func.count()).select_from(Learning)) == 0
+    assert second["skipped"] is False
+    assert _note(db_session, first["note_id"]).pipeline_version != stale
 
 
-def test_a_traversing_file_path_is_rejected(client, db_session):
+def test_an_embed_input_version_bump_forces_a_reingest(client, db_session, monkeypatch):
     key = make_api_key(db_session, "acme")
+    first = _ingest(client, key).json()
+    stale = _note(db_session, first["note_id"]).pipeline_version
 
-    response = _ingest(client, key, file_path="docs/../../secrets.md")
+    monkeypatch.setattr(pipeline, "EMBED_INPUT_VERSION", "99")
+    second = _ingest(client, key).json()
 
-    assert response.status_code == 400
-    assert "relative path" in response.json()["detail"]
-    db_session.expire_all()
-    assert db_session.scalar(select(func.count()).select_from(Learning)) == 0
-
-
-def test_validation_runs_before_any_deletion(client, db_session):
-    # _validate_file_path is called before delete_by_file. A rejected path must
-    # not have destroyed an existing row on its way out.
-    key = make_api_key(db_session, "acme")
-    _ingest(client, key, file_path="docs/note.md")
-
-    _ingest(client, key, file_path="/etc/passwd")
-
-    db_session.expire_all()
-    assert db_session.scalar(select(func.count()).select_from(Learning)) == 1
+    assert second["skipped"] is False
+    assert _note(db_session, first["note_id"]).pipeline_version != stale
 
 
-def test_content_over_the_cap_is_rejected(client, db_session):
-    from app.api.v1.ingest import MAX_CONTENT_CHARS
-
-    key = make_api_key(db_session, "acme")
-
-    response = _ingest(client, key, content="x" * (MAX_CONTENT_CHARS + 1))
-
-    assert response.status_code == 400
-    assert "too large" in response.json()["detail"]
-    db_session.expire_all()
-    assert db_session.scalar(select(func.count()).select_from(Learning)) == 0
-
-
-def test_content_exactly_at_the_cap_is_accepted(client, db_session):
-    # Boundary: the cap is inclusive, so exactly MAX_CONTENT_CHARS of ASCII
-    # content must pass. ASCII is kept as its own case because it is the one
-    # payload whose character count equals its byte count, so it is the only
-    # content that can reach this boundary at all -- see
-    # test_multibyte_content_within_the_char_cap_is_rejected_by_the_byte_limit
-    # below for what happens to everything else.
-    from app.api.v1.ingest import MAX_CONTENT_CHARS
-
-    key = make_api_key(db_session, "acme")
-
-    response = _ingest(client, key, content="x" * MAX_CONTENT_CHARS)
-
-    assert response.status_code == 200
-    assert response.json()["ingested"] > 0
-
-
-def test_multibyte_content_within_the_char_cap_is_rejected_by_the_byte_limit(
-    client, db_session
+def test_an_embedding_dimension_change_forces_a_reingest(
+    client, db_session, monkeypatch
 ):
-    # Real (non-ASCII) content cannot reach MAX_CONTENT_CHARS in practice.
-    # Starlette's form parser enforces its own 1,048,576-byte per-field limit
-    # ahead of _validate_content_size, and for application/x-www-form-urlencoded
-    # bodies (what `_ingest` sends, matching the curl examples and default
-    # client behaviour) multi-byte characters are percent-encoded on the
-    # wire, inflating them further still. CJK content at HALF the documented
-    # character cap already exceeds that byte limit -- well before
-    # MAX_CONTENT_CHARS -- and the rejection carries Starlette's own message,
-    # not ours.
-    from app.api.v1.ingest import MAX_CONTENT_CHARS
-
     key = make_api_key(db_session, "acme")
-    half_the_cap = MAX_CONTENT_CHARS // 2
+    first = _ingest(client, key).json()
+    stale = _note(db_session, first["note_id"]).pipeline_version
 
-    response = _ingest(client, key, content="中" * half_the_cap)
+    _stale_pipeline_settings(
+        monkeypatch, embedding_dimension=settings.embedding_dimension + 1
+    )
+    second = _ingest(client, key).json()
 
-    assert response.status_code == 400
-    assert "1024KB" in response.json()["detail"]
-    db_session.expire_all()
-    assert db_session.scalar(select(func.count()).select_from(Learning)) == 0
+    assert second["skipped"] is False
+    assert _note(db_session, first["note_id"]).pipeline_version != stale
 
 
-def test_the_cap_is_checked_before_any_deletion(client, db_session):
-    # Oversized content must not destroy what is already stored.
+def test_force_reingests_unchanged_content(client, db_session):
     key = make_api_key(db_session, "acme")
-    _ingest(client, key, file_path="docs/note.md")
+    first = _ingest(client, key).json()
+    before = set(_passage_ids(db_session, first["note_id"]))
 
-    from app.api.v1.ingest import MAX_CONTENT_CHARS
+    second = _ingest(client, key, force=True).json()
 
-    _ingest(
-        client,
-        key,
-        file_path="docs/note.md",
-        content="x" * (MAX_CONTENT_CHARS + 1),
+    assert second["note_id"] == first["note_id"]
+    assert second["skipped"] is False
+    assert set(_passage_ids(db_session, first["note_id"])).isdisjoint(before)
+
+
+def test_force_does_not_change_the_stored_pipeline_version_or_hash(client, db_session):
+    # force is extra work, not a different outcome.
+    key = make_api_key(db_session, "acme")
+    first = _ingest(client, key).json()
+    note = _note(db_session, first["note_id"])
+    before = (note.content_hash, note.pipeline_version)
+
+    _ingest(client, key, force=True)
+
+    after = _note(db_session, first["note_id"])
+    assert (after.content_hash, after.pipeline_version) == before
+
+
+def test_force_defaults_to_false(client, db_session):
+    key = make_api_key(db_session, "acme")
+    _ingest(client, key)
+
+    assert _ingest(client, key).json()["skipped"] is True
+
+
+def test_the_note_row_carries_the_frontmatter_and_provenance(client, db_session):
+    key = make_api_key(db_session, "acme")
+
+    body = _ingest(
+        client, key, content=FRONTMATTER_NOTE, status="approved",
+        meta={"origin": "test"},
+    ).json()
+
+    note = _note(db_session, body["note_id"])
+    assert note.name == "Quokka Ledger"
+    assert note.description == "Pangolin accounting commentary"
+    assert note.type == "adr"
+    assert note.provenance_kind == "empirical"
+    assert note.provenance_date.isoformat() == "2026-03-04"
+    assert note.status == "approved"
+    assert note.meta == {"origin": "test"}
+
+
+def test_scope_defaults_to_the_empty_string(client, db_session):
+    # '' rather than NULL, because a NULL would defeat the uniqueness of
+    # uq_notes_client_scope_path.
+    key = make_api_key(db_session, "acme")
+
+    response = client.post(
+        "/api/v1/ingest",
+        json={"path_or_uri": "docs/note.md", "content": BODY},
+        headers={"X-API-Key": key},
     )
 
-    db_session.expire_all()
-    assert db_session.scalar(select(func.count()).select_from(Learning)) == 1
+    assert response.status_code == 200
+    assert _note(db_session, response.json()["note_id"]).scope == ""
+
+
+def test_repo_name_is_accepted_as_an_alias_for_scope(client, db_session):
+    key = make_api_key(db_session, "acme")
+
+    response = client.post(
+        "/api/v1/ingest",
+        json={"repo_name": "repo_b", "path_or_uri": "docs/note.md", "content": BODY},
+        headers={"X-API-Key": key},
+    )
+
+    assert response.status_code == 200
+    assert _note(db_session, response.json()["note_id"]).scope == "repo_b"
+
+
+def test_passages_carry_an_embedding_of_the_configured_width(client, db_session):
+    key = make_api_key(db_session, "acme")
+
+    body = _ingest(client, key).json()
+
+    for passage in _passages(db_session, body["note_id"]):
+        assert len(passage.embedding) == settings.embedding_dimension
+
+
+def test_passages_carry_a_three_weight_tsv(client, db_session):
+    # The weighting itself, not merely a populated column: a length(tsv) > 0
+    # assertion would pass on an unweighted one.
+    key = make_api_key(db_session, "acme")
+
+    body = _ingest(client, key, content=FRONTMATTER_NOTE).json()
+
+    passage_id = _passage_ids(db_session, body["note_id"])[0]
+    # 'quokka' comes only from the note's name (A), 'marmoset' only from the
+    # passage content (B), 'pangolin' only from the description (C).
+    assert "A" in _tsv_weights(db_session, passage_id, "quokka")
+    assert "B" in _tsv_weights(db_session, passage_id, "marmoset")
+    assert "C" in _tsv_weights(db_session, passage_id, "pangolin")
+
+
+def test_a_note_without_a_name_or_description_still_gets_a_usable_tsv(client, db_session):
+    # The NULL-concatenation hazard on both the A and C sections: in Postgres
+    # 'x' || NULL is NULL, so composing the leads in SQL would blank the whole
+    # tsv for a note with no frontmatter.
+    key = make_api_key(db_session, "acme")
+
+    body = _ingest(client, key).json()
+
+    note = _note(db_session, body["note_id"])
+    assert (note.name, note.description) == (None, None)
+    passage_id = _passage_ids(db_session, note.id)[0]
+    assert "B" in _tsv_weights(db_session, passage_id, "marmoset")
+    assert "B" in _tsv_weights(db_session, passage_id, "ledger")

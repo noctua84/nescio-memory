@@ -67,8 +67,8 @@ def test_the_configured_dimension_matches_what_the_backend_emits():
         f"{PROBE_TEXT!r} but EMBEDDING_DIMENSION is "
         f"{settings.embedding_dimension}. Every ingest and every search fails "
         "in this configuration: app.core.embeddings rejects the vector before "
-        "it reaches pgvector. Correct EMBEDDING_DIMENSION and migrate the "
-        "learnings.embedding column to match, or configure a model of the "
+        "it reaches pgvector. Correct EMBEDDING_DIMENSION and migrate "
+        "passages.embedding to match, or configure a model of the "
         "configured width."
     )
 
@@ -126,7 +126,7 @@ def test_the_backend_emits_values_pgvector_can_actually_store():
         f"{PROBE_TEXT!r}; the first few are "
         f"{[(fault.index, fault.message) for fault in probe.unusable[:3]]}. "
         "Every ingest and every search fails with a 503 in this "
-        "configuration: the learnings.embedding column is float4 and "
+        "configuration: passages.embedding is a float4 pgvector column and "
         "app.core.embeddings rejects the vector before it reaches pgvector. "
         "EMBEDDING_DIMENSION is not the fault -- do not change it to match a "
         "backend in this state; fix or replace the model."

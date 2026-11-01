@@ -14,7 +14,7 @@ import logging
 # exposes no portable "query canceled" type, so there is no
 # abstraction-preserving way to detect this. If the driver ever changes
 # again, this check silently stops matching, timeouts revert to the generic
-# 503+Retry-After branch, and the 57014 tests below (test_error_responses.py,
+# 503+Retry-After branch, and the 57014 tests below (test_error_responses_database.py,
 # test_statement_timeout.py) start failing -- update it then.
 import psycopg.errors
 from fastapi import FastAPI, Request, status
@@ -131,7 +131,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         #
         # QueryCanceled (SQLSTATE 57014) is a special case within that family.
         # Only the search transaction ever sets a statement_timeout (see
-        # LearningRepository.search), so in practice 57014 here is almost
+        # PassageSearchRepository.search), so in practice 57014 here is almost
         # always that timeout firing -- a deterministic outcome for the same
         # input, not a transient outage. But 57014 is not exclusively a
         # statement_timeout: an admin's pg_cancel_backend() or a role-level

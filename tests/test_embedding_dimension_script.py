@@ -42,6 +42,12 @@ OFF_WIDTH = settings.embedding_dimension + 7
 # stored at any width: it migrates the column for nothing and fixes nothing.
 MISMATCH_REMEDIATION = "Set EMBEDDING_DIMENSION"
 
+# The MISMATCH branch's caveat about the generated column. Postgres refuses
+# ALTER COLUMN ... TYPE on passages.embedding while the STORED generated column
+# passages.embedding_degenerate reads it, so a remediation that only said
+# "migrate the column" would send the operator into a migration that fails.
+DEGENERATE_COLUMN_CAVEAT = "drop passages.embedding_degenerate first"
+
 
 def _clean_vector(width: int | None = None) -> list[float]:
     """A vector of components pgvector's float4 column holds without complaint."""
@@ -115,6 +121,13 @@ def test_a_usable_vector_of_the_wrong_width_exits_mismatch(monkeypatch, capsys):
     assert str(settings.embedding_dimension) in out
     # And the remediation, which is correct in this case and only this case.
     assert MISMATCH_REMEDIATION in out
+    # It names the column that actually has to be migrated...
+    assert "migrate passages.embedding to" in out
+    assert f"vector({OFF_WIDTH})" in out
+    # ...and the generated column that has to be dropped before the type can
+    # change, then re-added.
+    assert DEGENERATE_COLUMN_CAVEAT in out
+    assert "re-add embedding_degenerate" in out
 
 
 @pytest.mark.parametrize(
@@ -198,9 +211,12 @@ def test_a_correct_width_vector_of_unstorable_values_exits_unusable(
     # Which component, so the value can be found again in the backend's own
     # output rather than merely asserted to exist.
     assert "index 0:" in out
+    # The explanation names the column that cannot hold these values.
+    assert "passages.embedding is a float4 pgvector column" in out
     assert "OK" not in out.splitlines()[0]
     assert "MISMATCH" not in out
     assert MISMATCH_REMEDIATION not in out
+    assert DEGENERATE_COLUMN_CAVEAT not in out
 
 
 @pytest.mark.parametrize("index", [0, settings.embedding_dimension - 1])
@@ -227,7 +243,7 @@ def test_unusable_values_are_reported_ahead_of_a_wrong_width(monkeypatch, capsys
     also the wrong width -- both faults at once, with opposite remedies. The
     script reports the unusable values first and exits 3, because MISMATCH's
     remedy is the harmful one to act on: setting EMBEDDING_DIMENSION to this
-    width and migrating the learnings.embedding column adopts the shape of a
+    width and migrating passages.embedding adopts the shape of a
     backend whose output cannot be stored at any width, so it migrates the
     column for nothing and fixes nothing.
 
@@ -253,9 +269,11 @@ def test_unusable_values_are_reported_ahead_of_a_wrong_width(monkeypatch, capsys
     # later run and wonder why it went unmentioned.
     assert "width is wrong too" in out
     # But without the MISMATCH verdict or its remediation, which is the whole
-    # point of the ordering.
+    # point of the ordering. The generated-column caveat is part of that
+    # remediation: it is migration advice, and migrating is the wrong move here.
     assert "MISMATCH" not in out
     assert MISMATCH_REMEDIATION not in out
+    assert DEGENERATE_COLUMN_CAVEAT not in out
 
 
 def test_the_fault_listing_is_capped_so_the_remediation_survives(monkeypatch, capsys):

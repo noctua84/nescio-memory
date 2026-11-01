@@ -1,150 +1,130 @@
+"""POST /api/v1/search -- hybrid keyword, phrase and semantic search over passages.
+
+Two arms (full-text and vector) are fused by reciprocal rank in the repository.
+With VECTOR_WEIGHT=0 the vector arm is off and the query is never embedded.
+"""
+
 import logging
 
 from fastapi import APIRouter, Depends
 from langfuse import observe
 from sqlalchemy.orm import Session
 
-from app.core.context import (
-    ContextHit,
-    FetchBounds,
-    FetchedChunk,
-    RangeSize,
-    admit_ranges,
-    build_regions,
-    documents_within_cap,
-    plan_ranges,
-)
+from app.config import settings
 from app.core.db import get_db
-from app.core.embeddings import get_embedding
+from app.core.embeddings import get_query_embedding
+from app.core.errors import EmbeddingBackendError
 from app.core.security import get_current_client
 from app.models import ApiKey
-from app.repositories.learning import LearningRepository
-from app.schemas.search import SearchResponse, SearchRequest, SearchResult
+from app.repositories.passage_search import PassageSearchRepository
+from app.schemas.search import SearchRequest, SearchResponse, SearchResult
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-
-def _chunk_index(meta: dict) -> int | None:
-    """Read meta["chunk_index"] as an int, or None if it is not one.
-
-    JSONB is free-form, so this can be missing or any JSON type. None means
-    "this hit cannot be placed in a document", which costs it its context
-    rather than failing the search. `bool` is excluded explicitly because it
-    is an `int` subclass and a JSON `true` is not a chunk index.
-    """
-    index = meta.get("chunk_index")
-    return index if isinstance(index, int) and not isinstance(index, bool) else None
-
-
-def _expand(
-    repo: LearningRepository, hits: list[ContextHit], request: SearchRequest
-):
-    """Fetch and build the context regions for `hits`. Two queries, or none.
-
-    The two bounds on the fetch (#48) are applied here, where the I/O is, and
-    nowhere else: app/core/context.py decides WHAT they allow, this decides
-    when to ask the database. `hits` is passed to `build_regions` whole, not
-    capped -- the bounds remove context, never results.
-    """
-    expandable, documents_over_cap = documents_within_cap(hits)
-    ranges = plan_ranges(expandable, request.context, request.context_chunks)
-
-    # The measuring query returns one small row per range instead of the
-    # rows' text, so a document that cannot fit the character budget is
-    # recognised without transferring it.
-    sizes = {
-        row.range_id: RangeSize(
-            rows=row.rows,
-            total_chars=row.total_chars,
-            recorded_step=row.recorded_step,
-        )
-        for row in repo.measure_ranges(ranges)
-    }
-    admitted, regions_over_budget = admit_ranges(ranges, sizes, expandable)
-
-    fetched = [
-        FetchedChunk(
-            repo_name=row.repo_name,
-            file_path=row.file_path,
-            chunk_index=row.chunk_index,
-            content=row.content,
-            chunk_size=row.meta.get("chunk_size"),
-            chunk_overlap=row.meta.get("chunk_overlap"),
-        )
-        for row in repo.get_chunks_for_ranges(admitted)
-    ]
-    return build_regions(
-        hits,
-        fetched,
-        request.context,
-        request.context_chunks,
-        bounds=FetchBounds(
-            documents_over_cap=documents_over_cap,
-            regions_over_budget=regions_over_budget,
-        ),
-    )
+# Input and output capture are OFF, unlike the removed learnings API. Note
+# bodies are the user's own
+# memory notes and may contain personal data (the corpus has a people/ bucket),
+# and Langfuse may be cloud-hosted -- @observe reads its configuration from the
+# process environment, so a deployment that sets LANGFUSE_* ships whatever is
+# captured off-site. Spans, timings and errors are still traced; only the
+# payloads are withheld. Do not turn these back on without a privacy review.
 
 
 @router.post(
     "/search",
     response_model=SearchResponse,
-    summary="Semantic Memory Search",
-    description="Queries pgvector using a natural language prompt.",
+    summary="Hybrid keyword and semantic search over passages",
+    description=(
+        "Hybrid search over note passages: a full-text arm "
+        "(websearch_to_tsquery: phrases, words, exclusions) and a vector arm "
+        "(semantic similarity), fused by reciprocal rank. Returns individual "
+        "matching passages, never whole notes, ordered by the fused score. "
+        "Always fills up to top_k when that many passages exist -- there is no "
+        "relevance floor -- and fts_rank null marks a semantic-only match. A "
+        "query with no usable keywords (stop words only) is answered by the "
+        "vector arm. If the query cannot be embedded because the embedding "
+        "backend is briefly unavailable, the response is full-text only and "
+        "degraded is true."
+    ),
+    operation_id="searchPassages",
 )
-@observe(name="semantic-search")
-def search_memory(request: SearchRequest, db: Session = Depends(get_db), client: ApiKey = Depends(get_current_client)):
-    query_embedding = get_embedding(request.query)
-
-    repo = LearningRepository(db, client_name=client.client_name)
-    rows = repo.search(query_embedding, request.top_k, request.repo_filter)
-
-    contexts = []
-    refs: list[int | None] = [None] * len(rows)
-
-    if request.context != "none":
-        # Mapped to plain DTOs so app/core/context.py never sees a `Learning`
-        # -- and so the whole expansion is testable without a database.
-        hits = [
-            ContextHit(
-                repo_name=learning.repo_name,
-                file_path=learning.file_path,
-                chunk_index=_chunk_index(learning.meta),
-                similarity=similarity,
-            )
-            for learning, similarity in rows
-        ]
+@observe(name="passage-search", capture_input=False, capture_output=False)
+def search_passages(
+    request: SearchRequest,
+    db: Session = Depends(get_db),
+    client: ApiKey = Depends(get_current_client),
+) -> SearchResponse:
+    # Embed BEFORE the repository's first statement so no search work (and no
+    # statement_timeout window) overlaps the HTTP call. get_current_client has
+    # already run a SELECT on this session, which autobegins a transaction and
+    # checks a pool connection out, and the embed can wait up to
+    # QUERY_EMBED_TIMEOUT_S on Ollama (a cold model load is the slow case). So
+    # the auth read is ended first, or every in-flight embed would pin one
+    # idle-in-transaction connection and a slow Ollama would exhaust the pool.
+    # commit(), not rollback()/close(): it ends the read-only transaction and
+    # returns the connection to the pool, and under the test fixture it releases
+    # only the SAVEPOINT, whereas rollback would discard the seeded rows.
+    # client_name is read first because commit() expires the ORM instance. The
+    # repository's first statement re-begins a transaction, which its set_config
+    # read-back guard relies on.
+    # VECTOR_WEIGHT=0 is the FTS-only baseline mode: the embedder is never called.
+    client_name = client.client_name
+    db.commit()
+    query_vector: list[float] | None = None
+    degraded = False
+    if settings.vector_weight > 0:
         try:
-            contexts, refs = _expand(repo, hits, request)
-        except Exception:  # noqa: BLE001 -- deliberate, see below
-            # A deliberate blanket catch, not a missing `except`. The matched
-            # chunks below are the primary answer to the caller's query and
-            # they are already in hand; expansion is strictly additive and can
-            # only ever fail to add. So anything unexpected in it -- a
-            # malformed metadata shape, a database error on the extra query, a
-            # bug in region building -- degrades to the same search response
-            # with no context, rather than turning a successful search into a
-            # non-200. Narrowing this to the exceptions anticipated today would
-            # mean the ones not anticipated are exactly the ones that fail the
-            # search. Logged at warning so it is visible rather than silent.
+            query_vector = get_query_embedding(request.q)
+        except EmbeddingBackendError as exc:
+            # Exact class only. The base class means the backend is transiently
+            # unreachable, where full-text results are a useful answer. The
+            # subclasses mean it answered wrongly (bad response) or we are
+            # misconfigured (wrong model/dimension); serving FTS-only there
+            # would hide a fault that needs attention, so they propagate to the
+            # 503/500 handlers in app/core/errors.py. Ingest does NOT degrade:
+            # it still returns 503, since a note stored without vectors would
+            # be silently unsearchable by meaning.
+            if type(exc) is not EmbeddingBackendError:
+                raise
+            # The message is safe to log: on this path (exact base class) it is
+            # built only from the HTTP status, httpx's transport error text, or
+            # the local model's runtime error -- never the query. The query
+            # text is in the request body, which none of them echo. Without the
+            # message the log cannot tell a timeout from a reset connection.
             logger.warning(
-                "context expansion failed for client=%s context=%s; returning "
-                "results without context",
-                client.client_name,
-                request.context,
-                exc_info=True,
+                "query embedding unavailable (%s: %s); serving full-text "
+                "results only",
+                type(exc).__name__,
+                exc,
             )
-            contexts, refs = [], [None] * len(rows)
+            degraded = True
 
-    # Map ORM objects -> DTOs. Never expose `Learning` directly.
+    repo = PassageSearchRepository(db, client_name=client_name)
+    rows = repo.search(request.q, query_vector, request.top_k, request.repo_filter)
+
+    # Mapped field by field to the DTO. Never return a `Row`/model instance
+    # directly -- the response shape is the contract, not whatever columns
+    # the search happens to select.
     results = [
         SearchResult(
-            content=learning.content,
-            metadata=learning.meta,
-            similarity=similarity,
-            context_ref=refs[position],
+            passage_id=row.id,
+            note_id=row.note_id,
+            ordinal=row.ordinal,
+            name=row.name,
+            description=row.description,
+            type=row.type,
+            path_or_uri=row.path_or_uri,
+            heading_path=row.heading_path,
+            content=row.content,
+            provenance_kind=row.provenance_kind,
+            provenance_date=row.provenance_date,
+            status=row.status,
+            score=row.score,
+            fts_rank=row.fts_rank,
+            vector_rank=row.vector_rank,
         )
-        for position, (learning, similarity) in enumerate(rows)
+        for row in rows
     ]
-    return SearchResponse(results=results, contexts=contexts)
+    return SearchResponse(results=results, degraded=degraded)

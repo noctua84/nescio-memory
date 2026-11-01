@@ -4,9 +4,14 @@ from fastapi import FastAPI
 
 from app.api.v1.router import api_router
 from app.config import settings
+from app.core.body_limit import BodySizeLimitMiddleware
 from app.core.db import get_engine
 from app.core.errors import register_exception_handlers
-from app.core.schema_checks import verify_embedding_dimension, verify_pgvector_version
+from app.core.schema_checks import (
+    verify_embedding_dimension,
+    verify_migration_head,
+    verify_pgvector_version,
+)
 from app.helper import get_app_version
 
 __version__ = get_app_version()
@@ -19,6 +24,7 @@ async def lifespan(_: FastAPI):
     engine = get_engine()
     verify_pgvector_version(engine)
     verify_embedding_dimension(engine)
+    verify_migration_head(engine)
     yield
 
 
@@ -31,6 +37,12 @@ def create_app() -> FastAPI:
     )
 
     register_exception_handlers(app)
+
+    # Bounds /api/v1 request bytes before FastAPI buffers and parses the JSON
+    # body (which otherwise happens ahead of every dependency, including
+    # auth). Added as ASGI middleware, not a Depends(...), precisely so it
+    # runs before dependency resolution rather than as part of it.
+    app.add_middleware(BodySizeLimitMiddleware)
 
     app.include_router(api_router, prefix="/api/v1")
 

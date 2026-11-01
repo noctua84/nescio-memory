@@ -1,10 +1,17 @@
-import math
-import struct
 from typing import NamedTuple
 
 import httpx
 
 from app.config import settings
+from app.core.embedding_validation import (  # noqa: F401  re-exported
+    FLOAT32_MAX,
+    FLOAT32_MIN_NORMAL,
+    UnusableComponent,
+    _as_float32,
+    _component_fault,
+    _float32_sum_of_squares,
+    _validated,
+)
 from app.core.errors import (
     EmbeddingBackendBadResponse,
     EmbeddingBackendError,
@@ -17,163 +24,10 @@ _local_model = None
 # bounds a failed ingest at roughly one timeout rather than one per chunk.
 OLLAMA_TIMEOUT_SECONDS = 30.0
 
-# pgvector's `vector` column type is float4 (float32), not float8. A component
-# that is finite in Python's float64 but beyond this magnitude is just as
-# unusable as a NaN -- pgvector rejects it with SQLSTATE 22003 ("out of range
-# for type vector"), which the error layer maps to a client error even though
-# the backend produced the bad value. This is float32's largest finite value;
-# it round-trips through float32 exactly, so it is the correct inclusive bound.
-FLOAT32_MAX = 3.4028234663852886e38
-
-# float4's smallest normal value. Anything with a smaller magnitude is either
-# a subnormal or exactly zero; both are candidates for the zero-norm check
-# below, because pgvector's internal float4 arithmetic treats them as
-# contributing nothing to a vector's norm. Verified against the real
-# container (pgvector/pgvector:pg17): a vector of all-subnormal components
-# (every |x| < this bound) stores unchanged but its self cosine-distance
-# comes back NaN -- confirming the norm pgvector computes for it is zero even
-# though Python's float64 arithmetic on the same stored values is not.
-FLOAT32_MIN_NORMAL = 1.17549435e-38
-
-
-class UnusableComponent(NamedTuple):
-    """One component of a vector that pgvector's float4 column cannot hold.
-
-    `message` is the sentence the API surfaces, so the two callers of the rule
-    below cannot end up describing the same fault differently. `index` is what
-    a diagnostic needs and a request does not: _validated() stops at the first
-    fault, while a probe reports every one of them and has to say where.
-    """
-
-    index: int
-    message: str
-    # Set only for a component that could not be evaluated at all, so
-    # _validated() can still chain the OverflowError the verdict came from.
-    # Without it the traceback would stop at this module and lose the reason.
-    cause: BaseException | None = None
-
-
-def _component_fault(index: int, component: object) -> UnusableComponent | None:
-    """Judge one component against float4, without raising.
-
-    The single home of the rule. _validated() turns the first fault into the
-    error the caller sees; probe_embedding() collects them all and still reports
-    the width. A second copy of this predicate would drift from the first, and
-    the probe needs the one thing _validated() must not do -- to measure a
-    vector it would reject.
-    """
-    # bool is a subclass of int, so check it out explicitly rather than
-    # letting True sail through as 1.0.
-    if isinstance(component, bool) or not isinstance(component, (int, float)):
-        return UnusableComponent(
-            index,
-            f"embedding contained a {type(component).__name__}, expected numbers",
-        )
-    # NaN passes isinstance(..., float), so the type check above is
-    # insufficient to guarantee a usable value, and math.isfinite is still
-    # not sufficient on its own: the destination column is float32, narrower
-    # than a Python float, so a finite float64 can still be unrepresentable
-    # there, and an unbounded int (valid JSON, decoded by stdlib json into a
-    # Python int of arbitrary size) makes math.isfinite itself raise rather
-    # than return False.
-    try:
-        finite = math.isfinite(component)
-    except OverflowError as exc:
-        return UnusableComponent(
-            index,
-            "embedding component was too large to evaluate as a float",
-            exc,
-        )
-    if not finite or abs(component) > FLOAT32_MAX:
-        return UnusableComponent(
-            index,
-            f"embedding component was {component}, expected finite float32 values",
-        )
-    return None
-
-
-def _as_float32(value: float) -> float:
-    """Round `value` through float32, matching pgvector's float4 column.
-
-    struct.pack/unpack rather than numpy: numpy is not otherwise a dependency
-    of this module, and the standard library already round-trips a float
-    through IEEE 754 single precision exactly.
-    """
-    return struct.unpack("f", struct.pack("f", value))[0]
-
-
-def _float32_sum_of_squares(vector: list[float]) -> float:
-    """The vector's squared norm, accumulated the way float4 arithmetic sees it.
-
-    Doing this in Python's native float64 would miss exactly what #42 is
-    about: a component whose float64 square is a tiny but nonzero number can
-    still underflow to exactly 0 once it is squared in float32 (confirmed
-    empirically -- see FLOAT32_MIN_NORMAL above and the #42 self-distance
-    tests), and accumulating in float64 would report a nonzero total where
-    pgvector computes an exact zero. Each step below is rounded through
-    float32 so the running total cannot "rescue" an underflowed square with
-    float64 precision it would not actually have in storage.
-    """
-    total = 0.0
-    for component in vector:
-        value = _as_float32(component)
-        # Subnormals round-trip through struct.pack unchanged (Python/IEEE 754
-        # do not flush them to zero), but pgvector's own arithmetic does
-        # not preserve their contribution to a norm -- confirmed empirically:
-        # an all-subnormal vector's self cosine-distance comes back NaN. So a
-        # subnormal component is treated as zero here too, ahead of squaring.
-        if abs(value) < FLOAT32_MIN_NORMAL:
-            value = 0.0
-        total = _as_float32(total + _as_float32(value * value))
-    return total
-
-
-def _validated(vector: object) -> list[float]:
-    """Reject anything that is not a usable embedding.
-
-    The `embedding` key being present says nothing about its value. Without this,
-    a wrongly sized or wrongly typed vector reaches pgvector and fails as an
-    opaque 500 -- and a null one produced runnable SQL that returned a row, which
-    is worse than an error because it is silently wrong.
-    """
-    expected = settings.embedding_dimension
-    if not isinstance(vector, list):
-        raise EmbeddingBackendBadResponse(
-            f"embedding was {type(vector).__name__}, expected a list"
-        )
-    if len(vector) != expected:
-        raise EmbeddingBackendBadResponse(
-            f"embedding had {len(vector)} dimensions, expected {expected}"
-        )
-    for index, component in enumerate(vector):
-        fault = _component_fault(index, component)
-        if fault is None:
-            continue
-        # First fault only: a request has nothing to gain from the rest of the
-        # vector once one component makes it unstorable.
-        if fault.cause is not None:
-            raise EmbeddingBackendBadResponse(fault.message) from fault.cause
-        raise EmbeddingBackendBadResponse(fault.message)
-    # #42: every component above passed as a usable float32, but the VECTOR as
-    # a whole can still be unusable -- a zero vector, an all-subnormal one, or
-    # one whose components are individually normal yet each square underflows
-    # float32 (so the accumulated norm is zero even though no single component
-    # was rejected above). cosine_distance divides by the norm of both sides,
-    # so a zero-norm row produces NaN, which search() cannot turn back into a
-    # `similarity: float`. Caught here rather than left to the repository
-    # because the backend already returned something architecturally
-    # unusable; retrying the same input will not help, so this is a 503
-    # fault like the component checks above, not a request-shape error.
-    # Use <= not == because _float32_sum_of_squares is always >= 0 (sum of
-    # squares) and cannot be NaN here (non-finite components are rejected
-    # above), so this catches the zero case without float equality comparison.
-    if _float32_sum_of_squares(vector) <= 0.0:
-        raise EmbeddingBackendBadResponse(
-            "embedding had zero norm once rounded to float32, so cosine "
-            "distance against it is undefined; retrying with the same "
-            "input will not help"
-        )
-    return vector
+# The only HTTP statuses worth retrying: request timeout, rate limit, and the
+# server-side faults that mean "overloaded or restarting". 501 and 505 are
+# deliberately absent -- they are permanent capability answers.
+_TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 
 def _get_local_model():
@@ -190,66 +44,158 @@ def _get_local_model():
                 "EMBEDDING_BACKEND=local needs the local-embeddings extra; "
                 "install it with `uv sync --extra local-embeddings`"
             ) from exc
-        _local_model = SentenceTransformer(settings.local_embedding_model)
+        try:
+            _local_model = SentenceTransformer(settings.local_embedding_model)
+        except Exception as exc:
+            # Accepted trade-off: a one-off download hiccup on first load is
+            # also reported as a 500, and a retry or restart fixes it. The
+            # alternative, the transient base class, would let search degrade
+            # to FTS-only for ever on a typo'd LOCAL_EMBEDDING_MODEL.
+            raise EmbeddingBackendMisconfigured(
+                "Could not load LOCAL_EMBEDDING_MODEL "
+                f"{settings.local_embedding_model!r}: {exc}"
+            ) from exc
     return _local_model
 
 
-def _fetch(text: str) -> object:
-    """Ask the configured backend for an embedding, without validating it.
+def _fetch_batch(texts: list[str], timeout: float) -> list[object]:
+    """Ask the configured backend for one embedding per text, unvalidated.
 
-    Split out of get_embedding so probe_embedding_dimension() can measure what
-    the backend actually emits. Routing it through get_embedding instead would
-    mean the dimension check rejects the very vector being measured, which is
-    the one thing the probe must not do.
+    The single raw transport for both backends. Nothing here checks the count
+    or the contents of what comes back; _embed does, so the probe can still
+    measure a backend whose output _validated would reject.
     """
     if settings.embedding_backend == "local":
         try:
-            vector = _get_local_model().encode(text).tolist()
+            return [row.tolist() for row in _get_local_model().encode(texts)]
         except EmbeddingBackendError:
             # _get_local_model raises EmbeddingBackendMisconfigured for a missing
-            # extra. That is a subclass, so re-raise it unchanged rather than
-            # reclassifying a permanent fault as a transient one.
+            # extra or an unloadable model. That is a subclass, so re-raise it
+            # unchanged rather than reclassifying a permanent fault as a
+            # transient one.
             raise
         except Exception as exc:
             # Everything else here is a runtime fault in the in-process model --
-            # memory pressure, a bad model name, a failed download. Treated as
-            # transient: unlike a missing extra, a later attempt may succeed.
+            # memory pressure, for one. Treated as transient: unlike a missing
+            # extra or a bad model name, a later attempt may succeed.
+            # WHY the class name only: this message is logged on the degraded
+            # search path, and a model runtime error may quote the input text.
+            # The cause stays in the traceback chain via `from exc`.
             raise EmbeddingBackendError(
-                f"Local embedding backend failed: {exc}"
+                f"Local embedding backend failed: {type(exc).__name__}"
             ) from exc
-        return vector
 
-    payload = {"model": settings.ollama_model, "prompt": text}
+    # truncate=True matches the silent truncation of the legacy endpoint. With
+    # false, an over-long passage fails as an HTTP 400, which the status
+    # classification below would report as a misconfiguration.
+    payload = {"model": settings.ollama_model, "input": texts, "truncate": True}
     try:
-        with httpx.Client(timeout=OLLAMA_TIMEOUT_SECONDS) as client:
+        with httpx.Client(timeout=timeout) as client:
             response = client.post(settings.ollama_url, json=payload)
             response.raise_for_status()
     except httpx.InvalidURL as exc:
         # InvalidURL inherits from Exception rather than httpx.HTTPError, so the
-        # clause below does not catch it. A malformed URL is a deployment
+        # clauses below do not catch it. A malformed URL is a deployment
         # mistake, not a transient condition, so it must not promise a retry.
         raise EmbeddingBackendMisconfigured(
             f"OLLAMA_URL is not a valid URL: {settings.ollama_url!r}"
         ) from exc
+    except httpx.HTTPStatusError as exc:
+        # Must precede the generic clause. An allow-list, not a deny-list: only
+        # the statuses that mean "try again later" are transient, and every
+        # other non-2xx is a fault that retrying never fixes. Observed against
+        # Ollama: 404 for a model that was never pulled or a build without
+        # /api/embed, 501 ("server does not support embeddings") for a chat
+        # model, and 307/308 when OLLAMA_URL has a trailing slash or sits
+        # behind an http->https proxy (httpx does not follow redirects, and
+        # raise_for_status() raises for 3xx). Left on the base class these
+        # would make search degrade to FTS-only for good while claiming to be
+        # transient, and make every ingest answer "retry later". The message
+        # carries the status and URL, never the input texts.
+        code = exc.response.status_code
+        if code not in _TRANSIENT_STATUSES:
+            raise EmbeddingBackendMisconfigured(
+                f"Ollama answered HTTP {code} at {settings.ollama_url!r}; likely "
+                "causes: OLLAMA_MODEL is not pulled or is not an embedding "
+                "model, the server lacks /api/embed, or the URL redirects "
+                "(trailing slash, http->https); check OLLAMA_URL and OLLAMA_MODEL"
+            ) from exc
+        raise EmbeddingBackendError(f"Ollama request failed: HTTP {code}") from exc
     except httpx.HTTPError as exc:
-        # httpx.HTTPError is the base of RequestError (connection, timeout) and
-        # HTTPStatusError, so every transport failure is caught here and the
-        # httpx dependency stops at this module's edge.
+        # httpx.HTTPError is the base of RequestError (connection, timeout), so
+        # every remaining transport failure is caught here and the httpx
+        # dependency stops at this module's edge.
         raise EmbeddingBackendError(f"Ollama request failed: {exc}") from exc
 
     try:
-        vector = response.json()["embedding"]
+        embeddings = response.json()["embeddings"]
     except (ValueError, KeyError, TypeError) as exc:
         # ValueError covers a non-JSON body (JSONDecodeError subclasses it);
         # KeyError and TypeError cover JSON that is not the shape we expect.
         raise EmbeddingBackendBadResponse(
-            f"Ollama response was not a usable embedding: {exc}"
+            f"Ollama response was not a usable embedding batch: {exc}"
         ) from exc
-    return vector
+    if not isinstance(embeddings, list):
+        raise EmbeddingBackendBadResponse(
+            f"Ollama response 'embeddings' was {type(embeddings).__name__}, "
+            "expected a list"
+        )
+    return embeddings
+
+
+def _fetch(text: str) -> object:
+    """Ask the configured backend for one embedding, without validating it.
+
+    Split out of get_embedding so probe_embedding_dimension() can measure what
+    the backend actually emits. Routing it through get_embedding instead would
+    mean the dimension check rejects the very vector being measured, which is
+    the one thing the probe must not do. The probe and
+    scripts/check_embedding_dimension.py still call this; tests that want the
+    validation chain patch _fetch_batch instead.
+    """
+    vectors = _fetch_batch([text], OLLAMA_TIMEOUT_SECONDS)
+    if not vectors:
+        # An empty batch for one input would otherwise surface as IndexError.
+        raise EmbeddingBackendBadResponse("backend returned no embedding for 1 input")
+    return vectors[0]
+
+
+def _embed(texts: list[str], timeout: float) -> list[list[float]]:
+    """Embed texts in order, in sub-batches, validating every vector."""
+    if not texts:
+        return []
+    # Sub-batches bound each request under the 30 s timeout on a CPU Ollama,
+    # and bound how long ingest holds its FOR UPDATE lock across these calls
+    # (see app/api/v1/ingest.py).
+    size = settings.embed_batch_size
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), size):
+        batch = texts[start : start + size]
+        result = _fetch_batch(batch, timeout)
+        if len(result) != len(batch):
+            # Counts only: the texts are note content and must not be logged.
+            raise EmbeddingBackendBadResponse(
+                f"backend returned {len(result)} embeddings for {len(batch)} inputs"
+            )
+        vectors.extend(_validated(vector) for vector in result)
+    return vectors
+
+
+def get_embeddings(texts: list[str]) -> list[list[float]]:
+    return _embed(texts, OLLAMA_TIMEOUT_SECONDS)
 
 
 def get_embedding(text: str) -> list[float]:
-    return _validated(_fetch(text))
+    return get_embeddings([text])[0]
+
+
+def get_query_embedding(query: str) -> list[float]:
+    # Qwen3-Embedding is instruction-tuned on the query side only. Passages stay
+    # unprefixed, so the prefix does not enter pipeline_version() and changing
+    # QUERY_INSTRUCTION never invalidates stored embeddings.
+    if settings.query_instruction:
+        query = f"Instruct: {settings.query_instruction}\nQuery:{query}"
+    return _embed([query], settings.query_embed_timeout_s)[0]
 
 
 # Short and fixed. The probe's only job is to make the backend emit one vector,

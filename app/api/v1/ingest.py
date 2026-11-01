@@ -1,46 +1,60 @@
+import re
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Form, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from langfuse import observe
 from sqlalchemy.orm import Session
 
-from app.config import settings
-from app.core.chunking import chunk_text
 from app.core.db import get_db
-from app.core.embeddings import get_embedding
+from app.core.embeddings import get_embeddings
+from app.core.pipeline import content_hash, embedding_input, fts_lead_a, fts_lead_c, pipeline_version
 from app.core.security import get_current_client
+from app.core.splitter import split_note
 from app.models import ApiKey
-from app.models.learning import Learning
-from app.repositories.learning import LearningRepository
-from app.schemas.ingest import IngestResponse
+from app.repositories.note import NoteRepository, PassageRow
+from app.schemas.ingest import IngestRequest, IngestResponse
 
 router = APIRouter()
 
-MAX_CONTENT_CHARS = 500_000   # ~500 KB per file
-MIN_CONTENT_CHARS = 50
+# Input and output capture are OFF, unlike the removed learnings API. Note
+# bodies are the user's own
+# memory notes and may contain personal data (the corpus has a people/ bucket),
+# and Langfuse may be cloud-hosted -- @observe reads its configuration from the
+# process environment, so a deployment that sets LANGFUSE_* ships whatever is
+# captured off-site. Spans, timings and errors are still traced; only the
+# payloads are withheld. Do not turn these back on without a privacy review.
 
-# Starlette's form parser enforces this per-field BYTE limit
-# (starlette/formparsers.py: FormParser/MultiPartParser default
-# max_part_size = 1024 * 1024) before this module's Form(...) fields are ever
-# bound to a request, let alone before _validate_content_size below runs.
-# FastAPI's routing (fastapi/routing.py: `body = await request.form()`) calls
-# Request.form() with no arguments, so there is no application- or
-# route-level hook to raise it for a Form(...)-declared route without
-# bypassing Form(...) entirely and hand-parsing the body -- which would
-# change this endpoint's documented request schema. So for multi-byte
-# content this byte limit, not MAX_CONTENT_CHARS, is the one that actually
-# fires, and it does so via Starlette's own generic message rather than
-# ours. See docs/superpowers/specs/2026-09-29-stabilization-design.md item 2
-# review and .superpowers/sdd/task-robustness-report.md for the investigation.
-FORM_PART_BYTE_LIMIT = 1024 * 1024
+MAX_CONTENT_CHARS = 500_000
+
+# Unlike the removed learnings API, this route takes a JSON body (not
+# Form(...) fields), so there is
+# no Starlette per-form-field byte limit firing ahead of this check.
+# app.core.body_limit.BodySizeLimitMiddleware bounds the raw request bytes
+# before the body is ever buffered or parsed, including for unauthenticated
+# clients; MAX_CONTENT_CHARS below is a separate, later check that bounds the
+# decoded character count once the JSON body has been parsed.
+
+_URI_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://")
 
 
-def _validate_file_path(file_path: str) -> None:
-    """Reject absolute paths and traversal — file_path is stored/reflected."""
-    if file_path.startswith("/") or ".." in Path(file_path).parts:
+def _validate_path_or_uri(path_or_uri: str) -> None:
+    """Accept any URI as-is; reject an absolute path or one with '..'.
+
+    A value matching ``scheme://`` is treated as a URI and is not subject to
+    the path rule at all. Anything else is a path, stored and reflected back
+    the same way the removed learnings API's file_path was, so it gets the
+    same rule: no leading '/'
+    and no '..' path component.
+    """
+    if _URI_RE.match(path_or_uri):
+        return
+    if path_or_uri.startswith("/") or ".." in Path(path_or_uri).parts:
         raise HTTPException(
             status_code=400,
-            detail="file_path must be a relative path without '..'",
+            detail=(
+                "path_or_uri must be a relative path without '..', or an "
+                "absolute URI"
+            ),
         )
 
 
@@ -51,66 +65,113 @@ def _validate_content_size(content: str) -> None:
             status_code=400,
             detail=(
                 f"content is too large: {len(content)} characters exceeds the "
-                f"{MAX_CONTENT_CHARS} limit. Note: a {FORM_PART_BYTE_LIMIT}-byte "
-                "per-field limit is also enforced ahead of this check, which "
-                "multi-byte (non-ASCII) content can reach at a much lower "
-                "character count."
+                f"{MAX_CONTENT_CHARS} limit."
             ),
         )
+
 
 @router.post(
     "/ingest",
     response_model=IngestResponse,
-    summary="Ingest Markdown File",
-    description="Chunks content, embeds via Ollama, and upserts into pgvector.",
+    summary="Ingest a note",
+    description=(
+        "Splits Markdown content into heading-aware passages, embeds them, "
+        "and upserts the note and its passages. Skips re-splitting and "
+        "re-embedding when the content and pipeline version are unchanged, "
+        "unless force=True."
+    ),
+    operation_id="ingestNote",
 )
-@observe(name="file-ingestion")
-def ingest_file(
-    repo_name: str = Form(..., description="Repository this file belongs to."),
-    file_path: str = Form(..., description="Relative path of the file."),
-    content: str = Form(..., description="Raw markdown content to vectorize."),
+@observe(name="note-ingestion", capture_input=False, capture_output=False)
+def ingest_note(
+    request: IngestRequest,
     db: Session = Depends(get_db),
-    client: ApiKey = Depends(get_current_client)
-):
-    _validate_file_path(file_path)
-    _validate_content_size(content)
-    repo = LearningRepository(db, client_name=client.client_name)
-    repo.delete_by_file(repo_name, file_path)
+    client: ApiKey = Depends(get_current_client),
+) -> IngestResponse:
+    # Both validations run before anything is written or deleted.
+    _validate_path_or_uri(request.path_or_uri)
+    _validate_content_size(request.content)
 
-    # Resolved once, here, and passed explicitly to chunk_text rather than
-    # letting it re-read settings itself -- that makes chunk_size/chunk_overlap
-    # below provably the window these chunks were cut with, not a guess about
-    # what the service happened to be configured with. Joining chunks under a
-    # window read from current settings instead is silently wrong the moment
-    # the service is reconfigured after ingest; see
-    # docs/superpowers/specs/2026-10-03-search-context-expansion-design.md, D3.
-    chunk_size = settings.chunk_size
-    chunk_overlap = settings.chunk_overlap
+    result = split_note(request.content)
+    digest = content_hash(request.content)
+    version = pipeline_version()
 
-    ingested = 0
-    for i, chunk in enumerate(chunk_text(content, chunk_size, chunk_overlap)):
-        if len(chunk.strip()) < MIN_CONTENT_CHARS:
-            continue
+    repo = NoteRepository(db, client_name=client.client_name)
 
-        repo.add(
-            Learning(
-                repo_name=repo_name,
-                file_path=file_path,
-                content=chunk,
-                meta={
-                    "file_name": Path(file_path).name,
-                    "relative_path": file_path,
-                    "chunk_index": i,
-                    # Recorded per row so read-back can reassemble with the
-                    # window these chunks were actually cut with, independent
-                    # of whatever the service is configured with later.
-                    "chunk_size": chunk_size,
-                    "chunk_overlap": chunk_overlap,
-                },
-                embedding=get_embedding(chunk),
-            )
+    # The FOR UPDATE lock lock_note takes is held across the batched get_embeddings call
+    # below and released only by the single commit at the end. That is
+    # deliberate, and it is the same ordering the removed learnings API had (it
+    # held an open transaction across its per-chunk Ollama calls). Two properties
+    # come from it: the skip check happens
+    # BEFORE any embedding is spent, which is the whole economy of a 574-note re-ingest; and
+    # two concurrent ingests of one note serialise instead of interleaving a
+    # delete with the other's insert.
+    #
+    # The cost is lock hold time of about ceil(passages / embed_batch_size)
+    # embedding round-trips -- one per sub-batch, not one per passage. It is acceptable
+    # because the lock is per NOTE identity and the only contender is another
+    # ingest of that same note, which has nothing useful to do concurrently
+    # anyway; reads never take this lock.
+    #
+    # If it ever does bite (concurrent ingesters of the same note timing out):
+    # read the note's hash WITHOUT a lock, embed outside any transaction, then
+    # open a transaction, re-take the lock, re-check the hash, and write. That
+    # trades this simple invariant for a recheck and the possibility of wasted
+    # embedding work. Do not reach for it before the contention is measured.
+    locked = repo.lock_note(request.scope, request.path_or_uri)
+    if (
+        not request.force
+        and locked is not None
+        and locked.content_hash == digest
+        and locked.pipeline_version == version
+    ):
+        db.commit()  # releases the lock; nothing else to write
+        return IngestResponse(
+            note_id=locked.id,
+            passages=repo.count_passages(locked.id),
+            skipped=True,
         )
-        ingested += 1
 
-    db.commit()  # single transaction boundary for the whole file
-    return IngestResponse(status="success", file_path=file_path, chunks_ingested=ingested)
+    note_id = repo.upsert_note(
+        request.scope,
+        request.path_or_uri,
+        name=result.name,
+        description=result.description,
+        type_=result.type,
+        provenance_kind=result.provenance_kind,
+        provenance_date=result.provenance_date,
+        status=request.status,
+        content_hash=digest,
+        pipeline_version=version,
+        body=result.body,
+        meta=request.meta,
+    )
+
+    # One call for the whole note; vectors come back in input order, so they are
+    # zipped onto the passages by position. strict=True turns a count mismatch
+    # into an error instead of silently dropping passages.
+    vectors = get_embeddings(
+        [
+            embedding_input(result.name, passage.heading_path, passage.content)
+            for passage in result.passages
+        ]
+    )
+    rows = [
+        PassageRow(
+            ordinal=passage.ordinal,
+            heading_path=passage.heading_path,
+            content=passage.content,
+            embedding=vector,
+            fts_a=fts_lead_a(result.name, passage.heading_path),
+            fts_c=fts_lead_c(result.description),
+        )
+        for passage, vector in zip(result.passages, vectors, strict=True)
+    ]
+
+    # Embedding failures (EmbeddingBackendError) propagate uncaught and are
+    # mapped to 503 + Retry-After by app/core/errors.py. No commit has
+    # happened yet, so a failure here leaves the previous passages intact.
+    count = repo.replace_passages(note_id, request.scope, rows)
+
+    db.commit()  # single transaction boundary for the whole note
+    return IngestResponse(note_id=note_id, passages=count, skipped=False)

@@ -1,8 +1,10 @@
 """The model and the migrations must not drift apart.
 
 Real migrations only reveal drift that breaks an exercised statement. A missing
-index breaks nothing, which is exactly how learnings.file_path went unindexed
-while every test passed. This closes that gap.
+index breaks nothing: were ix_passages_client_note declared on the Passage
+model but never created by a migration, every tenant-filtered query would still
+return the right rows -- by a sequential scan -- and every test would pass.
+This closes that gap.
 """
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext

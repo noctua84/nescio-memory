@@ -33,8 +33,8 @@ os.environ.setdefault(
     "postgresql+psycopg://placeholder:placeholder@localhost:1/placeholder",
 )
 
-# app/api/v1/ingest.py and app/api/v1/search.py are wrapped in Langfuse's
-# @observe(...) decorator, which reads its configuration directly from the
+# The route handlers in app/api/v1/ (ingest.py, search.py, notes.py) are
+# wrapped in Langfuse's @observe(...) decorator, which reads its configuration directly from the
 # process environment (nothing in app/ or tests/ feeds it settings.langfuse_*
 # explicitly). Confirmed from the installed langfuse==4.15.4 source
 # (langfuse/_client/environment_variables.py and
@@ -63,9 +63,10 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.api.v1 import ingest as ingest_module  # noqa: E402
 from app.api.v1 import search as search_module  # noqa: E402
+from app.config import settings  # noqa: E402
 from app.core.db import get_db  # noqa: E402
 from app.main import app  # noqa: E402
-from tests.fakes import fake_embedding  # noqa: E402
+from tests.fakes import fake_embedding, fake_embeddings  # noqa: E402
 
 # testcontainers.postgres is a deprecation shim as of 4.15.0; the import above
 # is the live path.
@@ -128,7 +129,9 @@ def connection(engine):
     # problem. With ef_search back at its default -- the right call for production --
     # the full suite went red in 4 of 6 runs, test_top_k_limits_the_number_of_results
     # returning 0 or 1 rows of 2. Measured: ef=40 without this line, 4 of 6 red;
-    # ef=40 with it, 6 of 6 green.
+    # ef=40 with it, 6 of 6 green. That measurement was taken against the v1
+    # learnings search, since removed; the passages search's vector arm is ordered
+    # by the same HNSW index type, so the same reasoning applies to it.
     #
     # The mechanism: HNSW is approximate and post-filtered, so earlier tests'
     # rolled-back inserts leave index entries that crowd out the candidate window and
@@ -159,7 +162,8 @@ def db_session(connection):
     read its presence as evidence that a regression in it would be caught.
 
     What the suite does guard is the genuinely wrong setting: with
-    join_transaction_mode="control_fully", 17 tests fail, including
+    join_transaction_mode="control_fully", tests fail (17 when measured,
+    before the v1 suites were removed), including
     test_an_application_level_commit_does_not_escape_the_transaction, because
     the application's own commit() then ends the outer transaction.
 
@@ -176,14 +180,23 @@ def db_session(connection):
 def client(db_session, monkeypatch):
     """A TestClient wired to the test transaction, with embeddings faked.
 
-    The patch targets matter. ingest.py and search.py each did
-    `from app.core.embeddings import get_embedding`, which binds the name into
-    their own module namespace -- patching app.core.embeddings.get_embedding
-    would have no effect on what the endpoints actually call, and the tests
-    would quietly make real HTTP requests and hang.
+    The patch targets matter. app/api/v1/ingest.py does
+    `from app.core.embeddings import get_embeddings` (one batched call per
+    note) and app/api/v1/search.py does
+    `from app.core.embeddings import get_query_embedding` (called whenever
+    settings.vector_weight > 0). A from-import binds the name into the route
+    module's own namespace, so patching app.core.embeddings would have no
+    effect on what the endpoints actually call: each route module needs its
+    own patch, on the name it imported.
+
+    The rule is mechanical: every embedding name a route module imports needs
+    a patch here, or tests make real HTTP calls to Ollama -- which hang on
+    ingest, or, on search, degrade to full-text results (degraded: true) and
+    pass for the wrong reason. Adding a route that embeds means adding a line
+    below.
     """
-    monkeypatch.setattr(ingest_module, "get_embedding", fake_embedding)
-    monkeypatch.setattr(search_module, "get_embedding", fake_embedding)
+    monkeypatch.setattr(ingest_module, "get_embeddings", fake_embeddings)
+    monkeypatch.setattr(search_module, "get_query_embedding", fake_embedding)
 
     # get_current_client resolves through Depends(get_db) too, so overriding
     # get_db means a factory-created ApiKey row is immediately visible to
@@ -194,3 +207,25 @@ def client(db_session, monkeypatch):
     # into the next one, which then fails somewhere that points at the wrong
     # test.
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def fts_only(monkeypatch):
+    """Switch search to the full-text arm alone, for tests asserting pure FTS
+    semantics.
+
+    This is VECTOR_WEIGHT=0 -- the same switch the FTS-only baseline
+    measurement uses (scripts/eval_queries.py) -- not a test-only code path.
+    With it, app/api/v1/search.py never calls the embedder and
+    PassageSearchRepository builds no vector arm.
+
+    The patch target is the one `settings` object in app.config. Both the
+    route and app/repositories/passage_search.py do `from app.config import
+    settings` and read `settings.vector_weight` at call time, so they see this
+    instance; patching the attribute (not rebinding the name) is what reaches
+    both. Settings does not set validate_assignment, so the cross-field check
+    that FTS_WEIGHT and VECTOR_WEIGHT are not both 0 does not run here --
+    fts_weight stays at whatever it was, and a test that also zeroes it is on
+    its own.
+    """
+    monkeypatch.setattr(settings, "vector_weight", 0.0)

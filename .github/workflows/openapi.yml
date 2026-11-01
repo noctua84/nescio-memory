@@ -51,7 +51,7 @@ jobs:
       - name: Generate OpenAPI spec from code
         env:
           DATABASE_URL: postgresql+psycopg://dummy:dummy@localhost:5432/dummy
-          OLLAMA_URL: http://localhost:11434/api/embeddings
+          OLLAMA_URL: http://localhost:11434/api/embed
         run: uv run --locked --no-build python export_openapi.py
 
       # 1. Structural validation — is this a valid OpenAPI document?

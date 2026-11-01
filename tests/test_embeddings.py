@@ -54,7 +54,7 @@ def _response(payload, status_code=200):
     return httpx.Response(
         status_code=status_code,
         json=payload,
-        request=httpx.Request("POST", "http://ollama.invalid/api/embeddings"),
+        request=httpx.Request("POST", "http://ollama.invalid/api/embed"),
     )
 
 
@@ -80,7 +80,7 @@ def _raw_response(body: bytes, status_code=200):
         status_code=status_code,
         content=body,
         headers={"content-type": "application/json"},
-        request=httpx.Request("POST", "http://ollama.invalid/api/embeddings"),
+        request=httpx.Request("POST", "http://ollama.invalid/api/embed"),
     )
 
 
@@ -94,7 +94,7 @@ def _embedding_body_of_width(literal: str, width: int, index: int = 0) -> bytes:
     """
     components = ["0.01"] * width
     components[index] = literal
-    return b'{"embedding": [' + ", ".join(components).encode("ascii") + b"]}"
+    return b'{"embeddings": [[' + ", ".join(components).encode("ascii") + b"]]}"
 
 
 def _embedding_body(literal: str, index: int = 0) -> bytes:
@@ -117,7 +117,7 @@ NON_FINITE_POSITIONS = [0, settings.embedding_dimension - 1]
 
 # The wording _validated() uses for a component it can evaluate as a float and
 # still will not accept -- non-finite, or finite but outside float32's range.
-# Matched on rather than left implicit because _fetch() translates a JSON
+# Matched on rather than left implicit because _fetch_batch() translates a JSON
 # *decode* failure into the very same exception class, so a body that never
 # parsed at all would satisfy a bare pytest.raises(EmbeddingBackendBadResponse)
 # with the component loop never entered. Pinning the message is what makes the
@@ -168,7 +168,9 @@ def test_non_2xx_raises_embedding_backend_error(monkeypatch):
 
 
 def test_missing_embedding_key_raises_bad_response(monkeypatch):
-    _install(monkeypatch, lambda: _response({"not_what_we_expected": []}))
+    # The legacy /api/embeddings shape: a well-formed vector, but no batch key.
+    legacy = {"embedding": [0.01] * settings.embedding_dimension}
+    _install(monkeypatch, lambda: _response(legacy))
     with pytest.raises(EmbeddingBackendBadResponse):
         get_embedding("anything")
 
@@ -178,7 +180,7 @@ def test_non_json_body_raises_bad_response(monkeypatch):
         return httpx.Response(
             status_code=200,
             text="<html>proxy error</html>",
-            request=httpx.Request("POST", "http://ollama.invalid/api/embeddings"),
+            request=httpx.Request("POST", "http://ollama.invalid/api/embed"),
         )
 
     _install(monkeypatch, html_page)
@@ -194,7 +196,7 @@ def test_bad_response_is_a_subclass_so_one_handler_covers_both(monkeypatch):
 
 def test_a_successful_call_still_returns_the_vector(monkeypatch):
     vector = [0.01] * settings.embedding_dimension
-    _install(monkeypatch, lambda: _response({"embedding": vector}))
+    _install(monkeypatch, lambda: _response({"embeddings": [vector]}))
     assert get_embedding("anything") == vector
 
 
@@ -255,14 +257,14 @@ def test_an_unusable_embedding_value_is_rejected(monkeypatch, bad_value, why):
     # a literal on purpose: at any other length they fail on the dimension
     # check before the component-type check is ever reached, and the case stops
     # testing what it is named for.
-    _install(monkeypatch, lambda: _response({"embedding": bad_value}))
+    _install(monkeypatch, lambda: _response({"embeddings": [bad_value]}))
     with pytest.raises(EmbeddingBackendBadResponse):
         get_embedding(f"a response carrying {why}")
 
 
 def test_a_correctly_shaped_embedding_still_passes(monkeypatch):
     vector = [0.01] * settings.embedding_dimension
-    _install(monkeypatch, lambda: _response({"embedding": vector}))
+    _install(monkeypatch, lambda: _response({"embeddings": [vector]}))
     assert get_embedding("anything") == vector
 
 
@@ -279,7 +281,7 @@ def test_a_non_finite_embedding_component_is_rejected(monkeypatch, literal, inde
     # 5xx alerting stayed green. 503 is the honest answer: the backend returned
     # something unusable and it is not the caller's fault.
     #
-    # The `match=` is what keeps this honest. _fetch() raises the same
+    # The `match=` is what keeps this honest. _fetch_batch() raises the same
     # EmbeddingBackendBadResponse for a body that failed to parse, so a typo in
     # _embedding_body() -- or a stdlib json that stopped accepting the bare
     # literals -- would turn a bare pytest.raises green while the finiteness
@@ -295,7 +297,7 @@ def test_a_non_finite_embedding_component_is_rejected(monkeypatch, literal, inde
 def test_the_raw_payload_really_decodes_to_a_non_finite_float(literal, index):
     """The premise the test above rests on, pinned so it cannot pass vacuously.
 
-    _fetch() translates a JSON decode failure into the same
+    _fetch_batch() translates a JSON decode failure into the same
     EmbeddingBackendBadResponse that _validated() raises for a non-finite
     component. So if stdlib json ever stopped accepting the bare literals -- or
     if _embedding_body() produced something malformed -- the rejection test
@@ -304,7 +306,7 @@ def test_the_raw_payload_really_decodes_to_a_non_finite_float(literal, index):
     it decodes to the right width, and that the component in question really is
     a non-finite float by the time _validated() sees it.
     """
-    vector = _raw_response(_embedding_body(literal, index)).json()["embedding"]
+    vector = _raw_response(_embedding_body(literal, index)).json()["embeddings"][0]
     assert len(vector) == settings.embedding_dimension
     assert isinstance(vector[index], float)
     assert not math.isfinite(vector[index])
@@ -332,7 +334,7 @@ def test_a_full_length_vector_of_ints_still_passes(monkeypatch):
     # rejection is covered separately below, and would otherwise make this
     # int-handling test fail for an unrelated reason.
     vector = [1] * settings.embedding_dimension
-    _install(monkeypatch, lambda: _response({"embedding": vector}))
+    _install(monkeypatch, lambda: _response({"embeddings": [vector]}))
     assert get_embedding("anything") == vector
 
 
@@ -372,7 +374,8 @@ def test_a_float32_overflowing_component_is_rejected(monkeypatch, value, index):
     # Driven through `_response()`/`json=` deliberately: these values survive
     # httpx's encoder, so this exercises the ordinary decode path rather than
     # the raw-bytes workaround the non-finite cases are forced into.
-    _install(monkeypatch, lambda: _response({"embedding": _vector_with(value, index)}))
+    vector = _vector_with(value, index)
+    _install(monkeypatch, lambda: _response({"embeddings": [vector]}))
     with pytest.raises(EmbeddingBackendBadResponse, match=UNUSABLE_COMPONENT_MESSAGE):
         get_embedding(f"a response carrying {value} at index {index}")
 
@@ -393,7 +396,7 @@ def test_the_largest_float32_is_accepted_rather_than_rejected(monkeypatch, index
     reason that looks like a bug in the implementation.
     """
     expected = _vector_with(FLOAT32_MAX, index)
-    _install(monkeypatch, lambda: _response({"embedding": expected}))
+    _install(monkeypatch, lambda: _response({"embeddings": [expected]}))
     assert get_embedding("anything") == expected
 
 
@@ -403,7 +406,8 @@ def test_a_value_just_past_the_largest_float32_is_rejected(monkeypatch, index):
     # magnitude available -- close enough to the bound that a guard which went
     # looking for something dramatic like 1e39 would miss it, and far enough
     # over that no float32 rounding argument applies.
-    _install(monkeypatch, lambda: _response({"embedding": _vector_with(3.5e38, index)}))
+    vector = _vector_with(3.5e38, index)
+    _install(monkeypatch, lambda: _response({"embeddings": [vector]}))
     with pytest.raises(EmbeddingBackendBadResponse, match=UNUSABLE_COMPONENT_MESSAGE):
         get_embedding(f"a response carrying 3.5e38 at index {index}")
 
@@ -422,14 +426,13 @@ def test_a_huge_integer_component_is_rejected_as_a_backend_fault(
 ):
     # This case exists because of *how* it used to fail, not merely that it did.
     # math.isfinite() on an int too large to convert raises OverflowError, which
-    # is an ArithmeticError -- outside _fetch()'s
-    # `except (ValueError, KeyError, TypeError)` and outside every clause in
-    # between. So it escaped the module entirely as a bare OverflowError and
-    # surfaced as an opaque 500, breaking this module's contract that every
-    # backend fault leaves as an EmbeddingBackendError. The assertion below is
-    # therefore as much about the exception's *type* as about its being raised:
-    # with the guard reverted this test fails by erroring out of get_embedding
-    # rather than by a wrong status.
+    # is an ArithmeticError -- outside _fetch_batch()'s `except (ValueError,
+    # KeyError, TypeError)` and every clause in between. So it escaped the
+    # module as a bare OverflowError and surfaced as an opaque 500, breaking the
+    # contract that every backend fault leaves as an EmbeddingBackendError. The
+    # assertion below is therefore as much about the exception's *type* as about
+    # its being raised: with the guard reverted this test errors out of
+    # get_embedding rather than failing on a wrong status.
     #
     # Delivered as raw bytes because that is the production shape: stdlib json
     # has to be the thing that produces the Python int. Handing _response() a
@@ -451,7 +454,7 @@ def test_a_huge_integer_component_is_rejected_as_a_backend_fault(
 def test_the_raw_payload_really_decodes_to_an_unconvertible_int(literal, index):
     """The premise the test above rests on, pinned so it cannot pass vacuously.
 
-    Same hazard as the non-finite premise test: _fetch() translates a decode
+    Same hazard as the non-finite premise test: _fetch_batch() translates a decode
     failure into the same exception class _validated() raises here, so a
     malformed body would make the rejection test green with the component loop
     never entered. This asserts the body parses, that it parses to the right
@@ -459,7 +462,7 @@ def test_the_raw_payload_really_decodes_to_an_unconvertible_int(literal, index):
     not a string), and that math.isfinite() on it really raises OverflowError --
     which is the whole reason the try/except in _validated() exists.
     """
-    vector = _raw_response(_embedding_body(literal, index)).json()["embedding"]
+    vector = _raw_response(_embedding_body(literal, index)).json()["embeddings"][0]
     assert len(vector) == settings.embedding_dimension
     assert type(vector[index]) is int
     with pytest.raises(OverflowError):
@@ -541,7 +544,8 @@ def test_the_probe_reports_the_width_despite_an_out_of_range_component(
     # through the ordinary `_response()`/`json=` path for the reason the
     # rejection tests give: these need no non-standard JSON at all, which makes
     # them the likelier shape to arrive from a real backend.
-    _install(monkeypatch, lambda: _response({"embedding": _vector_with(value, index)}))
+    vector = _vector_with(value, index)
+    _install(monkeypatch, lambda: _response({"embeddings": [vector]}))
 
     probe = probe_embedding()
     assert probe.dimensions == settings.embedding_dimension
@@ -589,7 +593,7 @@ def test_the_probe_collects_every_fault_rather_than_stopping_at_the_first(
     # bug, the second a backend that is not an embedding model at all -- and
     # only the count distinguishes them.
     width = settings.embedding_dimension
-    body = b'{"embedding": [' + b", ".join([b"NaN"] * width) + b"]}"
+    body = b'{"embeddings": [[' + b", ".join([b"NaN"] * width) + b"]]}"
     _install(monkeypatch, lambda: _raw_response(body))
 
     probe = probe_embedding()
@@ -630,7 +634,7 @@ def test_the_probe_reports_no_faults_for_a_vector_the_service_would_accept(
     # comparison, say -- would leave them all green while the script reported
     # UNUSABLE VALUES for a healthy backend and exited 3 forever.
     vector = [0.01] * settings.embedding_dimension
-    _install(monkeypatch, lambda: _response({"embedding": vector}))
+    _install(monkeypatch, lambda: _response({"embeddings": [vector]}))
 
     probe = probe_embedding()
     assert probe.dimensions == settings.embedding_dimension
@@ -649,8 +653,8 @@ def test_the_probe_still_raises_when_there_is_no_vector_to_measure(
     # where raising is still right: with no list there is no width to measure
     # and no components to inspect, so there is nothing to hand back. The
     # message is matched on so this cannot pass by way of some other failure --
-    # _fetch() raises the same class for a body that never parsed.
-    _install(monkeypatch, lambda: _response({"embedding": not_a_list}))
+    # _fetch_batch() raises the same class for a body that never parsed.
+    _install(monkeypatch, lambda: _response({"embeddings": [not_a_list]}))
 
     with pytest.raises(
         EmbeddingBackendBadResponse,
@@ -796,7 +800,7 @@ def test_the_agreement_cases_cover_both_verdicts():
 # perfectly storable and whose NORM is still zero once float32 has had its
 # say. Two separate substrings because the sentence has two jobs: naming the
 # fault, and telling the caller a retry is pointless. Matched on rather than
-# left implicit for the reason UNUSABLE_COMPONENT_MESSAGE is: _fetch() and the
+# left implicit for the reason UNUSABLE_COMPONENT_MESSAGE is: _fetch_batch() and the
 # component loop both raise this same exception class, so a bare
 # pytest.raises(EmbeddingBackendBadResponse) would be satisfied by a rejection
 # that never reached the norm check at all.
@@ -914,10 +918,10 @@ def test_a_zero_norm_embedding_is_rejected_through_the_whole_fetch_chain(
     monkeypatch, vector
 ):
     # The same rule reached the way production reaches it: a backend response
-    # decoded by _fetch() and handed to _validated() by get_embedding(). The
+    # decoded by _fetch_batch() and validated by get_embedding(). The
     # test above calls _validated() directly, which would stay green if the
     # norm check were moved somewhere get_embedding() does not run.
-    _install(monkeypatch, lambda: _response({"embedding": vector}))
+    _install(monkeypatch, lambda: _response({"embeddings": [vector]}))
     with pytest.raises(EmbeddingBackendBadResponse, match=ZERO_NORM_MESSAGE):
         get_embedding("anything")
 
@@ -925,7 +929,7 @@ def test_a_zero_norm_embedding_is_rejected_through_the_whole_fetch_chain(
 @pytest.mark.parametrize("vector", ZERO_NORM_VECTORS)
 def test_the_zero_norm_rejection_is_a_backend_fault_not_a_request_error(vector):
     # The alerting contract, pinned at the exception level rather than at the
-    # route (tests/test_error_responses.py covers that end). The class decides
+    # route (tests/test_error_responses_embedding.py covers that end). The class decides
     # the status: EmbeddingBackendBadResponse is a 503 with Retry-After, which
     # is the honest answer -- the backend returned something architecturally
     # unusable and the caller's input was not at fault. Exact type as well as
@@ -968,7 +972,7 @@ def test_the_zero_norm_message_carries_no_caller_content(monkeypatch):
     secret = "a9f3c1-caller-supplied-text-that-must-not-be-echoed"
     _install(
         monkeypatch,
-        lambda: _response({"embedding": [0.0] * settings.embedding_dimension}),
+        lambda: _response({"embeddings": [[0.0] * settings.embedding_dimension]}),
     )
 
     with pytest.raises(EmbeddingBackendBadResponse) as excinfo:
@@ -991,7 +995,7 @@ def test_a_small_but_nonzero_embedding_is_still_accepted(vector):
 def test_a_small_but_nonzero_embedding_survives_the_whole_fetch_chain(
     monkeypatch, vector
 ):
-    _install(monkeypatch, lambda: _response({"embedding": vector}))
+    _install(monkeypatch, lambda: _response({"embeddings": [vector]}))
     assert get_embedding("anything") == vector
 
 
