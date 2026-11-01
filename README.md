@@ -373,7 +373,7 @@ passages).
 - **Removed settings:** `CHUNK_SIZE`, `CHUNK_OVERLAP`, `MAX_CONTEXT_CHARS` and
   `MAX_CONTEXT_DOCUMENTS`. Unknown keys are ignored, so an old `.env` still boots.
 - **`OLLAMA_URL` must end in `/api/embed`.** Ingest embeds in batches through that endpoint; the
-  legacy `/api/embeddings` is rejected at startup. Change the path and keep the same host.
+  legacy `/api/embeddings` and a bare host with no path are rejected at startup. Change the path and keep the same host.
 - **New settings** for hybrid search and batching are listed under
   [Configuration](#configuration).
 
@@ -389,7 +389,7 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `STATEMENT_TIMEOUT_MS` | `5000`                                     | caps each statement, not the whole request; must be `1..60000`; a hybrid search is one statement under this cap; **breaking in 0.5.0**: values above 60000 now refuse to start |
 | `EMBEDDING_BACKEND`   | `ollama`                                    | `ollama` (HTTP) or `local` (in-process); any other value fails at startup |
 | `LOCAL_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2`  | model for the `local` backend only — see [Embedding backends](#embedding-backends) |
-| `OLLAMA_URL`          | `http://localhost:11434/api/embed`          | Ollama batch embedding endpoint (local or remote); must end in `/api/embed`, with no trailing slash — the legacy `/api/embeddings` and a trailing slash (`/api/embed/`) fail at startup |
+| `OLLAMA_URL`          | `http://localhost:11434/api/embed`          | Ollama batch embedding endpoint (local or remote); must end in `/api/embed`, with no trailing slash (a reverse-proxy prefix such as `/ollama/api/embed` is fine) — a bare host (`http://host:11434`), any other path, the legacy `/api/embeddings` and a trailing slash (`/api/embed/`) fail at startup |
 | `OLLAMA_MODEL`        | `qwen3-embedding:0.6b`                      | embedding model name                                 |
 | `EMBEDDING_DIMENSION` | `1024`                                      | must match the model **and** the `vector(N)` column — the default is the width `qwen3-embedding:0.6b` actually emits; verify with [`scripts/check_embedding_dimension.py`](scripts/check_embedding_dimension.py) |
 | `LANGFUSE_PUBLIC_KEY` | *(empty → tracing off)*                     | Langfuse credentials                                 |
