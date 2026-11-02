@@ -46,11 +46,12 @@ def export():
     spec = _normalize_numeric_constraints(app.openapi())
 
     # Export as JSON
-    with open('openapi.json', 'w') as f:
-        json.dump(spec, f, indent=2)
+    # ensure_ascii=False: release-please rewrites this file with literal non-ASCII, so escaping here would fail the drift check on release PRs.
+    with open('openapi.json', 'w', encoding='utf-8') as f:
+        json.dump(spec, f, indent=2, ensure_ascii=False)
 
     # Export as YAML
-    with open('openapi.yaml', 'w') as f:
+    with open('openapi.yaml', 'w', encoding='utf-8') as f:
         yaml.dump(spec, f, Dumper=_IndentedDumper, sort_keys=False)
 
 
