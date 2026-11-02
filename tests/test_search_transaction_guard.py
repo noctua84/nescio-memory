@@ -81,8 +81,9 @@ def test_the_guard_names_the_one_setting_that_did_not_take_effect(
     preset = [name for name in _SESSION_SETS if name != missing]
 
     with _autocommit_session(engine, preset) as session:
+        repository = PassageSearchRepository(session, "acme")
         with pytest.raises(RuntimeError) as exc_info:
-            PassageSearchRepository(session, "acme").search("pelicanium", None, 5)
+            repository.search("pelicanium", None, 5)
 
     message = str(exc_info.value)
     assert re.match(rf"{re.escape(missing)} setting did not take effect", message)

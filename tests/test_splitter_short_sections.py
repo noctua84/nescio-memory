@@ -22,8 +22,7 @@ import re
 
 import pytest
 
-from app.core.splitter import (
-    MAX_CHARS, MIN_SECTION_CHARS, TARGET_CHARS, split_note)
+from app.core.splitter import MAX_CHARS, MIN_SECTION_CHARS, TARGET_CHARS, split_note
 
 # The shape that motivated the fix: a promotion ledger / daily log.
 LOG_ENTRIES = 400

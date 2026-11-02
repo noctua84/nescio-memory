@@ -6,6 +6,9 @@ response invalidates the whole run: exit 2, a count-only message on stderr
 (never the query text), no ``hits@``/``GATE`` verdict on stdout, and with
 ``--json`` a payload marked ``"valid": false`` / ``"passed": null``.
 
+With ``--json`` stdout is exactly one JSON object line: the human-readable
+progress text goes to stderr instead.
+
 No network and no database: every request goes through an
 ``httpx.MockTransport`` and the queries file is synthetic, written to tmp_path.
 """
@@ -149,11 +152,13 @@ def test_one_degraded_json_is_invalid_with_null_verdict(monkeypatch, queries_fil
     assert payload["total"] == 3
     assert "GATE" not in cap.out
     assert "hits@" not in cap.out
-    assert cap.err.strip() == (
+    # Progress goes to stderr under --json; the error line is its last line.
+    error_line = cap.err.strip().splitlines()[-1]
+    assert error_line == (
         "error: 1 of 3 responses were degraded (FTS-only fallback); "
         "the measurement is not valid"
     )
-    _assert_no_query_text(cap.err)
+    _assert_no_query_text(error_line)
 
 
 def test_all_degraded_counts_every_response(monkeypatch, queries_file, capsys):
@@ -165,7 +170,7 @@ def test_all_degraded_counts_every_response(monkeypatch, queries_file, capsys):
     assert payload["degraded"] == 3
     assert payload["valid"] is False
     assert payload["passed"] is None
-    assert cap.err.strip() == (
+    assert cap.err.strip().splitlines()[-1] == (
         "error: 3 of 3 responses were degraded (FTS-only fallback); "
         "the measurement is not valid"
     )
@@ -199,10 +204,9 @@ def test_non_degraded_values_are_not_counted(monkeypatch, queries_file, capsys, 
     cap = capsys.readouterr()
 
     assert code == eval_queries.EXIT_PASS == 0
-    assert cap.err == ""
-    assert "hits@5: 3/3" in cap.out
-    assert "GATE PASS" in cap.out
-    payload = _json_payload(cap.out)
+    assert "hits@5: 3/3" in cap.err
+    assert "GATE PASS" in cap.err
+    payload = json.loads(cap.out)
     assert payload["valid"] is True
     assert payload["degraded"] == 0
     assert payload["passed"] is True
@@ -224,10 +228,9 @@ def test_non_degraded_failing_run_keeps_fail_exit(monkeypatch, queries_file, cap
     cap = capsys.readouterr()
 
     assert code == eval_queries.EXIT_FAIL == 1
-    assert cap.err == ""
-    assert "hits@5: 0/3" in cap.out
-    assert "GATE FAIL" in cap.out
-    payload = _json_payload(cap.out)
+    assert "hits@5: 0/3" in cap.err
+    assert "GATE FAIL" in cap.err
+    payload = json.loads(cap.out)
     assert payload["valid"] is True
     assert payload["degraded"] == 0
     assert payload["passed"] is False
@@ -241,3 +244,74 @@ def test_non_degraded_failing_run_text_mode(monkeypatch, queries_file, capsys):
     assert code == 1
     assert "GATE FAIL" in cap.out
     assert "degraded" not in cap.err
+
+
+# --- --json keeps stdout machine-readable ------------------------------------
+
+
+def test_json_populated_stdout_is_pure_json_progress_on_stderr(monkeypatch, queries_file, capsys):
+    code, _ = _run(monkeypatch, queries_file, _flags(False, False, False), extra=["--json"])
+    cap = capsys.readouterr()
+
+    assert code == 0
+    payload = json.loads(cap.out)  # the whole of stdout, not just its last line
+    assert payload["populated"] is True
+    assert payload["hits"] == 3
+    assert len(cap.out.strip().splitlines()) == 1
+    assert "HIT @1  synthetic alpha lookup" in cap.err
+    assert "hits@5: 3/3" in cap.err
+    assert "GATE PASS" in cap.err
+
+
+def test_json_misses_report_on_stderr_and_stdout_stays_pure(monkeypatch, queries_file, capsys):
+    code, _ = _run(monkeypatch, queries_file, _flags(False, False, False), hit=False, extra=["--json"])
+    cap = capsys.readouterr()
+
+    assert code == 1
+    assert json.loads(cap.out)["passed"] is False
+    assert "MISS  synthetic alpha lookup" in cap.err
+    assert "expected:" in cap.err
+    assert "got:" in cap.err
+    for marker in ("MISS", "expected:", "got:", "hits@", "GATE"):
+        assert marker not in cap.out
+
+
+def test_json_not_yet_populated_stdout_is_pure_json(monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("NESCIO_ALLOWED_HOSTS", raising=False)
+    sparse = tmp_path / "sparse.yaml"
+    sparse.write_text(
+        YAML.replace("minimum_queries: 3", "minimum_queries: 4"), encoding="utf-8"
+    )
+
+    code = eval_queries.main(
+        ["--api-key", "test-key", "--queries", str(sparse), "--url", URL, "--json"]
+    )
+    cap = capsys.readouterr()
+
+    assert code == eval_queries.EXIT_NOT_POPULATED == 3
+    payload = json.loads(cap.out)
+    assert payload == {
+        "populated": False,
+        "top_k": 5,
+        "hits": 0,
+        "total": 3,
+        "minimum_queries": 4,
+    }
+    assert "not yet populated" in cap.err
+    assert "hits@5: 0/3 (gate void)" in cap.err
+
+
+def test_not_yet_populated_text_mode_stays_on_stdout(monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("NESCIO_ALLOWED_HOSTS", raising=False)
+    sparse = tmp_path / "sparse.yaml"
+    sparse.write_text(
+        YAML.replace("minimum_queries: 3", "minimum_queries: 4"), encoding="utf-8"
+    )
+
+    code = eval_queries.main(["--api-key", "test-key", "--queries", str(sparse), "--url", URL])
+    cap = capsys.readouterr()
+
+    assert code == 3
+    assert "not yet populated" in cap.out
+    assert "hits@5: 0/3 (gate void)" in cap.out
+    assert cap.err == ""

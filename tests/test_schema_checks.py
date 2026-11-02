@@ -202,9 +202,8 @@ def test_a_passages_width_mismatch_fails_startup(engine, monkeypatch):
     monkeypatch.setattr(main_module, "get_engine", lambda: engine)
     monkeypatch.setattr(settings, "embedding_dimension", wrong)
 
-    with pytest.raises(RuntimeError) as excinfo:
-        with TestClient(app):
-            pass
+    with pytest.raises(RuntimeError) as excinfo, TestClient(app):
+        pass
     message = str(excinfo.value)
     assert "passages.embedding" in message
     assert f"vector({actual})" in message

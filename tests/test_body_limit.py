@@ -14,18 +14,19 @@ The contract under test (see the module docstring in app/core/body_limit.py):
 
 Most tests here drive the middleware over a tiny recording app with a small
 ``max_bytes``, so nothing has to send 8 MiB. The constructor takes ``max_bytes``
-precisely so this is possible. Two tests at the bottom go through the real
-application to prove the middleware is actually wired into create_app() and
-sits ahead of authentication.
+precisely so this is possible. The byte limit's own derivation and the tests
+that go through the real application (proving the middleware is wired into
+create_app() and sits ahead of authentication) are in
+`test_body_limit_wiring.py`.
 """
+
 import asyncio
 import json
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.testclient import TestClient
 
-from app.core.body_limit import MAX_BODY_BYTES, BodySizeLimitMiddleware
-from tests.factories import make_api_key
+from app.core.body_limit import BodySizeLimitMiddleware
 
 LIMIT = 100
 
@@ -158,7 +159,7 @@ def _chunks(total_bytes: int, chunk_size: int = 32):
 
 
 def test_an_over_limit_content_length_is_rejected_with_413():
-    client, recorder = _build_app()
+    client, _recorder = _build_app()
 
     response = client.post("/api/v1/echo", content=b"x" * (LIMIT + 1))
 
@@ -183,9 +184,7 @@ def test_the_detail_reports_the_configured_limit_not_the_default():
 
     response = client.post("/api/v1/echo", content=b"x" * 65)
 
-    assert response.json() == {
-        "detail": "Request body too large: limit is 64 bytes."
-    }
+    assert response.json() == {"detail": "Request body too large: limit is 64 bytes."}
 
 
 def test_a_body_exactly_at_the_limit_passes_through_intact():
@@ -328,80 +327,3 @@ def test_the_prefix_match_is_on_the_whole_segment():
 
     assert status == 200
     assert recorder.handler_calls == 1
-
-
-# --- the limit's own derivation ----------------------------------------------
-
-
-def test_the_limit_admits_the_largest_body_the_content_cap_allows():
-    """Pins the derivation written in app/core/body_limit.py's comment.
-
-    MAX_CONTENT_CHARS is 500,000 characters, and the worst case per character
-    is an astral-plane codepoint, which json.dumps escapes as a surrogate pair
-    -- two \\uXXXX escapes, 12 bytes. The byte limit must not reject a body the
-    character check would have accepted.
-    """
-    from app.api.v1.ingest import MAX_CONTENT_CHARS
-
-    worst_case = json.dumps({"content": "\U0001F600" * MAX_CONTENT_CHARS})
-
-    assert len(worst_case.encode("utf-8")) <= MAX_BODY_BYTES
-
-
-# --- through the real application --------------------------------------------
-
-
-OVERSIZE = MAX_BODY_BYTES + 1
-
-
-def test_an_unauthenticated_oversized_ingest_gets_413_not_401(client):
-    """The middleware must beat auth, which it can only do by running first.
-
-    The Content-Length is forged over a tiny real body rather than really
-    sending 8 MiB: httpx lets an explicitly supplied header win over its own
-    computed one, and the middleware rejects on the declared value alone,
-    before reading the body at all. No X-API-Key is sent.
-    """
-    response = client.post(
-        "/api/v1/ingest",
-        content=b"{}",
-        headers={
-            "Content-Type": "application/json",
-            "Content-Length": str(OVERSIZE),
-        },
-    )
-
-    assert response.status_code == 413, (
-        f"expected 413 before auth, got {response.status_code}: "
-        f"{response.text}"
-    )
-    assert response.json() == {
-        "detail": f"Request body too large: limit is {MAX_BODY_BYTES} bytes."
-    }
-
-
-def test_a_normal_authenticated_ingest_still_succeeds(client, db_session):
-    """The middleware must be transparent to an ordinary request."""
-    key = make_api_key(db_session, "acme")
-
-    response = client.post(
-        "/api/v1/ingest",
-        json={
-            "scope": "repo_a",
-            "path_or_uri": "docs/note.md",
-            "content": "The marmoset throughput ledger for the quarter.",
-        },
-        headers={"X-API-Key": key},
-    )
-
-    assert response.status_code == 200, response.text
-    assert response.json()["passages"] >= 1
-    assert response.json()["skipped"] is False
-
-
-def test_health_is_not_intercepted(client):
-    """A non-/api/v1 route keeps working with the middleware installed."""
-    response = client.get("/health")
-
-    assert response.status_code == 200
-    assert response.json()["status"] == "ok"

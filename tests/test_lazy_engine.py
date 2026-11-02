@@ -67,6 +67,7 @@ def test_importing_app_main_does_not_create_an_engine():
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        check=False,
     )
 
     assert result.returncode == 0, (
@@ -185,9 +186,10 @@ def test_a_failed_statement_does_not_leak_bound_parameters(
     kwargs, so an error raised through them would say nothing about
     get_engine().
     """
-    import app.core.db as db_module
     from sqlalchemy import text
     from sqlalchemy.exc import DBAPIError
+
+    import app.core.db as db_module
     from app.config import settings
 
     monkeypatch.setattr(

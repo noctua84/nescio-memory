@@ -27,6 +27,11 @@ Any such response makes the whole measurement an error. With --json, a
 degraded run still prints the payload, marked "valid": false with
 "passed": null and the "degraded" count, before exiting 2.
 
+Output streams: without --json, progress and the verdict go to stdout. With
+--json, stdout carries exactly one JSON object line and nothing else; the
+human-readable progress text (HIT/MISS lines, hits@, GATE) goes to stderr, so
+`... --json | jq` and json.loads(stdout) work. Errors always go to stderr.
+
 Exit codes:
     0  gate passed
     1  gate failed
@@ -199,15 +204,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"could not read {args.queries}: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
+    # With --json, stdout is reserved for the single JSON object.
+    out = sys.stderr if args.json else sys.stdout
+
     top_k = args.top_k if args.top_k is not None else golden.gate.top_k
     total = len(golden.queries)
 
     if total < golden.gate.minimum_queries:
         print(
             f"not yet populated: {total} query(ies), need at least "
-            f"{golden.gate.minimum_queries} for the gate to be meaningful"
+            f"{golden.gate.minimum_queries} for the gate to be meaningful",
+            file=out,
         )
-        print(f"hits@{top_k}: 0/{total} (gate void)")
+        print(f"hits@{top_k}: 0/{total} (gate void)", file=out)
         if args.json:
             print(json_module.dumps(
                 {
@@ -242,12 +251,12 @@ def main(argv: list[str] | None = None) -> int:
                 rank = score(results, golden_query.expect_path_or_uri, top_k)
                 if rank is not None:
                     hits += 1
-                    print(f"HIT @{rank}  {golden_query.query}")
+                    print(f"HIT @{rank}  {golden_query.query}", file=out)
                 else:
                     misses = [r.get("path_or_uri") for r in results[:top_k]]
-                    print(f"MISS  {golden_query.query}")
-                    print(f"  expected: {golden_query.expect_path_or_uri}")
-                    print(f"  got:      {misses}")
+                    print(f"MISS  {golden_query.query}", file=out)
+                    print(f"  expected: {golden_query.expect_path_or_uri}", file=out)
+                    print(f"  got:      {misses}", file=out)
 
                 per_query.append({"query": golden_query.query, "rank": rank})
     except httpx.HTTPError as exc:
@@ -259,8 +268,8 @@ def main(argv: list[str] | None = None) -> int:
     valid = degraded == 0
     passed = valid and hits >= golden.gate.threshold
     if valid:
-        print(f"hits@{top_k}: {hits}/{total}")
-        print("GATE PASS" if passed else "GATE FAIL")
+        print(f"hits@{top_k}: {hits}/{total}", file=out)
+        print("GATE PASS" if passed else "GATE FAIL", file=out)
 
     if args.json:
         print(json_module.dumps(

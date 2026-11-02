@@ -40,13 +40,19 @@ drifts (characters; file read as UTF-8 / ``body`` as returned by
 """
 
 import re
+from dataclasses import FrozenInstanceError
 from datetime import date
 from pathlib import Path
 
 import pytest
 
 from app.core.splitter import (
-    MAX_CHARS, MIN_SECTION_CHARS, SPLITTER_VERSION, TARGET_CHARS, split_note)
+    MAX_CHARS,
+    MIN_SECTION_CHARS,
+    SPLITTER_VERSION,
+    TARGET_CHARS,
+    split_note,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "notes"
 
@@ -293,9 +299,9 @@ class TestInvariants:
     @pytest.mark.parametrize("name", ALL_FIXTURES)
     def test_the_frozen_dataclasses_reject_mutation(self, name):
         result = split_note(read_fixture(name))
-        with pytest.raises(Exception):
+        with pytest.raises(FrozenInstanceError):
             result.passages[0].ordinal = 99  # type: ignore[misc]
-        with pytest.raises(Exception):
+        with pytest.raises(FrozenInstanceError):
             result.body = "x"  # type: ignore[misc]
 
 

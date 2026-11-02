@@ -45,4 +45,4 @@ def test_no_transaction_is_open_while_the_query_is_embedded(
     # read-back guard still passes and the seeded rows are still visible.
     body = response.json()
     assert body["degraded"] is False
-    assert [r["passage_id"] for r in body["results"]][0] == passage.id
+    assert body["results"][0]["passage_id"] == passage.id

@@ -78,8 +78,14 @@ jobs:
       # gate on env instead. Without this the guard silently does nothing.
       # Named DOCKERHUB_NAME to match the repository secret that exists.
       DOCKERHUB_NAME: ${{ secrets.DOCKERHUB_NAME }}
+      # Same pattern for the SonarCloud token: forks and Dependabot PRs have no
+      # secrets, so the scan step skips instead of failing the job.
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # SonarCloud needs full history for blame and new-code detection.
+          fetch-depth: 0
 
       # Anonymous Docker Hub pulls are rate limited per IP, and GitHub's hosted
       # runners share egress addresses, so an unauthenticated pull of
@@ -107,5 +113,13 @@ jobs:
       - name: Install dependencies (fails if uv.lock is stale)
         run: uv sync --locked --no-build --python 3.12
 
+      # coverage.xml feeds SonarCloud below. scripts/ is measured too: its
+      # tests import the scripts in-process rather than spawning them.
       - name: Run tests
-        run: uv run --locked --no-build --python 3.12 pytest
+        run: uv run --locked --no-build --python 3.12 pytest --cov=app --cov=scripts --cov-report=xml --cov-report=term
+
+      # Requires Automatic Analysis to be OFF in the SonarCloud project;
+      # project settings live in sonar-project.properties.
+      - name: SonarCloud scan
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304  # v8.4.0

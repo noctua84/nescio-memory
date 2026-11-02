@@ -5,7 +5,7 @@ transaction that the `connection` fixture rolls back afterwards. They flush
 rather than commit: flushing makes the rows visible to subsequent queries on
 the same session, including the auth dependency, without ending anything.
 """
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 
 from sqlalchemy import func, literal_column
@@ -13,8 +13,12 @@ from sqlalchemy.orm import Session
 
 from app.core.pipeline import (
     content_hash as compute_content_hash,
+)
+from app.core.pipeline import (
     fts_lead_a,
     fts_lead_c,
+)
+from app.core.pipeline import (
     pipeline_version as compute_pipeline_version,
 )
 from app.core.security import _hash_key
@@ -42,7 +46,7 @@ def make_api_key(
             key_prefix=plaintext[:15],
             key_hash=_hash_key(plaintext),
             client_name=client_name,
-            revoked_at=datetime.now(timezone.utc) if revoked else None,
+            revoked_at=datetime.now(UTC) if revoked else None,
         )
     )
     db.flush()

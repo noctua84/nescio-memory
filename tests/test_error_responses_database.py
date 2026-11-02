@@ -16,7 +16,11 @@ from app.api.v1 import ingest as ingest_module
 from app.api.v1 import search as search_module
 from app.core import errors as errors_module
 from app.core.db import get_db
-from app.core.errors import INVALID_DATA_DETAIL, QUERY_TIMEOUT_DETAIL, RETRY_AFTER_SECONDS
+from app.core.errors import (
+    INVALID_DATA_DETAIL,
+    QUERY_TIMEOUT_DETAIL,
+    RETRY_AFTER_SECONDS,
+)
 from app.main import app
 from app.models.note import Note
 from app.models.passage import Passage

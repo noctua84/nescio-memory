@@ -1,7 +1,7 @@
 [project]
 name = "nescio-memory"
 version = "0.5.0"
-description = "Semantic memory API: chunk, embed and retrieve knowledge using PostgreSQL and pgvector."
+description = "Semantic memory API: store notes, embed their passages and retrieve them with hybrid search on PostgreSQL and pgvector."
 readme = "README.md"
 license = "MIT"
 authors = [
@@ -35,6 +35,7 @@ local-embeddings = [
 dev = [
     "openapi-spec-validator>=0.9.0",
     "pytest>=8.0",
+    "pytest-cov>=6.0",
     "pyyaml>=6.0.3",
     "testcontainers[postgres]>=4.15.0",
 ]
