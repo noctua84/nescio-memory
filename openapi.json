@@ -620,7 +620,7 @@
             "title": "Heading Path",
             "description": "Optional heading hierarchy path within the note.",
             "examples": [
-              "Architecture \u203a API Design"
+              "Architecture › API Design"
             ]
           },
           "content": {
