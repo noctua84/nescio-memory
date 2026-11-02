@@ -331,7 +331,6 @@ remove it during cleanup or simplification passes. Its camelCase aliases (`total
 
 ### Repo hygiene
 
-Dated `*.txt` files at the repository root (e.g.
-`2026-09-18-140231-can-you-handle-the-commit-message-part-for-the-st.txt`) are exported
-AI-session transcripts. They are untracked scratch artifacts — do **not** commit them, and never
+Dated `*.txt` files at the repository root (`YYYY-MM-DD-HHMMSS-<slug>.txt`) are exported
+AI-session transcripts. They are ignored scratch artifacts — do **not** commit them, and never
 use broad staging like `git add -A` here. Stage explicit paths only.
