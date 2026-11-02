@@ -22,7 +22,6 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.core import embeddings as embeddings_module
-from app.core import errors as errors_module
 from app.core.db import get_db
 from app.core.errors import (
     RETRY_AFTER_SECONDS,
@@ -68,15 +67,12 @@ def http(db_session, monkeypatch):
 
 
 @pytest.fixture
-def handler_records(monkeypatch, caplog):
+def handler_records(caplog):
     """Records from app.core.errors only.
 
-    Alembic's env.py (run by the session-scoped `engine` fixture) calls
-    fileConfig(), which disables every existing logger, app.core.errors'
-    included; that is test wiring, so it is undone here. Filtering by name keeps
-    the assertions about this logger rather than about the whole process.
+    Filtering by name keeps the assertions about this logger rather than about
+    the whole process.
     """
-    monkeypatch.setattr(errors_module.logger, "disabled", False)
     with caplog.at_level(logging.WARNING, logger="app.core.errors"):
         yield lambda: [r for r in caplog.records if r.name == "app.core.errors"]
 

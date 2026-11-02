@@ -7,6 +7,7 @@ from app.config import settings
 from app.core.body_limit import BodySizeLimitMiddleware
 from app.core.db import get_engine
 from app.core.errors import register_exception_handlers
+from app.core.log_config import configure_logging
 from app.core.schema_checks import (
     verify_embedding_dimension,
     verify_migration_head,
@@ -29,6 +30,11 @@ async def lifespan(_: FastAPI):
 
 
 def create_app() -> FastAPI:
+    # First, and here rather than in the lifespan: tests never run the lifespan,
+    # and anything logged while the rest of the app is wired up should already
+    # use the final format. Idempotent, because tests build the app more than once.
+    configure_logging(settings.log_level, settings.log_format)
+
     app = FastAPI(
         title=settings.app_name,
         description="NescioAI semantic memory core.",

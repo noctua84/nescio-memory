@@ -5,6 +5,9 @@ from urllib.parse import urlparse
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
 class Settings(BaseSettings):
     # Database
     database_url: str
@@ -82,7 +85,12 @@ class Settings(BaseSettings):
 
     # app
     app_name: str = "Nescio Semantic Memory API"
+    # Applies to the app.* and uvicorn.* loggers; the root logger stays at
+    # WARNING so third-party chatter (httpx, SQLAlchemy) does not follow it.
     log_level: str = "INFO"
+    # "json" is one OpenTelemetry-shaped object per line, for a collector;
+    # "text" is the human-readable form for a local terminal.
+    log_format: Literal["json", "text"] = "json"
 
     # server
     host: str = "localhost"
@@ -225,6 +233,21 @@ class Settings(BaseSettings):
                 f"{self.embed_batch_size}; 0 would never advance through the "
                 "texts and a huge batch defeats the per-request timeout bound"
             )
+        return self
+
+    # logging.config.dictConfig would otherwise reject an unknown level with a
+    # bare "Unable to configure logger" that names neither the variable nor the
+    # accepted values. Normalised to upper case so LOG_LEVEL=debug works; WARN
+    # and NOTSET are refused on purpose, so the documented five are the only ones.
+    @model_validator(mode="after")
+    def _log_level_must_be_a_level_name(self) -> "Settings":
+        level = self.log_level.strip().upper()
+        if level not in _LOG_LEVELS:
+            raise ValueError(
+                f"LOG_LEVEL must be one of {', '.join(_LOG_LEVELS)}, got "
+                f"{self.log_level!r}"
+            )
+        self.log_level = level
         return self
 
 

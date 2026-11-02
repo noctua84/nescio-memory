@@ -25,12 +25,9 @@ OLLAMA_URL = "http://embedder.invalid:11434/api/embed"
 
 
 @pytest.fixture
-def search_log(client, db_session, monkeypatch, caplog):
+def search_log(client, db_session, caplog):
     """Seed one passage, then return a function that searches and yields the
     degraded body plus every app log message emitted during the request."""
-    # alembic/env.py's fileConfig() disables every logger that already exists
-    # when the engine fixture migrates (see tests/test_error_responses.py).
-    monkeypatch.setattr(search_module.logger, "disabled", False)
     key = make_api_key(db_session, "acme")
     note = make_note(db_session, "acme")
     make_passage(
