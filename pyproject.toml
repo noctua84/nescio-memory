@@ -1,6 +1,6 @@
 [project]
 name = "nescio-memory"
-version = "0.5.0"
+version = "0.6.0"
 description = "Semantic memory API: store notes, embed their passages and retrieve them with hybrid search on PostgreSQL and pgvector."
 readme = "README.md"
 license = "MIT"

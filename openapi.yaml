@@ -2,21 +2,23 @@ openapi: 3.1.0
 info:
   title: Nescio Semantic Memory API
   description: NescioAI semantic memory core.
-  version: 0.5.0
+  version: 0.6.0
 paths:
   /api/v1/search:
     post:
       tags:
         - Search
       summary: Hybrid keyword and semantic search over passages
-      description: 'Hybrid search over note passages: a full-text arm (websearch_to_tsquery:
-        phrases, words, exclusions) and a vector arm (semantic similarity), fused
-        by reciprocal rank. Returns individual matching passages, never whole notes,
-        ordered by the fused score. Always fills up to top_k when that many passages
-        exist -- there is no relevance floor -- and fts_rank null marks a semantic-only
-        match. A query with no usable keywords (stop words only) is answered by the
-        vector arm. If the query cannot be embedded because the embedding backend
-        is briefly unavailable, the response is full-text only and degraded is true.'
+      description: >-
+        Hybrid search over note passages: a full-text arm (websearch_to_tsquery:
+        phrases, words, exclusions) and a vector arm (semantic similarity),
+        fused by reciprocal rank. Returns individual matching passages, never
+        whole notes, ordered by the fused score. Always fills up to top_k when
+        that many passages exist -- there is no relevance floor -- and fts_rank
+        null marks a semantic-only match. A query with no usable keywords (stop
+        words only) is answered by the vector arm. If the query cannot be
+        embedded because the embedding backend is briefly unavailable, the
+        response is full-text only and degraded is true.
       operationId: searchPassages
       requestBody:
         content:
@@ -44,8 +46,9 @@ paths:
       tags:
         - Ingest
       summary: Ingest a note
-      description: Splits Markdown content into heading-aware passages, embeds them,
-        and upserts the note and its passages. Skips re-splitting and re-embedding
+      description: >-
+        Splits Markdown content into heading-aware passages, embeds them, and
+        upserts the note and its passages. Skips re-splitting and re-embedding
         when the content and pipeline version are unchanged, unless force=True.
       operationId: ingestNote
       requestBody:
@@ -74,8 +77,10 @@ paths:
       tags:
         - Notes
       summary: Get a note by id
-      description: Fetch one note and its passage count. Returns 404 for a note that
-        does not exist and for another tenant's note alike -- see the module docstring.
+      description: >-
+        Fetch one note and its passage count. Returns 404 for a note that does
+        not exist and for another tenant's note alike -- see the module
+        docstring.
       operationId: getNote
       security:
         - APIKeyHeader: []
@@ -105,9 +110,10 @@ paths:
       tags:
         - Notes
       summary: Delete a note and its passages
-      description: Delete one note. Its passages go with it via cascade. Returns 404
-        for a note that does not exist and for another tenant's note alike -- see
-        the module docstring.
+      description: >-
+        Delete one note. Its passages go with it via cascade. Returns 404 for a
+        note that does not exist and for another tenant's note alike -- see the
+        module docstring.
       operationId: deleteNote
       security:
         - APIKeyHeader: []
@@ -158,8 +164,9 @@ components:
           type: string
           maxLength: 512
           title: Scope
-          description: Scope to organize notes within a tenant. Accepts both 'scope'
-            and 'repo_name' aliases for backwards compatibility.
+          description: >-
+            Scope to organize notes within a tenant. Accepts both 'scope' and
+            'repo_name' aliases for backwards compatibility.
           default: ''
           examples:
             - project-a
@@ -182,7 +189,8 @@ components:
               maxLength: 256
             - type: 'null'
           title: Status
-          description: Optional status label for the note (e.g., 'draft', 'approved',
+          description: >-
+            Optional status label for the note (e.g., 'draft', 'approved',
             'superseded').
           examples:
             - approved
@@ -194,9 +202,10 @@ components:
         force:
           type: boolean
           title: Force
-          description: Re-split, re-embed and rewrite this note's passages even when
-            the content hash and pipeline version both match. The escape hatch for
-            a change the pipeline version cannot see -- most plausibly a re-pulled
+          description: >-
+            Re-split, re-embed and rewrite this note's passages even when the
+            content hash and pipeline version both match. The escape hatch for a
+            change the pipeline version cannot see -- most plausibly a re-pulled
             embedding model behind an unchanged backend name and dimension.
           default: false
       type: object
@@ -218,8 +227,9 @@ components:
         skipped:
           type: boolean
           title: Skipped
-          description: True when the skip fired (content unchanged and force=False);
-            always False under force.
+          description: >-
+            True when the skip fired (content unchanged and force=False); always
+            False under force.
       type: object
       required:
         - note_id
@@ -259,14 +269,14 @@ components:
             - type: string
             - type: 'null'
           title: Description
-          description: Optional summary from frontmatter. Used in search at FTS weight
-            C.
+          description: Optional summary from frontmatter. Used in search at FTS weight C.
         type:
           anyOf:
             - type: string
             - type: 'null'
           title: Type
-          description: Optional type classification from frontmatter (e.g., 'adr',
+          description: >-
+            Optional type classification from frontmatter (e.g., 'adr',
             'design-doc').
           examples:
             - adr
@@ -275,7 +285,8 @@ components:
             - type: string
             - type: 'null'
           title: Provenance Kind
-          description: Optional provenance source kind (e.g., 'user override', 'empirical',
+          description: >-
+            Optional provenance source kind (e.g., 'user override', 'empirical',
             'agent inference').
           examples:
             - user override
@@ -301,8 +312,9 @@ components:
         pipeline_version:
           type: string
           title: Pipeline Version
-          description: Version identifier combining splitter, FTS composition, embedding-input
-            composition, and embedding backend+dimension.
+          description: >-
+            Version identifier combining splitter, FTS composition,
+            embedding-input composition, and embedding backend+dimension.
         body:
           type: string
           title: Body
@@ -346,8 +358,9 @@ components:
           type: string
           minLength: 1
           title: Q
-          description: Search query, matched by keyword/phrase and by meaning. Accepts
-            both 'q' and 'query' aliases.
+          description: >-
+            Search query, matched by keyword/phrase and by meaning. Accepts both
+            'q' and 'query' aliases.
           examples:
             - invoice-first checkout
         top_k:
@@ -355,9 +368,10 @@ components:
           maximum: 50
           minimum: 1
           title: Top K
-          description: Number of passages to return. Hybrid search always fills up
-            to top_k when that many passages exist (there is no relevance floor),
-            so trailing results can be weak matches.
+          description: >-
+            Number of passages to return. Hybrid search always fills up to top_k
+            when that many passages exist (there is no relevance floor), so
+            trailing results can be weak matches.
           default: 5
         repo_filter:
           anyOf:
@@ -383,7 +397,8 @@ components:
         degraded:
           type: boolean
           title: Degraded
-          description: true when the query could not be embedded and the results are
+          description: >-
+            true when the query could not be embedded and the results are
             full-text only
       type: object
       required:
@@ -416,8 +431,9 @@ components:
             - type: string
             - type: 'null'
           title: Description
-          description: Optional description of the note from frontmatter. Contributes
-            to FTS ranking at weight C.
+          description: >-
+            Optional description of the note from frontmatter. Contributes to
+            FTS ranking at weight C.
         type:
           anyOf:
             - type: string
@@ -435,7 +451,7 @@ components:
           title: Heading Path
           description: Optional heading hierarchy path within the note.
           examples:
-            - "Architecture \u203A API Design"
+            - Architecture › API Design
         content:
           type: string
           title: Content
@@ -462,23 +478,26 @@ components:
         score:
           type: number
           title: Score
-          description: Reciprocal-rank-fusion score; comparable only within one response;
+          description: >-
+            Reciprocal-rank-fusion score; comparable only within one response;
             higher is more relevant.
         fts_rank:
           anyOf:
             - type: integer
             - type: 'null'
           title: Fts Rank
-          description: 1-based rank in that arm's candidate list, null if the passage
-            was not among that arm's candidates or the arm did not run. A null fts_rank
-            means a semantic-only match.
+          description: >-
+            1-based rank in that arm's candidate list, null if the passage was
+            not among that arm's candidates or the arm did not run. A null
+            fts_rank means a semantic-only match.
         vector_rank:
           anyOf:
             - type: integer
             - type: 'null'
           title: Vector Rank
-          description: 1-based rank in that arm's candidate list, null if the passage
-            was not among that arm's candidates or the arm did not run.
+          description: >-
+            1-based rank in that arm's candidate list, null if the passage was
+            not among that arm's candidates or the arm did not run.
       type: object
       required:
         - passage_id
