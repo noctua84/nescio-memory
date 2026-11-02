@@ -11,7 +11,7 @@ from alembic.script import ScriptDirectory
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import OperationalError
 
-import app.core.schema_checks as schema_checks
+from app.core import schema_checks
 from app.core.schema_checks import verify_migration_head
 from app.main import app
 
@@ -136,6 +136,5 @@ def test_the_lifespan_runs_the_migration_check(engine, monkeypatch):
 
     monkeypatch.setattr(main_module, "get_engine", lambda: engine)
     monkeypatch.setattr(main_module, "verify_migration_head", behind)
-    with pytest.raises(RuntimeError, match="not at head"):
-        with TestClient(app):
-            pass
+    with pytest.raises(RuntimeError, match="not at head"), TestClient(app):
+        pass
