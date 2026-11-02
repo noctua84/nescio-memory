@@ -247,7 +247,7 @@ NEW_SETTING_DEFAULTS = {
     "query_instruction": (
         "Given a web search query, retrieve relevant passages that answer the query"
     ),
-    "query_embed_timeout_s": 5.0,
+    "query_embed_timeout_s": 15.0,
     "embed_batch_size": 16,
 }
 

@@ -373,7 +373,7 @@ passages).
 - **Removed settings:** `CHUNK_SIZE`, `CHUNK_OVERLAP`, `MAX_CONTEXT_CHARS` and
   `MAX_CONTEXT_DOCUMENTS`. Unknown keys are ignored, so an old `.env` still boots.
 - **`OLLAMA_URL` must end in `/api/embed`.** Ingest embeds in batches through that endpoint; the
-  legacy `/api/embeddings` is rejected at startup. Change the path and keep the same host.
+  legacy `/api/embeddings` and a bare host with no path are rejected at startup. Change the path and keep the same host.
 - **New settings** for hybrid search and batching are listed under
   [Configuration](#configuration).
 
@@ -389,7 +389,7 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `STATEMENT_TIMEOUT_MS` | `5000`                                     | caps each statement, not the whole request; must be `1..60000`; a hybrid search is one statement under this cap; **breaking in 0.5.0**: values above 60000 now refuse to start |
 | `EMBEDDING_BACKEND`   | `ollama`                                    | `ollama` (HTTP) or `local` (in-process); any other value fails at startup |
 | `LOCAL_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2`  | model for the `local` backend only — see [Embedding backends](#embedding-backends) |
-| `OLLAMA_URL`          | `http://localhost:11434/api/embed`          | Ollama batch embedding endpoint (local or remote); must end in `/api/embed`, with no trailing slash — the legacy `/api/embeddings` and a trailing slash (`/api/embed/`) fail at startup |
+| `OLLAMA_URL`          | `http://localhost:11434/api/embed`          | Ollama batch embedding endpoint (local or remote); must end in `/api/embed`, with no trailing slash (a reverse-proxy prefix such as `/ollama/api/embed` is fine) — a bare host (`http://host:11434`), any other path, the legacy `/api/embeddings` and a trailing slash (`/api/embed/`) fail at startup |
 | `OLLAMA_MODEL`        | `qwen3-embedding:0.6b`                      | embedding model name                                 |
 | `EMBEDDING_DIMENSION` | `1024`                                      | must match the model **and** the `vector(N)` column — the default is the width `qwen3-embedding:0.6b` actually emits; verify with [`scripts/check_embedding_dimension.py`](scripts/check_embedding_dimension.py) |
 | `LANGFUSE_PUBLIC_KEY` | *(empty → tracing off)*                     | Langfuse credentials                                 |
@@ -401,7 +401,7 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `RRF_K`               | `60`                                        | reciprocal-rank-fusion damping constant, `>= 1`; a passage scores `weight / (RRF_K + rank)` per branch |
 | `FTS_WEIGHT` / `VECTOR_WEIGHT` | `1.0` / `1.0`                      | per-branch multipliers on the fused score, finite and `>= 0`; `0` switches that branch off (`VECTOR_WEIGHT=0` is the keyword-only baseline); both `0` is rejected at startup |
 | `QUERY_INSTRUCTION`   | *(Qwen3 retrieval instruction)*             | prefix added to **query** embeddings only, never to passages, for instruction-tuned models such as Qwen3-Embedding; empty string disables it. Set `QUERY_INSTRUCTION=""` for a model that is not instruction-tuned (the `local` backend's sentence-transformers model, or any non-Qwen3 Ollama model): the prefix is applied to queries only and would skew ranking |
-| `QUERY_EMBED_TIMEOUT_S` | `5`                                       | seconds a search waits to embed the query, `0 < x <= 30`; on a transient failure the search degrades to keyword-only (`degraded: true`) |
+| `QUERY_EMBED_TIMEOUT_S` | `15`                                      | seconds a search waits to embed the query, `0 < x <= 30`; on a transient failure the search degrades to keyword-only (`degraded: true`). The default covers a cold model load: Ollama unloads an idle model after its `keep_alive` (5 minutes by default), so the first search after an idle period waits for a reload. A startup warm-up would not help, since it only covers the first load after a deploy; to avoid the reload, set `OLLAMA_KEEP_ALIVE` on the Ollama server. A longer wait does not hold a database connection |
 | `EMBED_BATCH_SIZE`    | `16`                                        | passages per `/api/embed` call at ingest, `1..256` |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
 

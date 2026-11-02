@@ -7,7 +7,11 @@ from app.config import settings
 from app.core.body_limit import BodySizeLimitMiddleware
 from app.core.db import get_engine
 from app.core.errors import register_exception_handlers
-from app.core.schema_checks import verify_embedding_dimension, verify_pgvector_version
+from app.core.schema_checks import (
+    verify_embedding_dimension,
+    verify_migration_head,
+    verify_pgvector_version,
+)
 from app.helper import get_app_version
 
 __version__ = get_app_version()
@@ -20,6 +24,7 @@ async def lifespan(_: FastAPI):
     engine = get_engine()
     verify_pgvector_version(engine)
     verify_embedding_dimension(engine)
+    verify_migration_head(engine)
     yield
 
 
