@@ -208,6 +208,23 @@ def client(db_session, monkeypatch):
     app.dependency_overrides.clear()
 
 
+@pytest.fixture(autouse=True)
+def no_embedding_retry(monkeypatch):
+    """Switch embedding retry off, and make sure nothing could sleep for it.
+
+    Most tests stub a failing backend to check how the failure is classified or
+    surfaced, and assert it was called exactly once. With the default budget
+    they would see a second call and, unstubbed, wait out a real backoff.
+    EMBED_RETRY_BUDGET=0 is the documented off switch. The retry behaviour is
+    covered in tests/test_embeddings_retry.py, which sets its own budget and
+    injects its own sleep, clock and jitter.
+    """
+    from app.core import embeddings as embeddings_module
+
+    monkeypatch.setattr(settings, "embed_retry_budget", 0)
+    monkeypatch.setattr(embeddings_module, "_sleep", lambda seconds: None)
+
+
 @pytest.fixture
 def fts_only(monkeypatch):
     """Switch search to the full-text arm alone, for tests asserting pure FTS
