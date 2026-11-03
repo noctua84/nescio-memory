@@ -191,7 +191,7 @@ The key does more than authenticate. Every note and passage written through it i
 Design rationale and the retrieval-quality baseline live in
 [`docs/superpowers/specs/2026-10-29-notes-passages-slice-1-design.md`](docs/superpowers/specs/2026-10-29-notes-passages-slice-1-design.md).
 The routes are tagged `Ingest`, `Notes` and `Search` in the OpenAPI document, with operation ids
-`ingestNote`, `getNote`, `deleteNote` and `searchPassages`.
+`ingestNote`, `getNote`, `deleteNote`, `deleteNoteByPath`, `deleteScope` and `searchPassages`.
 
 Every `/api/v1` route except `GET /health` requires the `X-API-Key` header, and all data is
 tenant-scoped by it.
@@ -277,12 +277,67 @@ curl http://localhost:8000/api/v1/notes/42 -H "X-API-Key: nm_your_key_here"
 
 The erasure path: removes a note and, by cascade, every one of its passages. Returns `204` with
 no body on success, and the same indistinguishable `404` as `GET` for a missing or foreign id.
-This is the **only** way to remove a note — nothing reconciles notes against a source tree, so a
-client that stops holding a file must call this itself.
+Nothing reconciles notes against a source tree, so a client that stops holding a file must call a
+delete route itself — this one if it kept the id, or the two below if it only has the path or the
+scope.
 
 ```bash
 curl -X DELETE http://localhost:8000/api/v1/notes/42 -H "X-API-Key: nm_your_key_here"
 ```
+
+#### `DELETE /api/v1/notes?scope=…&path_or_uri=…`
+
+Deletes the one note stored at `(scope, path_or_uri)`, for a client that does not hold the id. Both
+query parameters are required; `scope` may be the empty string, which is the root scope. They are
+query parameters rather than path segments because a scope can be empty and a path contains
+slashes. `path_or_uri` follows the same rule as ingest (a relative path without `..`, or a
+`scheme://` URI), so a value ingest would refuse is refused here too.
+
+```bash
+curl -X DELETE -G http://localhost:8000/api/v1/notes -H "X-API-Key: nm_your_key_here" \
+  --data-urlencode "scope=nescio-memory" \
+  --data-urlencode "path_or_uri=docs/architecture.md"
+```
+
+```json
+{
+  "notes_deleted": 1,
+  "passages_deleted": 3,
+  "notes": [
+    {"note_id": 42, "path_or_uri": "docs/architecture.md", "content_hash": "..."}
+  ]
+}
+```
+
+No match is `404 {"detail": "Note not found"}`, byte-identical to delete by id and the same whether
+the note never existed or belongs to another client. The lookup is scoped to the calling client, so
+it cannot be used to probe another client's paths. Unlike delete by id the success response is
+`200` with a body, so the caller learns what was removed (the id and content hash are gone from the
+database by then).
+
+#### `DELETE /api/v1/scopes?scope=…`
+
+Retires a whole scope: deletes every note in it and, by cascade, their passages. The response has
+the same shape as delete by path, with one entry in `notes` per removed note. A scope with no
+notes — including one that belongs to another client — is **not** an error: the answer is `200`
+with `notes_deleted` and `passages_deleted` of `0` and an empty `notes` list, which keeps a retry
+after a partial failure harmless.
+
+```bash
+curl -X DELETE "http://localhost:8000/api/v1/scopes?scope=nescio-memory" -H "X-API-Key: nm_your_key_here"
+```
+
+**The root scope cannot be deleted by accident.** Notes ingested without a scope live in the empty
+scope `""`, and a client that builds this URL from a variable that turned out empty would
+otherwise erase them. So an empty or omitted `scope` is refused with `400` before anything runs.
+To delete the root scope on purpose, say so:
+
+```bash
+curl -X DELETE "http://localhost:8000/api/v1/scopes?root_scope=true" -H "X-API-Key: nm_your_key_here"
+```
+
+With `root_scope=true`, `scope` must be empty or omitted and only the root scope is deleted;
+combining `root_scope=true` with a non-empty `scope` is a `400` as well.
 
 #### `POST /api/v1/search`
 
@@ -620,16 +675,18 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
 - **Ingestion has no retry or backoff.** Passages are embedded through Ollama's `/api/embed` in
   groups of `EMBED_BATCH_SIZE`, but a failed call is not retried; the request fails and the client
   re-sends it.
-- **There is no list or export route.** No enumeration, no fetch-by-path: a note is reachable
-  by id (`GET /api/v1/notes/{id}`) or as passages through a search that matched it. This is an
+- **There is no list or export route.** No enumeration, and no fetch-by-path (deleting by path
+  exists, reading by path does not): a note is readable by id (`GET /api/v1/notes/{id}`) or as
+  passages through a search that matched it. This is an
   architectural property and **not a security boundary**: there is no rate limiting, so bulk
   retrieval is bounded by query effort rather than refused. Recovering the corpus itself is a
   `pg_dump`/restore concern, not an API one. A note changes only by re-ingesting it whole.
 - **Changing the FTS configuration or weights forces a full re-ingest**, because `tsv` is
   materialized at ingest time, not computed on the fly.
-- **A note whose source file was deleted is not removed automatically.**
-  `DELETE /api/v1/notes/{id}` is the only erasure path; reconciling notes against a source tree
-  is not something the service does.
+- **A note whose source file was deleted is not removed automatically.** A client removes it
+  with `DELETE /api/v1/notes/{id}` or `DELETE /api/v1/notes?scope=…&path_or_uri=…`, or retires a
+  whole scope with `DELETE /api/v1/scopes`; reconciling notes against a source tree is not
+  something the service does.
 
 Contributions addressing any of the above are welcome.
 

@@ -9,16 +9,14 @@ paths:
       tags:
         - Search
       summary: Hybrid keyword and semantic search over passages
-      description: >-
-        Hybrid search over note passages: a full-text arm (websearch_to_tsquery:
-        phrases, words, exclusions) and a vector arm (semantic similarity),
-        fused by reciprocal rank. Returns individual matching passages, never
-        whole notes, ordered by the fused score. Always fills up to top_k when
-        that many passages exist -- there is no relevance floor -- and fts_rank
-        null marks a semantic-only match. A query with no usable keywords (stop
-        words only) is answered by the vector arm. If the query cannot be
-        embedded because the embedding backend is briefly unavailable, the
-        response is full-text only and degraded is true.
+      description: 'Hybrid search over note passages: a full-text arm (websearch_to_tsquery:
+        phrases, words, exclusions) and a vector arm (semantic similarity), fused
+        by reciprocal rank. Returns individual matching passages, never whole notes,
+        ordered by the fused score. Always fills up to top_k when that many passages
+        exist -- there is no relevance floor -- and fts_rank null marks a semantic-only
+        match. A query with no usable keywords (stop words only) is answered by the
+        vector arm. If the query cannot be embedded because the embedding backend
+        is briefly unavailable, the response is full-text only and degraded is true.'
       operationId: searchPassages
       requestBody:
         content:
@@ -46,9 +44,8 @@ paths:
       tags:
         - Ingest
       summary: Ingest a note
-      description: >-
-        Splits Markdown content into heading-aware passages, embeds them, and
-        upserts the note and its passages. Skips re-splitting and re-embedding
+      description: Splits Markdown content into heading-aware passages, embeds them,
+        and upserts the note and its passages. Skips re-splitting and re-embedding
         when the content and pipeline version are unchanged, unless force=True.
       operationId: ingestNote
       requestBody:
@@ -77,10 +74,8 @@ paths:
       tags:
         - Notes
       summary: Get a note by id
-      description: >-
-        Fetch one note and its passage count. Returns 404 for a note that does
-        not exist and for another tenant's note alike -- see the module
-        docstring.
+      description: Fetch one note and its passage count. Returns 404 for a note that
+        does not exist and for another tenant's note alike -- see the module docstring.
       operationId: getNote
       security:
         - APIKeyHeader: []
@@ -110,10 +105,9 @@ paths:
       tags:
         - Notes
       summary: Delete a note and its passages
-      description: >-
-        Delete one note. Its passages go with it via cascade. Returns 404 for a
-        note that does not exist and for another tenant's note alike -- see the
-        module docstring.
+      description: Delete one note. Its passages go with it via cascade. Returns 404
+        for a note that does not exist and for another tenant's note alike -- see
+        the module docstring.
       operationId: deleteNote
       security:
         - APIKeyHeader: []
@@ -135,6 +129,108 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/notes:
+    delete:
+      tags:
+        - Notes
+      summary: Delete a note by scope and path
+      description: Delete the note stored at (scope, path_or_uri) and, by cascade,
+        its passages -- for a client that does not hold the note id. Both query parameters
+        are required; scope may be the empty string, which is the root scope. Returns
+        404 when there is no such note for this client, and for another tenant's note
+        alike.
+      operationId: deleteNoteByPath
+      security:
+        - APIKeyHeader: []
+      parameters:
+        - name: scope
+          in: query
+          required: true
+          schema:
+            type: string
+            maxLength: 512
+            description: Scope of the note; may be empty.
+            title: Scope
+          description: Scope of the note; may be empty.
+        - name: path_or_uri
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 2048
+            description: Path or URI of the note within its scope.
+            title: Path Or Uri
+          description: Path or URI of the note within its scope.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteNotesResponse'
+        '400':
+          description: path_or_uri is an absolute path or contains '..'.
+        '404':
+          description: No such note for this client.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/scopes:
+    delete:
+      tags:
+        - Notes
+      summary: Delete every note in a scope
+      description: 'Retire a whole scope: delete every note in it and, by cascade,
+        their passages. An empty or omitted scope is refused with 400 unless root_scope=true
+        is sent, in which case scope must be empty or omitted and the root (empty)
+        scope is the one deleted. A scope with no notes is not an error: the response
+        is 200 with zero counts.'
+      operationId: deleteScope
+      security:
+        - APIKeyHeader: []
+      parameters:
+        - name: scope
+          in: query
+          required: false
+          schema:
+            anyOf:
+              - type: string
+                maxLength: 512
+              - type: 'null'
+            description: Scope to delete. Omit or leave empty only with root_scope=true.
+            title: Scope
+          description: Scope to delete. Omit or leave empty only with root_scope=true.
+        - name: root_scope
+          in: query
+          required: false
+          schema:
+            type: boolean
+            description: Must be true to delete the root (empty) scope; then scope
+              must be empty or omitted.
+            default: false
+            title: Root Scope
+          description: Must be true to delete the root (empty) scope; then scope must
+            be empty or omitted.
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteNotesResponse'
+        '400':
+          description: scope is empty or omitted without root_scope=true, or root_scope=true
+            was combined with a non-empty scope.
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /health:
     get:
       tags:
@@ -149,6 +245,52 @@ paths:
               schema: {}
 components:
   schemas:
+    DeleteNotesResponse:
+      properties:
+        notes_deleted:
+          type: integer
+          title: Notes Deleted
+          description: Number of notes removed.
+        passages_deleted:
+          type: integer
+          title: Passages Deleted
+          description: Number of passages removed along with those notes.
+        notes:
+          items:
+            $ref: '#/components/schemas/DeletedNote'
+          type: array
+          title: Notes
+          description: Every note removed, so a caller can reconcile its own index.
+      type: object
+      required:
+        - notes_deleted
+        - passages_deleted
+        - notes
+      title: DeleteNotesResponse
+      description: Result of deleting a note by path, or a whole scope.
+    DeletedNote:
+      properties:
+        note_id:
+          type: integer
+          title: Note Id
+          description: Id the note had before it was deleted.
+        path_or_uri:
+          type: string
+          title: Path Or Uri
+          description: Path or URI the note had within its scope.
+          examples:
+            - docs/architecture/adr-001.md
+        content_hash:
+          type: string
+          title: Content Hash
+          description: Content hash the note had when it was deleted.
+      type: object
+      required:
+        - note_id
+        - path_or_uri
+        - content_hash
+      title: DeletedNote
+      description: Identity of one note a delete removed.
     HTTPValidationError:
       properties:
         detail:
@@ -164,9 +306,8 @@ components:
           type: string
           maxLength: 512
           title: Scope
-          description: >-
-            Scope to organize notes within a tenant. Accepts both 'scope' and
-            'repo_name' aliases for backwards compatibility.
+          description: Scope to organize notes within a tenant. Accepts both 'scope'
+            and 'repo_name' aliases for backwards compatibility.
           default: ''
           examples:
             - project-a
@@ -189,8 +330,7 @@ components:
               maxLength: 256
             - type: 'null'
           title: Status
-          description: >-
-            Optional status label for the note (e.g., 'draft', 'approved',
+          description: Optional status label for the note (e.g., 'draft', 'approved',
             'superseded').
           examples:
             - approved
@@ -202,10 +342,9 @@ components:
         force:
           type: boolean
           title: Force
-          description: >-
-            Re-split, re-embed and rewrite this note's passages even when the
-            content hash and pipeline version both match. The escape hatch for a
-            change the pipeline version cannot see -- most plausibly a re-pulled
+          description: Re-split, re-embed and rewrite this note's passages even when
+            the content hash and pipeline version both match. The escape hatch for
+            a change the pipeline version cannot see -- most plausibly a re-pulled
             embedding model behind an unchanged backend name and dimension.
           default: false
       type: object
@@ -227,9 +366,8 @@ components:
         skipped:
           type: boolean
           title: Skipped
-          description: >-
-            True when the skip fired (content unchanged and force=False); always
-            False under force.
+          description: True when the skip fired (content unchanged and force=False);
+            always False under force.
       type: object
       required:
         - note_id
@@ -269,14 +407,14 @@ components:
             - type: string
             - type: 'null'
           title: Description
-          description: Optional summary from frontmatter. Used in search at FTS weight C.
+          description: Optional summary from frontmatter. Used in search at FTS weight
+            C.
         type:
           anyOf:
             - type: string
             - type: 'null'
           title: Type
-          description: >-
-            Optional type classification from frontmatter (e.g., 'adr',
+          description: Optional type classification from frontmatter (e.g., 'adr',
             'design-doc').
           examples:
             - adr
@@ -285,8 +423,7 @@ components:
             - type: string
             - type: 'null'
           title: Provenance Kind
-          description: >-
-            Optional provenance source kind (e.g., 'user override', 'empirical',
+          description: Optional provenance source kind (e.g., 'user override', 'empirical',
             'agent inference').
           examples:
             - user override
@@ -312,9 +449,8 @@ components:
         pipeline_version:
           type: string
           title: Pipeline Version
-          description: >-
-            Version identifier combining splitter, FTS composition,
-            embedding-input composition, and embedding backend+dimension.
+          description: Version identifier combining splitter, FTS composition, embedding-input
+            composition, and embedding backend+dimension.
         body:
           type: string
           title: Body
@@ -358,9 +494,8 @@ components:
           type: string
           minLength: 1
           title: Q
-          description: >-
-            Search query, matched by keyword/phrase and by meaning. Accepts both
-            'q' and 'query' aliases.
+          description: Search query, matched by keyword/phrase and by meaning. Accepts
+            both 'q' and 'query' aliases.
           examples:
             - invoice-first checkout
         top_k:
@@ -368,10 +503,9 @@ components:
           maximum: 50
           minimum: 1
           title: Top K
-          description: >-
-            Number of passages to return. Hybrid search always fills up to top_k
-            when that many passages exist (there is no relevance floor), so
-            trailing results can be weak matches.
+          description: Number of passages to return. Hybrid search always fills up
+            to top_k when that many passages exist (there is no relevance floor),
+            so trailing results can be weak matches.
           default: 5
         repo_filter:
           anyOf:
@@ -397,8 +531,7 @@ components:
         degraded:
           type: boolean
           title: Degraded
-          description: >-
-            true when the query could not be embedded and the results are
+          description: true when the query could not be embedded and the results are
             full-text only
       type: object
       required:
@@ -431,9 +564,8 @@ components:
             - type: string
             - type: 'null'
           title: Description
-          description: >-
-            Optional description of the note from frontmatter. Contributes to
-            FTS ranking at weight C.
+          description: Optional description of the note from frontmatter. Contributes
+            to FTS ranking at weight C.
         type:
           anyOf:
             - type: string
@@ -451,7 +583,7 @@ components:
           title: Heading Path
           description: Optional heading hierarchy path within the note.
           examples:
-            - Architecture › API Design
+            - "Architecture \u203A API Design"
         content:
           type: string
           title: Content
@@ -478,26 +610,23 @@ components:
         score:
           type: number
           title: Score
-          description: >-
-            Reciprocal-rank-fusion score; comparable only within one response;
+          description: Reciprocal-rank-fusion score; comparable only within one response;
             higher is more relevant.
         fts_rank:
           anyOf:
             - type: integer
             - type: 'null'
           title: Fts Rank
-          description: >-
-            1-based rank in that arm's candidate list, null if the passage was
-            not among that arm's candidates or the arm did not run. A null
-            fts_rank means a semantic-only match.
+          description: 1-based rank in that arm's candidate list, null if the passage
+            was not among that arm's candidates or the arm did not run. A null fts_rank
+            means a semantic-only match.
         vector_rank:
           anyOf:
             - type: integer
             - type: 'null'
           title: Vector Rank
-          description: >-
-            1-based rank in that arm's candidate list, null if the passage was
-            not among that arm's candidates or the arm did not run.
+          description: 1-based rank in that arm's candidate list, null if the passage
+            was not among that arm's candidates or the arm did not run.
       type: object
       required:
         - passage_id

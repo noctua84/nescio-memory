@@ -1,4 +1,5 @@
-"""GET and DELETE /api/v1/notes/{note_id} -- one note by id.
+"""GET and DELETE /api/v1/notes/{note_id} -- one note by id -- plus delete by
+path and delete by scope.
 
 Both routes share NOTE_NOT_FOUND_DETAIL and neither branches on *why* a note
 did not resolve: NoteRepository.get_note/delete_note return None/False for a
@@ -11,15 +12,17 @@ byte-identical (same status, body and headers) in both cases because it is
 the *same* code path, not two paths that happen to agree today.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from langfuse import observe
 from sqlalchemy.orm import Session
 
+from app.api.v1.validation import validate_path_or_uri
 from app.core.db import get_db
 from app.core.security import get_current_client
 from app.models import ApiKey
+from app.repositories.note import DeletedNote as RepoDeletedNote
 from app.repositories.note import NoteRepository
-from app.schemas.note import NoteResponse
+from app.schemas.note import DeleteNotesResponse, DeletedNote, NoteResponse
 
 router = APIRouter()
 
@@ -32,6 +35,17 @@ router = APIRouter()
 # payloads are withheld. Do not turn these back on without a privacy review.
 
 NOTE_NOT_FOUND_DETAIL = "Note not found"
+
+# The two 400s of DELETE /scopes. Constants because the tests pin the exact
+# text, and so a client can match on them.
+SCOPE_REQUIRED_DETAIL = (
+    "scope is required. To delete the root (empty) scope, send "
+    "root_scope=true with no scope."
+)
+ROOT_SCOPE_CONFLICT_DETAIL = (
+    "root_scope=true deletes the root (empty) scope and cannot be combined "
+    "with a non-empty scope."
+)
 
 
 @router.get(
@@ -107,9 +121,125 @@ def delete_note(
     # 404 raised above leaves nothing to roll back.
     db.commit()
 
-    # This DELETE is the ONLY erasure path for a note. Nothing reconciles a
-    # note against a deleted source file -- there is no sweeper, no TTL, no
-    # "file no longer exists on disk" check anywhere in this service. A
-    # client that stops holding a file and wants its note gone must call
-    # this endpoint itself.
+    # Deletes (this one, by path, by scope) are the ONLY erasure paths for a
+    # note. Nothing reconciles a note against a deleted source file -- there is
+    # no sweeper, no TTL, no "file no longer exists on disk" check anywhere in
+    # this service. A client that stops holding a file and wants its note gone
+    # must call one of them itself.
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete(
+    "/notes",
+    response_model=DeleteNotesResponse,
+    summary="Delete a note by scope and path",
+    description=(
+        "Delete the note stored at (scope, path_or_uri) and, by cascade, its "
+        "passages -- for a client that does not hold the note id. Both query "
+        "parameters are required; scope may be the empty string, which is the "
+        "root scope. Returns 404 when there is no such note for this client, "
+        "and for another tenant's note alike."
+    ),
+    operation_id="deleteNoteByPath",
+    responses={
+        400: {"description": "path_or_uri is an absolute path or contains '..'."},
+        404: {"description": "No such note for this client."},
+    },
+)
+@observe(name="note-delete-by-path", capture_input=False, capture_output=False)
+def delete_note_by_path(
+    # Query parameters, not path segments: scope may be "" and a path_or_uri
+    # contains slashes. `Query(...)` makes the parameter required while still
+    # accepting an empty value, which is what lets the root scope be named.
+    scope: str = Query(..., max_length=512, description="Scope of the note; may be empty."),
+    path_or_uri: str = Query(
+        ..., min_length=1, max_length=2048, description="Path or URI of the note within its scope."
+    ),
+    db: Session = Depends(get_db),
+    client: ApiKey = Depends(get_current_client),
+) -> DeleteNotesResponse:
+    validate_path_or_uri(path_or_uri)
+
+    repo = NoteRepository(db, client_name=client.client_name)
+    deleted, passages_deleted = repo.delete_by_path(scope, path_or_uri)
+    # Same 404 as delete by id, and for the same reason it is not an oracle:
+    # the lookup is tenant-scoped, so "no match" and "another tenant's note"
+    # are one code path.
+    if not deleted:
+        raise HTTPException(status_code=404, detail=NOTE_NOT_FOUND_DETAIL)
+    # Single transaction boundary, success path only, as in delete_note.
+    db.commit()
+    return _delete_response(deleted, passages_deleted)
+
+
+@router.delete(
+    "/scopes",
+    response_model=DeleteNotesResponse,
+    summary="Delete every note in a scope",
+    description=(
+        "Retire a whole scope: delete every note in it and, by cascade, their "
+        "passages. An empty or omitted scope is refused with 400 unless "
+        "root_scope=true is sent, in which case scope must be empty or "
+        "omitted and the root (empty) scope is the one deleted. A scope with "
+        "no notes is not an error: the response is 200 with zero counts."
+    ),
+    operation_id="deleteScope",
+    responses={
+        400: {
+            "description": (
+                "scope is empty or omitted without root_scope=true, or "
+                "root_scope=true was combined with a non-empty scope."
+            )
+        },
+    },
+)
+@observe(name="scope-delete", capture_input=False, capture_output=False)
+def delete_scope(
+    scope: str | None = Query(
+        None, max_length=512, description="Scope to delete. Omit or leave empty only with root_scope=true."
+    ),
+    root_scope: bool = Query(
+        False,
+        description=(
+            "Must be true to delete the root (empty) scope; then scope must "
+            "be empty or omitted."
+        ),
+    ),
+    db: Session = Depends(get_db),
+    client: ApiKey = Depends(get_current_client),
+) -> DeleteNotesResponse:
+    # The root scope ("") is real data -- an ingest without a scope lands
+    # there -- and a client that builds this URL from a variable which turned
+    # out empty would otherwise erase it. Nobody attends this service, so the
+    # only guard is this one: the destructive default has to be spelled out.
+    # Both checks run before any statement, so a refusal touches nothing.
+    if root_scope:
+        if scope:
+            raise HTTPException(status_code=400, detail=ROOT_SCOPE_CONFLICT_DETAIL)
+    elif not scope:
+        raise HTTPException(status_code=400, detail=SCOPE_REQUIRED_DETAIL)
+
+    repo = NoteRepository(db, client_name=client.client_name)
+    deleted, passages_deleted = repo.delete_scope(scope or "")
+    # No 404 for an empty scope: "nothing to delete" is the state the caller
+    # asked for, and 200 with zero counts keeps a retry after a partial
+    # failure idempotent. It is tenant-scoped, so it cannot reveal another
+    # tenant's scope either.
+    db.commit()
+    return _delete_response(deleted, passages_deleted)
+
+
+def _delete_response(deleted: list[RepoDeletedNote], passages_deleted: int) -> DeleteNotesResponse:
+    # Mapped field by field to the DTO, like get_note.
+    return DeleteNotesResponse(
+        notes_deleted=len(deleted),
+        passages_deleted=passages_deleted,
+        notes=[
+            DeletedNote(
+                note_id=note.note_id,
+                path_or_uri=note.path_or_uri,
+                content_hash=note.content_hash,
+            )
+            for note in deleted
+        ],
+    )

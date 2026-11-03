@@ -67,3 +67,32 @@ class NoteResponse(BaseModel):
     )
     created_at: datetime = Field(..., description="Timestamp when the note was created.")
     updated_at: datetime = Field(..., description="Timestamp when the note was last updated.")
+
+
+class DeletedNote(BaseModel):
+    """Identity of one note a delete removed."""
+
+    note_id: int = Field(..., description="Id the note had before it was deleted.")
+    path_or_uri: str = Field(
+        ...,
+        description="Path or URI the note had within its scope.",
+        examples=["docs/architecture/adr-001.md"],
+    )
+    content_hash: str = Field(
+        ...,
+        description="Content hash the note had when it was deleted.",
+    )
+
+
+class DeleteNotesResponse(BaseModel):
+    """Result of deleting a note by path, or a whole scope."""
+
+    notes_deleted: int = Field(..., description="Number of notes removed.")
+    passages_deleted: int = Field(
+        ...,
+        description="Number of passages removed along with those notes.",
+    )
+    notes: list[DeletedNote] = Field(
+        ...,
+        description="Every note removed, so a caller can reconcile its own index.",
+    )
