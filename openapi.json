@@ -211,10 +211,81 @@
           }
         }
       }
+    },
+    "/ready": {
+      "get": {
+        "tags": [
+          "Ops"
+        ],
+        "summary": "Readiness probe",
+        "description": "Reports whether PostgreSQL and the embedding backend can serve, within a hard time bound. Unlike `/health` (liveness) this contacts the dependencies. 200 `ready` or 200 `degraded` (the embedding backend is down but the database works); 503 `not_ready` when the database is down. Alert when `status` is not `ready`; `checks.embedding_backend.status` names the failing dependency.",
+        "operationId": "readiness",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessReport"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The database is unavailable (`not_ready`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessReport"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
     "schemas": {
+      "DatabaseCheck": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "fail",
+              "timeout"
+            ],
+            "title": "Status",
+            "description": "`ok`: a trivial query succeeded. `fail`: the database could not be reached or the query errored. `timeout`: no answer within READY_DB_TIMEOUT_S."
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "DatabaseCheck"
+      },
+      "EmbeddingBackendCheck": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "fail",
+              "timeout",
+              "not_checked"
+            ],
+            "title": "Status",
+            "description": "`ok`: Ollama answered and the configured model is pulled. `fail`: unreachable, or the model is missing. `timeout`: no answer within READY_EMBEDDING_TIMEOUT_S. `not_checked`: the `local` backend runs in-process, so there is nothing remote to probe."
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "EmbeddingBackendCheck"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -483,6 +554,45 @@
         ],
         "title": "NoteResponse",
         "description": "Response containing a note and its passage count."
+      },
+      "ReadinessChecks": {
+        "properties": {
+          "database": {
+            "$ref": "#/components/schemas/DatabaseCheck"
+          },
+          "embedding_backend": {
+            "$ref": "#/components/schemas/EmbeddingBackendCheck"
+          }
+        },
+        "type": "object",
+        "required": [
+          "database",
+          "embedding_backend"
+        ],
+        "title": "ReadinessChecks"
+      },
+      "ReadinessReport": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "degraded",
+              "not_ready"
+            ],
+            "title": "Status",
+            "description": "`ready`: everything is fine. `degraded`: the database works but the embedding backend does not (HTTP 200, so replicas stay in rotation; alert on this field). `not_ready`: the database is down (HTTP 503)."
+          },
+          "checks": {
+            "$ref": "#/components/schemas/ReadinessChecks"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "checks"
+        ],
+        "title": "ReadinessReport"
       },
       "SearchRequest": {
         "properties": {

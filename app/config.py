@@ -75,6 +75,20 @@ class Settings(BaseSettings):
     # timeout on a CPU Ollama and bounds how long ingest holds its row lock.
     embed_batch_size: int = 16
 
+    # Readiness probe (GET /ready). Each dependency check is given this long
+    # before the response reports it as "timeout"; the two run in parallel, so
+    # the endpoint answers within max(READY_DB_TIMEOUT_S, READY_EMBEDDING_TIMEOUT_S)
+    # plus a small overhead. 2 s sits under a typical orchestrator probe
+    # timeout (kubelet and Docker both default to 1-3 s), so a hung dependency
+    # produces a "timeout" body rather than a probe that gave up first.
+    ready_db_timeout_s: float = 2.0
+    ready_embedding_timeout_s: float = 2.0
+    # How long a finished check result is reused. Probes arrive from several
+    # replicas' orchestrators and monitors at once; without this each one would
+    # open a database connection and hit Ollama. 0 disables reuse of a finished
+    # result (a check that is still running is always shared regardless).
+    ready_cache_ttl_s: float = 5.0
+
     # langfuse:
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
@@ -224,6 +238,29 @@ class Settings(BaseSettings):
                 "EMBED_BATCH_SIZE must be in range 1..256, got "
                 f"{self.embed_batch_size}; 0 would never advance through the "
                 "texts and a huge batch defeats the per-request timeout bound"
+            )
+        return self
+
+    # Bounded for the same reason as the knobs above: the readiness endpoint is
+    # unauthenticated, so a typo must not turn it into an unbounded wait (a
+    # huge timeout) or a check-per-request amplifier (a negative TTL is
+    # meaningless; 0 is the supported way to switch reuse off). The 10 s and
+    # 60 s ceilings are misconfiguration guards, well past any sane probe.
+    @model_validator(mode="after")
+    def _readiness_knobs_must_be_in_range(self) -> "Settings":
+        for name, value in (
+            ("READY_DB_TIMEOUT_S", self.ready_db_timeout_s),
+            ("READY_EMBEDDING_TIMEOUT_S", self.ready_embedding_timeout_s),
+        ):
+            # isfinite first: NaN compares false against everything.
+            if not (math.isfinite(value) and 0 < value <= 10):
+                raise ValueError(f"{name} must satisfy 0 < x <= 10, got {value}")
+        if not (
+            math.isfinite(self.ready_cache_ttl_s) and 0 <= self.ready_cache_ttl_s <= 60
+        ):
+            raise ValueError(
+                "READY_CACHE_TTL_S must satisfy 0 <= x <= 60, got "
+                f"{self.ready_cache_ttl_s}; 0 disables reuse of a finished result"
             )
         return self
 

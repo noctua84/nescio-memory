@@ -145,10 +145,51 @@ curl http://localhost:8000/health
 nothing. To check it against what the model really emits, see
 [Checking the dimension](#checking-the-dimension).
 
+### `GET /ready`
+
+Readiness probe. Where `/health` asks "is the process alive?" and contacts nothing, `/ready` asks
+"can it serve right now?" and checks PostgreSQL (`SELECT 1` under a statement timeout) and the
+embedding backend (Ollama `POST /api/show` for `OLLAMA_MODEL`, which proves the server is up and
+the model is pulled without loading it; the `local` backend runs in-process and reports
+`not_checked`). Use `/health` for restart decisions and `/ready` for traffic and monitoring: a
+dead dependency should take a replica out of rotation, not get it killed.
+
+```bash
+curl -i http://localhost:8000/ready
+# HTTP/1.1 200 OK
+# {"status":"ready","checks":{"database":{"status":"ok"},
+#  "embedding_backend":{"status":"ok"}}}
+```
+
+| Overall `status` | HTTP | Meaning                                                               |
+| ---------------- | ---- | --------------------------------------------------------------------- |
+| `ready`          | 200  | database `ok`; embedding backend `ok` or `not_checked`                 |
+| `degraded`       | 200  | database `ok`, embedding backend `fail` or `timeout`                   |
+| `not_ready`      | 503  | database `fail` or `timeout`                                           |
+
+Each check reports `ok`, `fail` or `timeout` (`not_checked` for the `local` embedding backend).
+Neither the exception text nor any host name is returned; the detail is logged at `WARNING`.
+
+An Ollama outage is deliberately `200 degraded`, not `503`: Ollama is shared by every replica, so
+failing readiness on it would eject all of them at once, and search already degrades to keyword
+results without it. The consequence is that an orchestrator only ever sees the `200`, so
+**alert on `status` not being `ready`**, and read `checks.embedding_backend.status` to see which
+dependency failed.
+
+The probe is safe to poll hard and is unauthenticated (no `X-API-Key`):
+
+- The response arrives within `max(READY_DB_TIMEOUT_S, READY_EMBEDDING_TIMEOUT_S)` plus a small
+  overhead, even if a dependency hangs; a check that has not answered by then reports `timeout`.
+- At most one check per dependency is ever in flight. Concurrent requests share it, and a hung
+  dependency keeps one background thread busy until its own connect or HTTP timeout fires instead
+  of piling up connections.
+- A finished result is reused for `READY_CACHE_TTL_S`, so a readiness failure can take up to that
+  long to be reported and to clear.
+
 ### Authentication
 
-Every route under `/api/v1` requires an `X-API-Key` header. `GET /health` does not, so a liveness
-probe needs no credentials.
+Every route under `/api/v1` requires an `X-API-Key` header. `GET /health` and `GET /ready` do not,
+so a liveness or readiness probe needs no credentials.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/search \
@@ -193,8 +234,8 @@ Design rationale and the retrieval-quality baseline live in
 The routes are tagged `Ingest`, `Notes` and `Search` in the OpenAPI document, with operation ids
 `ingestNote`, `getNote`, `deleteNote` and `searchPassages`.
 
-Every `/api/v1` route except `GET /health` requires the `X-API-Key` header, and all data is
-tenant-scoped by it.
+Every `/api/v1` route requires the `X-API-Key` header (only `GET /health` and `GET /ready`, which
+sit outside `/api/v1`, do not), and all data is tenant-scoped by it.
 
 #### `POST /api/v1/ingest`
 
@@ -403,6 +444,9 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `QUERY_INSTRUCTION`   | *(Qwen3 retrieval instruction)*             | prefix added to **query** embeddings only, never to passages, for instruction-tuned models such as Qwen3-Embedding; empty string disables it. Set `QUERY_INSTRUCTION=""` for a model that is not instruction-tuned (the `local` backend's sentence-transformers model, or any non-Qwen3 Ollama model): the prefix is applied to queries only and would skew ranking |
 | `QUERY_EMBED_TIMEOUT_S` | `15`                                      | seconds a search waits to embed the query, `0 < x <= 30`; on a transient failure the search degrades to keyword-only (`degraded: true`). The default covers a cold model load: Ollama unloads an idle model after its `keep_alive` (5 minutes by default), so the first search after an idle period waits for a reload. A startup warm-up would not help, since it only covers the first load after a deploy; to avoid the reload, set `OLLAMA_KEEP_ALIVE` on the Ollama server. A longer wait does not hold a database connection |
 | `EMBED_BATCH_SIZE`    | `16`                                        | passages per `/api/embed` call at ingest, `1..256` |
+| `READY_DB_TIMEOUT_S`  | `2.0`                                       | seconds `GET /ready` waits for the database check before reporting `timeout`, `0 < x <= 10`; see [`GET /ready`](#get-ready) |
+| `READY_EMBEDDING_TIMEOUT_S` | `2.0`                                 | seconds `GET /ready` waits for the Ollama check before reporting `timeout`, `0 < x <= 10` |
+| `READY_CACHE_TTL_S`   | `5.0`                                       | seconds a finished readiness result is reused, `0 <= x <= 60`; `0` disables reuse (a check already running is still shared) |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
 
 ### Embedding backends
