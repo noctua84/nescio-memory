@@ -403,6 +403,10 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `QUERY_INSTRUCTION`   | *(Qwen3 retrieval instruction)*             | prefix added to **query** embeddings only, never to passages, for instruction-tuned models such as Qwen3-Embedding; empty string disables it. Set `QUERY_INSTRUCTION=""` for a model that is not instruction-tuned (the `local` backend's sentence-transformers model, or any non-Qwen3 Ollama model): the prefix is applied to queries only and would skew ranking |
 | `QUERY_EMBED_TIMEOUT_S` | `15`                                      | seconds a search waits to embed the query, `0 < x <= 30`; on a transient failure the search degrades to keyword-only (`degraded: true`). The default covers a cold model load: Ollama unloads an idle model after its `keep_alive` (5 minutes by default), so the first search after an idle period waits for a reload. A startup warm-up would not help, since it only covers the first load after a deploy; to avoid the reload, set `OLLAMA_KEEP_ALIVE` on the Ollama server. A longer wait does not hold a database connection |
 | `EMBED_BATCH_SIZE`    | `16`                                        | passages per `/api/embed` call at ingest, `1..256` |
+| `EMBED_RETRY_ATTEMPTS` | `3`                                        | tries per embedding call, the first included, `1..5`; `1` means no retry. Only transient failures are retried (timeouts, connection errors, HTTP 408/429/500/502/503/504); a bad response or a misconfiguration never is |
+| `EMBED_RETRY_BASE_DELAY_S` | `0.5`                                  | backoff before the first retry, `0 < x <= EMBED_RETRY_MAX_DELAY_S`; it doubles each retry and the actual wait is uniformly random below that (full jitter) |
+| `EMBED_RETRY_MAX_DELAY_S` | `4.0`                                   | longest single backoff, `0 < x <= 10`; also the cap on a `Retry-After` the embedding server sends with a 429 or 503 |
+| `EMBED_RETRY_BUDGET`  | `2`                                         | retries shared by **all** calls of one ingest request, `0..10`; `0` disables retry. See "Ingestion retries" under Current limitations for the worst-case bound |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
 
 ### Embedding backends
@@ -617,9 +621,19 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
   `Exception`, so any genuinely unanticipated failure still surfaces as plain-text
   `Internal Server Error` rather than JSON, and a client still cannot rely on parsing
   `detail` from every error.
-- **Ingestion has no retry or backoff.** Passages are embedded through Ollama's `/api/embed` in
-  groups of `EMBED_BATCH_SIZE`, but a failed call is not retried; the request fails and the client
-  re-sends it.
+- **Ingestion retries transient embedding failures, within a fixed bound.** Passages are embedded
+  through Ollama's `/api/embed` in groups of `EMBED_BATCH_SIZE`. A call that fails with a timeout,
+  a connection error or HTTP 408/429/500/502/503/504 is retried with exponential backoff and full
+  jitter (`EMBED_RETRY_BASE_DELAY_S`, doubling, capped at `EMBED_RETRY_MAX_DELAY_S`; a `Retry-After`
+  from a 429 or 503 is honoured up to that cap), at most `EMBED_RETRY_ATTEMPTS` tries per group.
+  A bad response or a misconfiguration is never retried. The retries are drawn from one pool of
+  `EMBED_RETRY_BUDGET` per request, shared by all groups, so a large note cannot retry once per
+  group. Ingest holds a row lock while it embeds, so the worst case is stated: the lock is held
+  at most `EMBED_RETRY_BUDGET × (30 s + EMBED_RETRY_MAX_DELAY_S)` longer than a request that never
+  retries (defaults: `2 × (30 + 4) = 68 s`), whatever the note's size. When the budget runs out
+  the request fails with `503` as before and the client re-sends it. A search retries at most
+  once and only inside `QUERY_EMBED_TIMEOUT_S`; if that is not enough it degrades to keyword-only
+  as before.
 - **There is no list or export route.** No enumeration, no fetch-by-path: a note is reachable
   by id (`GET /api/v1/notes/{id}`) or as passages through a search that matched it. This is an
   architectural property and **not a security boundary**: there is no rate limiting, so bulk

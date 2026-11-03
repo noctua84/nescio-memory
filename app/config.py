@@ -74,6 +74,13 @@ class Settings(BaseSettings):
     # Texts per /api/embed request. Bounds each request under the 30 s ingest
     # timeout on a CPU Ollama and bounds how long ingest holds its row lock.
     embed_batch_size: int = 16
+    # Retry of transient embedding failures (see app.core.retry). Attempts are
+    # per sub-batch; the budget is shared by all sub-batches of one request,
+    # which is what bounds the ingest lock hold however large the note is.
+    embed_retry_attempts: int = 3
+    embed_retry_base_delay_s: float = 0.5
+    embed_retry_max_delay_s: float = 4.0
+    embed_retry_budget: int = 2
 
     # langfuse:
     langfuse_public_key: str = ""
@@ -224,6 +231,40 @@ class Settings(BaseSettings):
                 "EMBED_BATCH_SIZE must be in range 1..256, got "
                 f"{self.embed_batch_size}; 0 would never advance through the "
                 "texts and a huge batch defeats the per-request timeout bound"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _embed_retry_knobs_must_be_in_range(self) -> "Settings":
+        if not 1 <= self.embed_retry_attempts <= 5:
+            raise ValueError(
+                "EMBED_RETRY_ATTEMPTS must be in range 1..5, got "
+                f"{self.embed_retry_attempts}; 1 means no retry and 0 would "
+                "never make the first attempt"
+            )
+        if not (
+            math.isfinite(self.embed_retry_max_delay_s)
+            and 0 < self.embed_retry_max_delay_s <= 10
+        ):
+            raise ValueError(
+                "EMBED_RETRY_MAX_DELAY_S must satisfy 0 < x <= 10, got "
+                f"{self.embed_retry_max_delay_s}; it is part of the ingest "
+                "lock-hold bound"
+            )
+        if not (
+            math.isfinite(self.embed_retry_base_delay_s)
+            and 0 < self.embed_retry_base_delay_s <= self.embed_retry_max_delay_s
+        ):
+            raise ValueError(
+                "EMBED_RETRY_BASE_DELAY_S must satisfy 0 < x <= "
+                f"EMBED_RETRY_MAX_DELAY_S ({self.embed_retry_max_delay_s}), got "
+                f"{self.embed_retry_base_delay_s}"
+            )
+        if not 0 <= self.embed_retry_budget <= 10:
+            raise ValueError(
+                "EMBED_RETRY_BUDGET must be in range 0..10, got "
+                f"{self.embed_retry_budget}; 0 disables retry, and the budget "
+                "bounds how much longer ingest holds its row lock"
             )
         return self
 
