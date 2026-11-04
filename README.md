@@ -507,6 +507,10 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `READY_DB_TIMEOUT_S`  | `2.0`                                       | seconds `GET /ready` waits for the database check before reporting `timeout`, `0 < x <= 10`; see [`GET /ready`](#get-ready) |
 | `READY_EMBEDDING_TIMEOUT_S` | `2.0`                                 | seconds `GET /ready` waits for the Ollama check before reporting `timeout`, `0 < x <= 10` |
 | `READY_CACHE_TTL_S`   | `5.0`                                       | seconds a finished readiness result is reused, `0 <= x <= 60`; `0` disables reuse (a check already running is still shared) |
+| `EMBED_RETRY_ATTEMPTS` | `3`                                        | tries per embedding call, the first included, `1..5`; `1` means no retry. Only transient failures are retried (timeouts, connection errors, HTTP 408/429/500/502/503/504); a bad response or a misconfiguration never is |
+| `EMBED_RETRY_BASE_DELAY_S` | `0.5`                                  | backoff before the first retry, `0 < x <= EMBED_RETRY_MAX_DELAY_S`; it doubles each retry and the actual wait is uniformly random below that (full jitter) |
+| `EMBED_RETRY_MAX_DELAY_S` | `4.0`                                   | longest single backoff, `0 < x <= 10`; also the cap on a `Retry-After` the embedding server sends with a 429 or 503 |
+| `EMBED_RETRY_BUDGET`  | `2`                                         | retries shared by **all** calls of one ingest request, `0..10`; `0` disables retry. See "Ingestion retries" under Current limitations for the worst-case bound |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
 
 ### Logging
@@ -749,9 +753,19 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
 - **Langfuse keys in `.env` are ignored.** `@observe` relies on the SDK reading `LANGFUSE_*` from
   the process environment, and pydantic-settings does not export `.env` values into it. Export the
   keys in your shell or service manager, or tracing silently stays off.
-- **Ingestion has no retry or backoff.** Passages are embedded through Ollama's `/api/embed` in
-  groups of `EMBED_BATCH_SIZE`, but a failed call is not retried; the request fails and the client
-  re-sends it.
+- **Ingestion retries transient embedding failures, within a fixed bound.** Passages are embedded
+  through Ollama's `/api/embed` in groups of `EMBED_BATCH_SIZE`. A call that fails with a timeout,
+  a connection error or HTTP 408/429/500/502/503/504 is retried with exponential backoff and full
+  jitter (`EMBED_RETRY_BASE_DELAY_S`, doubling, capped at `EMBED_RETRY_MAX_DELAY_S`; a `Retry-After`
+  from a 429 or 503 is honoured up to that cap), at most `EMBED_RETRY_ATTEMPTS` tries per group.
+  A bad response or a misconfiguration is never retried. The retries are drawn from one pool of
+  `EMBED_RETRY_BUDGET` per request, shared by all groups, so a large note cannot retry once per
+  group. Ingest holds a row lock while it embeds, so the worst case is stated: the lock is held
+  at most `EMBED_RETRY_BUDGET × (30 s + EMBED_RETRY_MAX_DELAY_S)` longer than a request that never
+  retries (defaults: `2 × (30 + 4) = 68 s`), whatever the note's size. When the budget runs out
+  the request fails with `503` as before and the client re-sends it. A search retries at most
+  once and only inside `QUERY_EMBED_TIMEOUT_S`; if that is not enough it degrades to keyword-only
+  as before.
 - **There is no list or export route.** No enumeration, no fetch-by-path: a note is reachable
   by id (`GET /api/v1/notes/{id}`) or as passages through a search that matched it. This is an
   architectural property and **not a security boundary**: there is no rate limiting, so bulk

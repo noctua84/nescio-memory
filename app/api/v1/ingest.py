@@ -108,7 +108,10 @@ def ingest_note(
     # delete with the other's insert.
     #
     # The cost is lock hold time of about ceil(passages / embed_batch_size)
-    # embedding round-trips -- one per sub-batch, not one per passage. It is acceptable
+    # embedding round-trips -- one per sub-batch, not one per passage -- plus,
+    # when the backend is flaky, the retries: at most EMBED_RETRY_BUDGET of them
+    # for the whole note (shared across sub-batches), each costing up to one
+    # 30 s call and EMBED_RETRY_MAX_DELAY_S of backoff. It is acceptable
     # because the lock is per NOTE identity and the only contender is another
     # ingest of that same note, which has nothing useful to do concurrently
     # anyway; reads never take this lock.
@@ -171,6 +174,8 @@ def ingest_note(
     # Embedding failures (EmbeddingBackendError) propagate uncaught and are
     # mapped to 503 + Retry-After by app/core/errors.py. No commit has
     # happened yet, so a failure here leaves the previous passages intact.
+    # Transient ones were already retried inside get_embeddings, within the
+    # budget described above the lock.
     count = repo.replace_passages(note_id, request.scope, rows)
 
     db.commit()  # single transaction boundary for the whole note

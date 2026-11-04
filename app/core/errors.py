@@ -45,6 +45,10 @@ class EmbeddingBackendError(RuntimeError):
     status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     detail = "Embedding backend unavailable"
     retry_after = True
+    # Seconds the backend asked us to wait (a Retry-After header on a 429/503),
+    # for the in-process retry in app.core.retry. Not the client-facing
+    # Retry-After above, which is the fixed RETRY_AFTER_SECONDS.
+    backoff_hint_s: float | None = None
 
 
 class EmbeddingBackendBadResponse(EmbeddingBackendError):
