@@ -381,6 +381,38 @@ an error: the keyword branch contributes nothing and the vector branch still ans
 response is a `200` with semantic matches (and an empty `results` only if the caller holds no
 passages).
 
+### Error responses
+
+Errors from `/api/v1` carry a JSON body, `{"detail": ...}`. Except for `422`, `detail` is a string: a
+fixed message for each failure below, never an exception message.
+
+| Status | `detail` | Retry-After (seconds) | When |
+| ------ | -------- | --------------------- | ---- |
+| 400 | `Request contains data the database cannot accept` | none | The database rejected a value, such as a NUL byte in text. |
+| 400 | `path_or_uri must be a relative path without '..', or an absolute URI` | none | `POST /api/v1/ingest` with an absolute path or a `..` component. |
+| 400 | `content is too large: N characters exceeds the 500000 limit.` | none | `POST /api/v1/ingest` with `content` over 500,000 characters. `N` is the submitted length. |
+| 400 | `Invalid Content-Length header.` | none | Any `/api/v1` route, with a `Content-Length` that is not a non-negative integer. Rejected before authentication. |
+| 401 | `Missing API key` | none | The `X-API-Key` header is absent. |
+| 401 | `Invalid or revoked API key` | none | The key is unknown or revoked. |
+| 404 | `Note not found` | none | `GET` or `DELETE /api/v1/notes/{id}` for a note that does not exist, or belongs to another client. |
+| 413 | `Request body too large: limit is 8388608 bytes.` | none | Any `/api/v1` route, with a body over the limit. Rejected before authentication. |
+| 422 | list of error objects | none | Request validation failed. Each object has `loc`, `msg` and `type`. |
+| 500 | `Embedding backend is misconfigured` | none | The embedding backend cannot work as deployed. Retrying will not help; the deployment must change. |
+| 500 | `Internal server error` | none | An unanticipated failure. The traceback is in the server log. |
+| 503 | `Database unavailable` | 30 | The database cannot be reached. |
+| 503 | `Query exceeded time limit` | none | A query was cancelled, in practice by the search `statement_timeout` (`STATEMENT_TIMEOUT_MS`). |
+| 503 | `Embedding backend unavailable` | 30 | The embedding backend cannot be reached, timed out, or answered with a transient HTTP status. |
+| 503 | `Embedding backend returned an unexpected response` | 30 | The embedding backend answered with something that is not a usable vector. |
+
+Retry-After is sent only when a retry can succeed. A dependency that is down may recover, so the 30
+seconds is a hint to back off, not a promise. A bad request, a misconfiguration and a bug fail the
+same way on every retry, so their responses carry no header.
+
+A transient embedding failure is handled differently by the two routes that embed. `POST /api/v1/ingest`
+returns the `503` above. `POST /api/v1/search` answers `200` with full-text results and
+`degraded: true` instead (see `degraded` under `POST /api/v1/search`). A bad response or a
+misconfiguration is not degraded on either route.
+
 ## Upgrading to 0.6.0
 
 0.6.0 is a breaking release.
