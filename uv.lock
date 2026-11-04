@@ -819,6 +819,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "langfuse" },
+    { name = "opentelemetry-api" },
     { name = "pgvector" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic" },
@@ -837,6 +838,7 @@ local-embeddings = [
 [package.dev-dependencies]
 dev = [
     { name = "openapi-spec-validator" },
+    { name = "opentelemetry-sdk" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "pyyaml" },
@@ -849,6 +851,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "langfuse", specifier = "==5.0.4" },
+    { name = "opentelemetry-api", specifier = ">=1.45.1" },
     { name = "pgvector", specifier = ">=0.5.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2.13.5" },
@@ -864,6 +867,7 @@ provides-extras = ["local-embeddings"]
 [package.metadata.requires-dev]
 dev = [
     { name = "openapi-spec-validator", specifier = ">=0.9.0" },
+    { name = "opentelemetry-sdk", specifier = ">=1.45.1" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },

@@ -396,7 +396,10 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `LANGFUSE_SECRET_KEY` | *(empty → tracing off)*                     |                                                      |
 | `LANGFUSE_HOST`       | `https://cloud.langfuse.com`                | Langfuse instance                                    |
 | `APP_NAME`            | `Nescio Semantic Memory API`                | title shown in the OpenAPI docs                      |
-| `LOG_LEVEL`           | `INFO`                                      | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL` |
+| `LOG_LEVEL`           | `INFO`                                      | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL` (case-insensitive; anything else fails at startup); applies to the `app.*` and `uvicorn.*` loggers, the root logger stays at `WARNING` so httpx and SQLAlchemy stay quiet — see [Logging](#logging) |
+| `LOG_FORMAT`          | `json`                                      | `json` (one OpenTelemetry-shaped object per line, for a collector) or `text` (human-readable, for a local terminal); any other value fails at startup |
+| `OTEL_SERVICE_NAME`   | *(unset → `APP_NAME`)*                      | `service.name` on every log line. **Process environment only**, not read from `.env`, like `LANGFUSE_*`: Langfuse's tracer reads it from the process environment too, so logs and traces carry one service identity |
+| `OTEL_RESOURCE_ATTRIBUTES` | *(unset)*                              | extra resource fields on every log line, as comma-separated `key=value` pairs (percent-decoded); `service.name` and `service.version` inside it are honoured. A malformed entry is skipped with one warning. **Process environment only**, not read from `.env` |
 | `SEARCH_CANDIDATES`   | `50`                                        | candidates each search branch (keyword, vector) contributes before fusion; `1..1000`; the effective number is `max(SEARCH_CANDIDATES, top_k)` |
 | `RRF_K`               | `60`                                        | reciprocal-rank-fusion damping constant, `>= 1`; a passage scores `weight / (RRF_K + rank)` per branch |
 | `FTS_WEIGHT` / `VECTOR_WEIGHT` | `1.0` / `1.0`                      | per-branch multipliers on the fused score, finite and `>= 0`; `0` switches that branch off (`VECTOR_WEIGHT=0` is the keyword-only baseline); both `0` is rejected at startup |
@@ -404,6 +407,40 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `QUERY_EMBED_TIMEOUT_S` | `15`                                      | seconds a search waits to embed the query, `0 < x <= 30`; on a transient failure the search degrades to keyword-only (`degraded: true`). The default covers a cold model load: Ollama unloads an idle model after its `keep_alive` (5 minutes by default), so the first search after an idle period waits for a reload. A startup warm-up would not help, since it only covers the first load after a deploy; to avoid the reload, set `OLLAMA_KEEP_ALIVE` on the Ollama server. A longer wait does not hold a database connection |
 | `EMBED_BATCH_SIZE`    | `16`                                        | passages per `/api/embed` call at ingest, `1..256` |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
+
+### Logging
+
+Every record goes to **stdout** as one line of JSON (`LOG_FORMAT=json`, the default): from the
+`app.*` loggers and from `uvicorn.error` and `uvicorn.access`. A traceback is one escaped string
+inside the line, never several lines. Fields:
+
+| Field | Value |
+| ----- | ----- |
+| `timestamp` | ISO 8601, UTC, milliseconds, `Z` suffix |
+| `level`, `severity_number` | `DEBUG` 5, `INFO` 9, `WARNING` 13, `ERROR` 17, `CRITICAL` 21 (OpenTelemetry severity numbers; a level in between maps to the nearest lower one) |
+| `logger`, `message` | the logger name and the formatted message |
+| `service.name`, `service.version` | see `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` above; the version is the project version |
+| `trace_id`, `span_id` | 32 and 16 hex characters, present only while an OpenTelemetry span is active |
+| `exception.type`, `exception.message`, `exception.stacktrace` | present when an exception is logged |
+| anything passed as `extra=` | emitted as its own field |
+
+Request logs from `uvicorn.access` carry `http.request.method`, `url.path`, `http.response.status_code`,
+`client.address` and `client.port`, plus a message rebuilt from them. **The query string is dropped**:
+it can carry a note path or a search term, so the raw uvicorn message is never emitted. Request
+bodies, note content, paths and API keys are not logged, and the keys `content`, `body`, `q`,
+`query`, `api_key`, `x_api_key`, `headers` and `path_or_uri` are replaced with `[redacted]` if a call
+site ever passes them.
+
+**Delivery is stdout only.** To get the records into Dash0 (or any OpenTelemetry backend), point a
+collector's `filelog` receiver at the container's stdout. There is deliberately no OTLP log
+exporter: exporting as well would deliver every record twice.
+
+**Trace correlation.** `trace_id` and `span_id` come from `opentelemetry.trace.get_current_span()`.
+Inside a route decorated with Langfuse's `@observe`, that is the Langfuse span (checked against
+langfuse 5.0.4: a valid, recording span with real ids) **when the `LANGFUSE_*` keys are set**. With
+the keys unset, or with `LANGFUSE_TRACING_ENABLED=false`, Langfuse hands out a non-recording span
+with an invalid (all-zero) context, so the log lines carry no `trace_id`/`span_id`. That is correct,
+since there is no trace to link to, but it means correlation needs Langfuse tracing switched on.
 
 ### Embedding backends
 
