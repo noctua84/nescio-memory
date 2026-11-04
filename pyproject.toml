@@ -31,6 +31,12 @@ dependencies = [
 local-embeddings = [
     "sentence-transformers==6.2.0",
 ]
+# The stdio MCP server in nescio_mcp/, run from a checkout. Opt-in because the
+# API does not need it:
+#   uv run --extra mcp python -m nescio_mcp
+mcp = [
+    "mcp==2.3.0",
+]
 
 [dependency-groups]
 dev = [
