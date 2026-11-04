@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 from app.api.v1.router import api_router
 from app.config import settings
@@ -8,6 +8,7 @@ from app.core.body_limit import BodySizeLimitMiddleware
 from app.core.db import get_engine
 from app.core.errors import register_exception_handlers
 from app.core.log_config import configure_logging
+from app.core.readiness import ReadinessReport, run_checks
 from app.core.schema_checks import (
     verify_embedding_dimension,
     verify_migration_head,
@@ -72,6 +73,39 @@ def create_app() -> FastAPI:
             # number comes from scripts/check_embedding_dimension.py.
             "embedding_dimension": settings.embedding_dimension,
         }
+
+    # Readiness, the counterpart to /health above. Unauthenticated on purpose
+    # (an orchestrator probe carries no key) and outside the /api/v1 router.
+    # Unlike /health it does contact PostgreSQL and Ollama, which is safe only
+    # because run_checks bounds the wait and keeps one check per dependency in
+    # flight. A sync route: the work is blocking waits on futures, which FastAPI
+    # runs in its threadpool.
+    @app.get(
+        "/ready",
+        tags=["Ops"],
+        operation_id="readiness",
+        summary="Readiness probe",
+        description=(
+            "Reports whether PostgreSQL and the embedding backend can serve, "
+            "within a hard time bound. Unlike `/health` (liveness) this contacts "
+            "the dependencies. 200 `ready` or 200 `degraded` (the embedding "
+            "backend is down but the database works); 503 `not_ready` when the "
+            "database is down. Alert when `status` is not `ready`; "
+            "`checks.embedding_backend.status` names the failing dependency."
+        ),
+        response_model=ReadinessReport,
+        responses={
+            503: {
+                "model": ReadinessReport,
+                "description": "The database is unavailable (`not_ready`).",
+            }
+        },
+    )
+    def ready(response: Response) -> ReadinessReport:
+        report = run_checks()
+        if report.status == "not_ready":
+            response.status_code = 503
+        return report
 
     return app
 
