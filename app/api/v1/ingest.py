@@ -1,10 +1,8 @@
-import re
-from pathlib import Path
-
 from fastapi import APIRouter, Depends, HTTPException
 from langfuse import observe
 from sqlalchemy.orm import Session
 
+from app.api.v1.validation import validate_path_or_uri
 from app.core.db import get_db
 from app.core.embeddings import get_embeddings
 from app.core.pipeline import content_hash, embedding_input, fts_lead_a, fts_lead_c, pipeline_version
@@ -33,29 +31,6 @@ MAX_CONTENT_CHARS = 500_000
 # before the body is ever buffered or parsed, including for unauthenticated
 # clients; MAX_CONTENT_CHARS below is a separate, later check that bounds the
 # decoded character count once the JSON body has been parsed.
-
-_URI_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://")
-
-
-def _validate_path_or_uri(path_or_uri: str) -> None:
-    """Accept any URI as-is; reject an absolute path or one with '..'.
-
-    A value matching ``scheme://`` is treated as a URI and is not subject to
-    the path rule at all. Anything else is a path, stored and reflected back
-    the same way the removed learnings API's file_path was, so it gets the
-    same rule: no leading '/'
-    and no '..' path component.
-    """
-    if _URI_RE.match(path_or_uri):
-        return
-    if path_or_uri.startswith("/") or ".." in Path(path_or_uri).parts:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "path_or_uri must be a relative path without '..', or an "
-                "absolute URI"
-            ),
-        )
 
 
 def _validate_content_size(content: str) -> None:
@@ -89,7 +64,7 @@ def ingest_note(
     client: ApiKey = Depends(get_current_client),
 ) -> IngestResponse:
     # Both validations run before anything is written or deleted.
-    _validate_path_or_uri(request.path_or_uri)
+    validate_path_or_uri(request.path_or_uri)
     _validate_content_size(request.content)
 
     result = split_note(request.content)
