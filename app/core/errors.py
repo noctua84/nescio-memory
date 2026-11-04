@@ -19,7 +19,7 @@ import logging
 import psycopg.errors
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import DataError, OperationalError
+from sqlalchemy.exc import DataError, OperationalError, StatementError
 
 from app.config import settings
 
@@ -32,6 +32,7 @@ RETRY_AFTER_SECONDS = 30
 DATABASE_UNAVAILABLE_DETAIL = "Database unavailable"
 QUERY_TIMEOUT_DETAIL = "Query exceeded time limit"
 INVALID_DATA_DETAIL = "Request contains data the database cannot accept"
+INTERNAL_ERROR_DETAIL = "Internal server error"
 
 
 class EmbeddingBackendError(RuntimeError):
@@ -72,6 +73,62 @@ def _service_unavailable(detail: str, retry: bool = True) -> JSONResponse:
         content={"detail": detail},
         headers=headers,
     )
+
+
+def _withheld(sqlstate: object) -> str:
+    return f"driver message withheld (SQLSTATE {sqlstate or 'unknown'})"
+
+
+def _scrub_statement_errors(exc: BaseException) -> None:
+    """Strip user-supplied values from every SQLAlchemy error in exc's chain.
+
+    str() of a StatementError/DBAPIError (and so the log record's
+    exception.message and the last line of exception.stacktrace) can carry
+    bound SQL parameters, and bound parameters are note content, search terms
+    and paths. Two separate leaks, closed separately:
+
+    1. `[parameters: ...]`, which SQLAlchemy renders from the error's own
+       params. get_engine() already sets hide_parameters=True, which covers
+       every error the application's engine raises; setting the flag on the
+       instance here as well makes this handler independent of how the engine
+       was built (a script's, a test's) and of an error constructed by hand.
+    2. The driver's message. Postgres echoes offending values back, e.g.
+       `invalid input syntax for type integer: "<the value>"` or
+       `Key (path_or_uri)=(<the value>) already exists`, and SQLAlchemy copies
+       that text into the error's message. hide_parameters does not touch it.
+       It is replaced by the SQLSTATE; the exception class, the SQL statement
+       (placeholders, never values) and the traceback are kept, which is what
+       tells an operator where it came from.
+
+    Done in place, on the instance, rather than on a copy passed to the logger,
+    because Starlette re-raises after the 500 handler responds and uvicorn logs
+    the same object again: a scrubbed copy would leave that second log line
+    leaking. The chain is walked (__cause__, __context__) because
+    traceback.format_exception prints each link with its own str(). Narrow on
+    purpose: generic exceptions keep their message in the log (never in the
+    response); only errors that wrap a database call are rewritten.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, StatementError):
+            current.hide_parameters = True
+            orig = current.orig
+            if orig is not None:
+                sqlstate = getattr(orig, "sqlstate", None)
+                current.args = (
+                    f"({type(orig).__module__}.{type(orig).__qualname__}) "
+                    + _withheld(sqlstate),
+                )
+                # The driver error is usually also the wrapper's __cause__, so
+                # the walk would reach it anyway; rewriting it here as well
+                # covers a wrapper whose orig is not chained.
+                orig.args = (_withheld(sqlstate),)
+        pending.extend((current.__cause__, current.__context__))
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -182,6 +239,10 @@ def register_exception_handlers(app: FastAPI) -> None:
         # below is what keeps an internal-bug DataError visible to operators
         # instead of silently blamed on the client forever.
         sqlstate = getattr(exc.orig, "sqlstate", None)
+        # Before the exc_info below: this is the path the NUL-byte and
+        # invalid-text-representation cases take, where the driver message
+        # can quote the offending value.
+        _scrub_statement_errors(exc)
         # The response body says nothing specific; the log is the only place
         # the cause survives. Without exc_info, this handler would be less
         # debuggable than the unhandled 500 it replaced, and SQLSTATE alone
@@ -195,4 +256,38 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"detail": INVALID_DATA_DETAIL},
+        )
+
+    @app.exception_handler(Exception)
+    async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
+        # The catch-all. Without it an unanticipated failure surfaces as
+        # Starlette's plain-text "Internal Server Error", so a client could not
+        # rely on `detail` being parseable from every error. HTTPException and
+        # request validation keep FastAPI's own handlers (Starlette picks the
+        # nearest class in the MRO, and these are registered for subclasses),
+        # and the 503/400 mappings above are likewise unaffected.
+        #
+        # Starlette routes a handler registered for Exception (or 500) to
+        # ServerErrorMiddleware, not ExceptionMiddleware. That middleware sends
+        # this response and then re-raises (starlette/middleware/errors.py:
+        # "We always continue to raise the exception"), so uvicorn logs the
+        # traceback a second time. That duplicate is an accepted trade-off:
+        # suppressing it would mean swallowing the exception that servers and
+        # test clients rely on seeing, and a doubled traceback is cheaper than
+        # a lost one in a service nobody watches.
+        #
+        # The body is a constant, never str(exc): exception messages are for
+        # logs. No Retry-After either -- an unanticipated bug is not something
+        # a retry is known to fix, and advertising one would be untrue.
+        _scrub_statement_errors(exc)
+        logger.error(
+            "Unhandled %s on %s %s",
+            type(exc).__name__,
+            request.method,
+            request.url.path,
+            exc_info=exc,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": INTERNAL_ERROR_DETAIL},
         )
