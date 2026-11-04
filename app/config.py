@@ -106,6 +106,16 @@ class Settings(BaseSettings):
     # How long ingest_events rows are kept (scripts/prune_ingest_events.py).
     audit_retention_days: int = 400
 
+    # Per-tenant limits, enforced in Postgres so they hold across replicas (see
+    # app.core.rate_limit). No off switch: nobody attends this service, so the
+    # bounds are guarantees. Ingest slots held at once, per client:
+    rate_limit_ingest_concurrency: int = 2
+    # Retry-After on an ingest refused for want of a slot.
+    rate_limit_ingest_retry_after_s: int = 5
+    # Searches per client per fixed window of RATE_LIMIT_WINDOW_S seconds.
+    rate_limit_search_requests: int = 120
+    rate_limit_window_s: int = 60
+
     # langfuse:
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
@@ -348,6 +358,21 @@ class Settings(BaseSettings):
                 f"{self.audit_retention_days}; the prune script deletes on this "
                 "number, so a typo must not erase the record of who changed what"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _rate_limit_knobs_must_be_in_range(self) -> "Settings":
+        for name, value, low, high in (
+            ("RATE_LIMIT_INGEST_CONCURRENCY", self.rate_limit_ingest_concurrency, 1, 32),
+            ("RATE_LIMIT_INGEST_RETRY_AFTER_S", self.rate_limit_ingest_retry_after_s, 1, 60),
+            ("RATE_LIMIT_SEARCH_REQUESTS", self.rate_limit_search_requests, 1, 10000),
+            ("RATE_LIMIT_WINDOW_S", self.rate_limit_window_s, 1, 3600),
+        ):
+            if not low <= value <= high:
+                raise ValueError(
+                    f"{name} must be in range {low}..{high}, got {value}; the "
+                    "limits have no off switch, so 0 would refuse every request"
+                )
         return self
 
 

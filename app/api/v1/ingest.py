@@ -6,6 +6,7 @@ from app.api.v1.validation import validate_path_or_uri
 from app.core.db import get_db
 from app.core.embeddings import get_embeddings
 from app.core.pipeline import content_hash, embedding_input, fts_lead_a, fts_lead_c, pipeline_version
+from app.core.rate_limit import acquire_ingest_slot, rate_limited_response
 from app.core.security import get_current_client
 from app.core.splitter import split_note
 from app.core.tracing import annotate_span
@@ -58,6 +59,12 @@ def _validate_content_size(content: str) -> None:
         "unless force=True."
     ),
     operation_id="ingestNote",
+    responses={
+        429: rate_limited_response(
+            "All of this client's ingest slots are in use. A re-ingest that "
+            "would be skipped is never refused."
+        ),
+    },
 )
 @observe(name="note-ingestion", capture_input=False, capture_output=False)
 def ingest_note(
@@ -136,6 +143,12 @@ def _ingest(request: IngestRequest, db: Session, client: ApiKey) -> IngestRespon
         )
         db.commit()  # releases the lock; the event is the only write
         return IngestResponse(note_id=locked.id, passages=passages, skipped=True)
+
+    # After the skip check, so a skipped re-ingest never touches the limiter, and
+    # before the first write, so a refusal has nothing to undo: RateLimited rolls
+    # back, which releases the note lock and writes no event, because nothing
+    # changed. Held until the commit below, so embedding and its retries are inside.
+    acquire_ingest_slot(db, client.client_name)
 
     note_id = repo.upsert_note(
         request.scope,

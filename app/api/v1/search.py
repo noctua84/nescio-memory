@@ -14,6 +14,7 @@ from app.config import settings
 from app.core.db import get_db
 from app.core.embeddings import get_query_embedding
 from app.core.errors import EmbeddingBackendError
+from app.core.rate_limit import limit_search, rate_limited_response
 from app.core.security import get_current_client
 from app.core.tracing import annotate_span
 from app.models import ApiKey
@@ -50,6 +51,13 @@ router = APIRouter()
         "degraded is true."
     ),
     operation_id="searchPassages",
+    dependencies=[Depends(limit_search)],
+    responses={
+        429: rate_limited_response(
+            "This client is over its search limit for the current window. "
+            "Retry-After is the time left in the window."
+        ),
+    },
 )
 @observe(name="passage-search", capture_input=False, capture_output=False)
 def search_passages(
@@ -80,6 +88,8 @@ def _search(request: SearchRequest, db: Session, client: ApiKey) -> SearchRespon
     # client_name is read first because commit() expires the ORM instance. The
     # repository's first statement re-begins a transaction, which its set_config
     # read-back guard relies on.
+    # limit_search ended the auth transaction itself, a step earlier, and reading
+    # client_name above re-began one. That is the transaction this commit ends.
     # VECTOR_WEIGHT=0 is the FTS-only baseline mode: the embedder is never called.
     client_name = client.client_name
     db.commit()

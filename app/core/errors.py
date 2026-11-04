@@ -33,6 +33,7 @@ DATABASE_UNAVAILABLE_DETAIL = "Database unavailable"
 QUERY_TIMEOUT_DETAIL = "Query exceeded time limit"
 INVALID_DATA_DETAIL = "Request contains data the database cannot accept"
 INTERNAL_ERROR_DETAIL = "Internal server error"
+RATE_LIMITED_DETAIL = "Rate limit exceeded"
 
 
 class EmbeddingBackendError(RuntimeError):
@@ -68,6 +69,22 @@ class EmbeddingBackendMisconfigured(EmbeddingBackendError):
     status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
     detail = "Embedding backend is misconfigured"
     retry_after = False
+
+
+class RateLimited(Exception):
+    """A per-tenant limit refused this request; see app.core.rate_limit.
+
+    Unlike the classes above, the retry hint is per instance, because the honest
+    wait depends on the limit: a fixed setting for an ingest slot, the time left
+    in the window for search. A retry can always succeed, so it is always sent.
+    """
+
+    status_code = status.HTTP_429_TOO_MANY_REQUESTS
+    detail = RATE_LIMITED_DETAIL
+
+    def __init__(self, retry_after_s: int) -> None:
+        super().__init__(f"rate limited; retry after {retry_after_s} s")
+        self.retry_after_s = retry_after_s
 
 
 def _service_unavailable(detail: str, retry: bool = True) -> JSONResponse:
@@ -180,6 +197,16 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=exc.status_code,
             content={"detail": exc.detail},
             headers=headers,
+        )
+
+    @app.exception_handler(RateLimited)
+    async def _rate_limited(request: Request, exc: RateLimited) -> JSONResponse:
+        # Not logged here: app.core.rate_limit logs the refusal, because only it
+        # knows which tenant and which limit.
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers={"Retry-After": str(exc.retry_after_s)},
         )
 
     @app.exception_handler(OperationalError)

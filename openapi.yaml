@@ -69,6 +69,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorDetail'
+        '429':
+          description: This client is over its search limit for the current window.
+            Retry-After is the time left in the window.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorDetail'
         '422':
           description: Validation Error
           content:
@@ -128,6 +140,18 @@ paths:
           description: A dependency is unavailable, or a query exceeded its time limit.
             Retry-After is sent only on the 503s where a retry can succeed; "Query
             exceeded time limit" sends none.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorDetail'
+        '429':
+          description: All of this client's ingest slots are in use. A re-ingest that
+            would be skipped is never refused.
           headers:
             Retry-After:
               description: Seconds to wait before retrying.

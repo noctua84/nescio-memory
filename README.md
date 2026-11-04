@@ -355,6 +355,7 @@ the embedding-input composition, and the embedding backend + dimension) match th
 hash match behind a changed pipeline version still re-splits and re-embeds. `force: true` is the
 escape hatch for a change the pipeline version cannot see — most plausibly a re-pulled embedding
 model behind an unchanged backend name and dimension — and always costs the work, never skipping.
+A skip never counts against the [ingest limit](#rate-limits).
 
 #### `GET /api/v1/notes/{id}`
 
@@ -527,6 +528,42 @@ an error: the keyword branch contributes nothing and the vector branch still ans
 response is a `200` with semantic matches (and an empty `results` only if the caller holds no
 passages).
 
+### Rate limits
+
+Ingest and search are limited per client. The limits are keyed by `client_name`, so the old and new
+key of a [rotation](#key-rotation) share one budget. They are kept in PostgreSQL, so **they hold across
+replicas**: adding a replica adds no budget. There is no off switch; raise a limit instead. A refusal
+is a `429` with `Retry-After` (see [Error responses](#error-responses)), and the service logs a
+`WARNING` naming the client. The other routes are not limited.
+
+**Ingest: a concurrency cap.** At most `RATE_LIMIT_INGEST_CONCURRENCY` ingests per client embed at
+once; there is no per-minute rate. A slot is taken after the skip check and released when the ingest
+commits or rolls back.
+
+- **Skips are free.** A re-ingest that would be skipped never touches the limiter, so it succeeds with
+  every slot in use, and it still writes its `skipped` [audit event](#audit-trail).
+- A refused ingest changes nothing, so it writes no audit event.
+- `Retry-After` is the fixed `RATE_LIMIT_INGEST_RETRY_AFTER_S`, and it is a hint rather than a promise.
+  A slot is held while the whole note is embedded, including
+  [embedding retries](#current-limitations), which can add up to
+  `EMBED_RETRY_BUDGET × (30 s + EMBED_RETRY_MAX_DELAY_S)` (68 s by default). With a slow or flaky
+  backend, a retry after that many seconds can be refused again.
+
+**Search: a request rate.** At most `RATE_LIMIT_SEARCH_REQUESTS` requests per client in each fixed
+window of `RATE_LIMIT_WINDOW_S` seconds.
+
+- Windows are aligned to the clock of the database, not to a client's first request: with the default
+  60 s, one starts on every minute. `Retry-After` is the seconds left in the current window, rounded up.
+- Because the window is fixed, a client can send up to twice the limit across a boundary: a full
+  budget just before it and another just after.
+- Every authenticated request counts, including one answered with `422` or `429`. A refused request
+  does not push the window back. A request that fails authentication does not count.
+- The counters are in an `UNLOGGED` table, so a database crash resets them and hands every client a
+  fresh budget.
+
+**Clients should honour `Retry-After` over their own backoff.** `scripts/reingest.py` does: see
+[Re-ingesting a corpus](#re-ingesting-a-corpus).
+
 ### Error responses
 
 Errors from `/api/v1` carry a JSON body, `{"detail": ...}`. Except for `422`, `detail` is a string: a
@@ -535,7 +572,9 @@ fixed message for each failure below, never an exception message.
 | Status | `detail` | Retry-After (seconds) | When |
 | ------ | -------- | --------------------- | ---- |
 | 400 | `Request contains data the database cannot accept` | none | The database rejected a value, such as a NUL byte in text. |
-| 400 | `path_or_uri must be a relative path without '..', or an absolute URI` | none | `POST /api/v1/ingest` with an absolute path or a `..` component. |
+| 400 | `path_or_uri must be a relative path without '..', or an absolute URI` | none | `POST /api/v1/ingest` or `DELETE /api/v1/notes?scope=…&path_or_uri=…` with an absolute path or a `..` component. |
+| 400 | `scope is required. To delete the root (empty) scope, send root_scope=true with no scope.` | none | `DELETE /api/v1/scopes` with an empty or omitted `scope`. |
+| 400 | `root_scope=true deletes the root (empty) scope and cannot be combined with a non-empty scope.` | none | `DELETE /api/v1/scopes` with `root_scope=true` and a non-empty `scope`. |
 | 400 | `content is too large: N characters exceeds the 500000 limit.` | none | `POST /api/v1/ingest` with `content` over 500,000 characters. `N` is the submitted length. |
 | 400 | `Invalid Content-Length header.` | none | Any `/api/v1` route, with a `Content-Length` that is not a non-negative integer. Rejected before authentication. |
 | 401 | `Missing API key` | none | The `X-API-Key` header is absent. |
@@ -543,16 +582,19 @@ fixed message for each failure below, never an exception message.
 | 404 | `Note not found` | none | `GET` or `DELETE /api/v1/notes/{id}` for a note that does not exist, or belongs to another client. |
 | 413 | `Request body too large: limit is 8388608 bytes.` | none | Any `/api/v1` route, with a body over the limit. Rejected before authentication. |
 | 422 | list of error objects | none | Request validation failed. Each object has `loc`, `msg` and `type`. |
+| 429 | `Rate limit exceeded` | ingest: `RATE_LIMIT_INGEST_RETRY_AFTER_S`; search: seconds left in the window | `POST /api/v1/ingest` with all of the client's slots in use, or `POST /api/v1/search` over the client's limit for the window. See [Rate limits](#rate-limits). |
 | 500 | `Embedding backend is misconfigured` | none | The embedding backend cannot work as deployed. Retrying will not help; the deployment must change. |
 | 500 | `Internal server error` | none | An unanticipated failure. The traceback is in the server log. |
 | 503 | `Database unavailable` | 30 | The database cannot be reached. |
 | 503 | `Query exceeded time limit` | none | A query was cancelled, in practice by the search `statement_timeout` (`STATEMENT_TIMEOUT_MS`). |
 | 503 | `Embedding backend unavailable` | 30 | The embedding backend cannot be reached, timed out, or answered with a transient HTTP status. |
 | 503 | `Embedding backend returned an unexpected response` | 30 | The embedding backend answered with something that is not a usable vector. |
+| 503 | no `detail`: the body is the readiness report, with `status` `not_ready` | none | `GET /ready`, which sits outside `/api/v1`, when the database check fails or times out. See [`GET /ready`](#get-ready). |
 
 Retry-After is sent only when a retry can succeed. A dependency that is down may recover, so the 30
-seconds is a hint to back off, not a promise. A bad request, a misconfiguration and a bug fail the
-same way on every retry, so their responses carry no header.
+seconds is a hint to back off, not a promise. A rate limit clears by itself, so a `429` always carries
+one. A bad request, a misconfiguration and a bug fail the same way on every retry, so their responses
+carry no header.
 
 A transient embedding failure is handled differently by the two routes that embed. `POST /api/v1/ingest`
 returns the `503` above. `POST /api/v1/search` answers `200` with full-text results and
@@ -618,6 +660,10 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `EMBED_RETRY_BUDGET`  | `2`                                         | retries shared by **all** calls of one ingest request, `0..10`; `0` disables retry. See "Ingestion retries" under Current limitations for the worst-case bound |
 | `KEY_LAST_USED_THROTTLE_S` | `300`                                  | `api_keys.last_used_at` is rewritten at most once per this many seconds per key, `0..86400`; `0` touches on every request — see [Audit trail](#audit-trail) |
 | `AUDIT_RETENTION_DAYS` | `400`                                      | days `ingest_events` rows survive `scripts/prune_ingest_events.py`, `30..3650` — see [Audit trail](#audit-trail) |
+| `RATE_LIMIT_INGEST_CONCURRENCY` | `2`                                 | ingests per client that may embed at once, `1..32`; skipped re-ingests do not count — see [Rate limits](#rate-limits) |
+| `RATE_LIMIT_INGEST_RETRY_AFTER_S` | `5`                               | `Retry-After`, in seconds, on an ingest refused for want of a slot, `1..60`; a hint, because a slot is held across embedding and its retries — see [Rate limits](#rate-limits) |
+| `RATE_LIMIT_SEARCH_REQUESTS` | `120`                                  | searches per client per window, `1..10000` |
+| `RATE_LIMIT_WINDOW_S` | `60`                                        | length of the fixed search window in seconds, `1..3600` |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
 
 ### Logging
@@ -915,6 +961,10 @@ would be posted and makes no HTTP call. `--url` must point at an allowed host (`
 `127.0.0.1`, `::1` by default); extend the allowlist with the comma-separated
 `NESCIO_ALLOWED_HOSTS` environment variable.
 
+A `429` or `503` gets one retry after the response's `Retry-After` (5 s if it has none, and never more
+than 60 s). A second one is reported as `FAILED 429` or `FAILED 503`, and the run moves on to the next
+file. The files are sent one at a time, so a single run needs only one [ingest slot](#rate-limits).
+
 ### Measuring retrieval quality
 
 `scripts/eval_queries.py` runs a fixed list of queries against `/api/v1/search` and reports how
@@ -979,15 +1029,16 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
   `EMBED_RETRY_BUDGET` per request, shared by all groups, so a large note cannot retry once per
   group. Ingest holds a row lock while it embeds, so the worst case is stated: the lock is held
   at most `EMBED_RETRY_BUDGET × (30 s + EMBED_RETRY_MAX_DELAY_S)` longer than a request that never
-  retries (defaults: `2 × (30 + 4) = 68 s`), whatever the note's size. When the budget runs out
+  retries (defaults: `2 × (30 + 4) = 68 s`), whatever the note's size, and so is the ingest's
+  [slot](#rate-limits). When the budget runs out
   the request fails with `503` as before and the client re-sends it. A search retries at most
   once and only inside `QUERY_EMBED_TIMEOUT_S`; if that is not enough it degrades to keyword-only
   as before.
 - **There is no list or export route.** No enumeration, and no fetch-by-path (deleting by path
   exists, reading by path does not): a note is readable by id (`GET /api/v1/notes/{id}`) or as
   passages through a search that matched it. This is an
-  architectural property and **not a security boundary**: there is no rate limiting, so bulk
-  retrieval is bounded by query effort rather than refused. Recovering the corpus itself is a
+  architectural property and **not a security boundary**: the [search rate limit](#rate-limits) slows
+  bulk retrieval but does not refuse it. Recovering the corpus itself is a
   `pg_dump`/restore concern, not an API one. A note changes only by re-ingesting it whole.
 - **Changing the FTS configuration or weights forces a full re-ingest**, because `tsv` is
   materialized at ingest time, not computed on the fly.
