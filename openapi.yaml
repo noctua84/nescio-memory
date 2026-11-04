@@ -323,6 +323,10 @@ paths:
                 $ref: '#/components/schemas/DeleteNotesResponse'
         '400':
           description: path_or_uri is an absolute path or contains '..'.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorDetail'
         '401':
           description: The X-API-Key header is missing, unknown or revoked.
           content:
@@ -409,6 +413,10 @@ paths:
         '400':
           description: scope is empty or omitted without root_scope=true, or root_scope=true
             was combined with a non-empty scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorDetail'
         '401':
           description: The X-API-Key header is missing, unknown or revoked.
           content:

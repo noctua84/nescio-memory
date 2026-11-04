@@ -22,6 +22,7 @@ from app.core.security import get_current_client
 from app.models import ApiKey
 from app.repositories.note import DeletedNote as RepoDeletedNote
 from app.repositories.note import NoteRepository
+from app.schemas.errors import ErrorDetail
 from app.schemas.note import DeleteNotesResponse, DeletedNote, NoteResponse
 
 router = APIRouter()
@@ -142,7 +143,10 @@ def delete_note(
     ),
     operation_id="deleteNoteByPath",
     responses={
-        400: {"description": "path_or_uri is an absolute path or contains '..'."},
+        400: {
+            "model": ErrorDetail,
+            "description": "path_or_uri is an absolute path or contains '..'.",
+        },
         404: {"description": "No such note for this client."},
     },
 )
@@ -186,6 +190,7 @@ def delete_note_by_path(
     operation_id="deleteScope",
     responses={
         400: {
+            "model": ErrorDetail,
             "description": (
                 "scope is empty or omitted without root_scope=true, or "
                 "root_scope=true was combined with a non-empty scope."

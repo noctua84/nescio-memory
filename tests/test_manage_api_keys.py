@@ -97,6 +97,10 @@ def test_revoke_by_id_makes_the_key_fail_authentication(db_session, client, caps
     make_api_key(db_session, "acme", plaintext=key)
     assert _authenticates(client, key)
 
+    # The request above can log through the app's stdout handler; drain it so
+    # the assertion below sees only the script's own output.
+    capsys.readouterr()
+
     assert _run(db_session, ["revoke", "--id", str(_id_of(db_session, key))]) == 0
     assert capsys.readouterr().out.strip() == "revoked 1"
 
