@@ -1,23 +1,23 @@
 # scripts/create_api_key.py
+"""Mint an API key. A thin shim over `manage_api_keys.py create`.
+
+    uv run python scripts/create_api_key.py my-client
+
+Kept so the documented command keeps working. Omit the argument and the client
+is named `default`, as it always was.
+"""
 import sys
+from collections.abc import Sequence
 
-from app.core.db import get_sessionmaker
-from app.core.security import generate_api_key
-from app.models.api_key import ApiKey
+from scripts.manage_api_keys import SessionFactory
+from scripts.manage_api_keys import main as manage_api_keys_main
 
 
-def main() -> None:
-    client_name = sys.argv[1] if len(sys.argv) > 1 else "default"
-    plaintext, key_hash, prefix = generate_api_key(client_name)
-
-    with get_sessionmaker()() as db:
-        db.add(ApiKey(key_prefix=prefix, key_hash=key_hash, client_name=client_name))
-        db.commit()
-
-    print(f"client_name : {client_name}")
-    print(f"api_key     : {plaintext}")
-    print("⚠️  Store this now — it cannot be retrieved again.")
+def main(argv: Sequence[str] | None = None, session_factory: SessionFactory | None = None) -> int:
+    args = sys.argv[1:] if argv is None else list(argv)
+    client_name = args[0] if args else "default"
+    return manage_api_keys_main(["create", client_name], session_factory=session_factory)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

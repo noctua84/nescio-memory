@@ -100,7 +100,7 @@ v1 storage.
 Every `/api/v1` route requires an API key. Mint one per client:
 
 ```bash
-uv run python scripts/create_api_key.py my-client
+uv run python -m scripts.create_api_key my-client
 ```
 
 ```
@@ -111,6 +111,31 @@ api_key     : nm_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 Only a SHA-256 hash of the key is stored, so the plaintext cannot be recovered — mint a new key if
 you lose it. Omit the argument and the client is named `default`.
+
+#### Key rotation
+
+Rotate a client's key without SQL, in three steps:
+
+```bash
+# 1. Mint the replacement. Copy its api_key line now: it is shown once.
+uv run python -m scripts.manage_api_keys create my-client
+
+# 2. Deploy the new key to the client and check that it authenticates.
+
+# 3. Find the old key's id, then revoke it.
+uv run python -m scripts.manage_api_keys list --client my-client
+uv run python -m scripts.manage_api_keys revoke --id 1
+```
+
+`list` shows each key's id, client, display prefix (the first 15 characters, so you can match a row to
+the key you copied), created time and revoked time. It never shows the secret or its hash. Revoked keys
+are hidden unless you pass `--include-revoked`.
+
+- `revoke --id N` revokes one key. Revoking a key that is already revoked prints `revoked 0` and exits 0.
+- `revoke --client NAME --yes` revokes every active key of that client. It refuses without `--yes`.
+
+A revoked key is rejected with `401` on its next request. Revoking sets `revoked_at` rather than
+deleting the row, so the audit trail is kept.
 
 The `client_name` is not just a label: every ingested note and passage is tagged with it, and each client sees
 only its own data. See [Authentication](#authentication).
