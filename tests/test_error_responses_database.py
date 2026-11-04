@@ -20,6 +20,7 @@ from app.core.errors import (
     QUERY_TIMEOUT_DETAIL,
     RETRY_AFTER_SECONDS,
 )
+from app.core.key_usage import get_key_usage_recorder
 from app.main import app
 from app.models.note import Note
 from app.models.passage import Passage
@@ -55,6 +56,7 @@ def http(db_session, monkeypatch):
     monkeypatch.setattr(ingest_module, "get_embeddings", fake_embeddings)
     monkeypatch.setattr(search_module, "get_query_embedding", fake_embedding)
     app.dependency_overrides[get_db] = lambda: db_session
+    app.dependency_overrides[get_key_usage_recorder] = lambda: lambda key_id: None
     try:
         yield TestClient(app, raise_server_exceptions=False)
     finally:

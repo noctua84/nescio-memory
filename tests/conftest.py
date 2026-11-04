@@ -64,6 +64,7 @@ from app.api.v1 import ingest as ingest_module
 from app.api.v1 import search as search_module
 from app.config import settings
 from app.core.db import get_db
+from app.core.key_usage import get_key_usage_recorder
 from app.main import app
 from tests.fakes import fake_embedding, fake_embeddings
 
@@ -176,7 +177,13 @@ def db_session(connection):
 
 
 @pytest.fixture
-def client(db_session, monkeypatch):
+def key_uses():
+    """The key ids the `client` fixture's recorder was called with, in order."""
+    return []
+
+
+@pytest.fixture
+def client(db_session, monkeypatch, key_uses):
     """A TestClient wired to the test transaction, with embeddings faked.
 
     The patch targets matter. app/api/v1/ingest.py does
@@ -201,6 +208,9 @@ def client(db_session, monkeypatch):
     # get_db means a factory-created ApiKey row is immediately visible to
     # authentication -- no separate seeding path, nothing committed to clean up.
     app.dependency_overrides[get_db] = lambda: db_session
+    # The real recorder writes on its own connection, which cannot see a key
+    # created in this test's transaction. tests/test_api_key_last_used.py covers it.
+    app.dependency_overrides[get_key_usage_recorder] = lambda: key_uses.append
     yield TestClient(app)
     # Clearing matters: a leftover override leaks this test's closed session
     # into the next one, which then fails somewhere that points at the wrong

@@ -23,6 +23,7 @@ from app.core.errors import (
     EmbeddingBackendError,
     EmbeddingBackendMisconfigured,
 )
+from app.core.key_usage import get_key_usage_recorder
 from app.main import app
 from app.models.note import Note
 from app.models.passage import Passage
@@ -54,6 +55,7 @@ def http(db_session, monkeypatch):
         embeddings_module, "_fetch_batch", lambda texts, timeout: fake_embeddings(texts)
     )
     app.dependency_overrides[get_db] = lambda: db_session
+    app.dependency_overrides[get_key_usage_recorder] = lambda: lambda key_id: None
     try:
         yield TestClient(app, raise_server_exceptions=False)
     finally:
