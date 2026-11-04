@@ -37,8 +37,8 @@ separate Ollama pod behind a Service. An optional in-process backend using
 [sentence-transformers](https://sbert.net) is available for deployments that cannot run a second
 service; see [Embedding backends](#embedding-backends). Handlers are traced with
 [Langfuse](https://langfuse.com) when `LANGFUSE_*` are exported into the **process environment** —
-values that only live in `.env` are not picked up, see
-[Current limitations](#current-limitations).
+when you run with `uv`, values that only live in `.env` are not picked up, see
+[Current limitations](#current-limitations); Docker Compose exports `.env` for you.
 
 ## Requirements
 
@@ -46,7 +46,8 @@ values that only live in `.env` are not picked up, see
 - **[uv](https://docs.astral.sh/uv/)** — manages the virtualenv and the lockfile
 - **PostgreSQL 16+** with the `pgvector` extension, **`pgvector` >= 0.8.0 required** — search sets
   `hnsw.iterative_scan`, which earlier versions reject outright
-- **Docker** — only to run the test suite, which starts a real PostgreSQL + pgvector container
+- **Docker** — to run the test suite, which starts a real PostgreSQL + pgvector container, and
+  for the optional [Docker Compose](#5-run-with-docker-compose) setup
 - **Ollama** running an embedding model (e.g. `qwen3-embedding`) — unless you use the optional
   in-process backend instead
 
@@ -140,17 +141,65 @@ deleting the row, so the audit trail is kept.
 The `client_name` is not just a label: every ingested note and passage is tagged with it, and each client sees
 only its own data. See [Authentication](#authentication).
 
-### 5. Run
+### 5. Run with Docker Compose
+
+The [`Dockerfile`](Dockerfile) and [`compose.yaml`](compose.yaml) run PostgreSQL + pgvector,
+Ollama, the schema migration and the API as one stack, so with containers you can skip steps 1
+and 3 (the `migrate` service applies the schema). To run the API from a Python checkout instead,
+see [Development](#development).
 
 ```bash
-uv run uvicorn app.main:app --reload --port 8000
+docker compose up -d
+docker compose exec app python scripts/create_api_key.py my-client   # step 4, inside the container
+curl http://localhost:8080/ready
 ```
 
-Run this **from the repository root**: `app` is imported from the working directory, and `.env` is
-resolved relative to it as well.
+`.env` is optional here: every value has a default. Copy `.env.example` to `.env` to change
+`OLLAMA_MODEL`, enable Langfuse and so on.
 
-Interactive docs are served by FastAPI at <http://localhost:8000/docs>. The committed contract
-lives in [`openapi.json`](openapi.json) / [`openapi.yaml`](openapi.yaml).
+The API is published on port **8080** (`APP_PORT` changes the host side); interactive docs are at
+<http://localhost:8080/docs>. The first `up` pulls the Ollama image and downloads the embedding
+model, so `/ready` reports `degraded` until that finishes. The committed contract lives in
+[`openapi.json`](openapi.json) / [`openapi.yaml`](openapi.yaml).
+
+| Service       | What it does                                                                                 |
+| ------------- | -------------------------------------------------------------------------------------------- |
+| `db`          | `pgvector/pgvector` (PostgreSQL 17, pgvector 0.8.x), data in the `pgdata` volume. Not published to the host. |
+| `ollama`      | Ollama server, models in the `ollama` volume. For a GPU, uncomment the `deploy` block in `compose.yaml`. |
+| `ollama-pull` | One-shot: downloads `OLLAMA_MODEL` into the volume, then exits.                              |
+| `migrate`     | One-shot: runs `alembic upgrade head` once `db` is healthy, then exits.                      |
+| `app`         | The API. Starts only after `migrate` exited successfully.                                    |
+
+- **Migrations never run on app start.** Only the `migrate` service applies them. After upgrading
+  the image, run `docker compose run --rm migrate` (or just `docker compose up -d`, which re-runs
+  it) before the new `app` starts.
+- **The `app` health check calls `/ready`**, so the container is healthy only when PostgreSQL
+  answers. A missing Ollama gives `degraded` (still healthy); a dead database makes it unhealthy.
+  The image's own `HEALTHCHECK` calls `/health`, which touches no dependency.
+- **Ollama is optional for startup.** `docker compose up -d db migrate app` runs the API without it;
+  search then falls back to keyword-only and ingest fails until an embedding backend is reachable.
+- **`.env` is passed into the container whole**, including `LANGFUSE_*`. Compose exports it into
+  the process environment, which is where the Langfuse SDK reads it, so the
+  [`.env` limitation](#current-limitations) does not apply here. `DATABASE_URL` and `OLLAMA_URL`
+  are overridden to point at the `db` and `ollama` services, whatever `.env` says. Database
+  credentials come from `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB` (default `nescio`,
+  `nescio`, `nescio_memory`); set a real password if the stack is reachable from anywhere but
+  your own machine, and keep it URL-safe because it is placed into `DATABASE_URL`.
+- **Image variants.** The default image uses Ollama and has no torch. For the in-process backend,
+  build with the `local-embeddings` extra:
+
+  ```bash
+  EXTRAS=local-embeddings docker compose build
+  ```
+
+  and set `EMBEDDING_BACKEND=local`; read [Embedding backends](#embedding-backends) first, since
+  that backend has a different embedding width. Only the default image is published.
+- **Published image.** Each GitHub release pushes `ghcr.io/noctua84/nescio-memory` tagged `X.Y.Z`,
+  `X.Y` and `latest`. Pull requests build the image and smoke-test the stack in CI
+  ([`docker.yml`](.github/workflows/docker.yml)).
+
+The container runs as an unprivileged user (uid 10001) and listens on port 8080 inside, regardless
+of `HOST` and `PORT` in `.env` (see [Configuration](#configuration)).
 
 ## API
 
@@ -714,13 +763,17 @@ uv sync --locked                      # install / refresh the environment
 uv sync --locked --extra local-embeddings  # only if using the in-process backend
 uv lock                               # after changing dependencies in pyproject.toml
 uv run python export_openapi.py       # regenerate openapi.json + openapi.yaml
-uv run uvicorn app.main:app --reload  # dev server (from the repository root)
+uv run uvicorn app.main:app --reload --port 8000  # dev server (from the repository root)
 uv run pytest                         # integration suite (needs Docker)
 uv run alembic upgrade head           # apply migrations
 uv run python -m scripts.check_embedding_dimension  # does the model's width match EMBEDDING_DIMENSION?
 ```
 
-Four things are enforced by CI:
+Run the dev server **from the repository root**: `app` is imported from the working directory, and
+`.env` is resolved relative to it as well. Interactive docs are then at
+<http://localhost:8000/docs>. This path needs steps 1 to 3 of the [Quick start](#quick-start).
+
+Five things are enforced by CI:
 
 - **The test suite must pass.** `uv run pytest` runs the integration suite against a real
   PostgreSQL + pgvector container on every push and pull request. No count is quoted here because
@@ -732,6 +785,9 @@ Four things are enforced by CI:
   `openapi.yaml`.
 - **The `local-embeddings` extra must still resolve.** A `--dry-run` sync verifies it against the
   lockfile on every run without downloading torch, so the opt-in backend cannot rot unnoticed.
+- **The container image must build and boot.** [`docker.yml`](.github/workflows/docker.yml)
+  builds the image on every pull request and starts `db`, `migrate` and `app` (without Ollama),
+  asserting that `/ready` reports the database `ok`.
 
 ### Re-ingesting a corpus
 
@@ -805,9 +861,11 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
   other non-2xx status (a 404 for a model that is not pulled, a 501 for a non-embedding model, a
   redirect such as the 307 from a trailing-slash `OLLAMA_URL`) returns a `500` with no `Retry-After`. Treat `degraded: true` as a weaker result,
   not an error; `scripts/eval_queries.py` refuses to score one.
-- **Langfuse keys in `.env` are ignored.** `@observe` relies on the SDK reading `LANGFUSE_*` from
-  the process environment, and pydantic-settings does not export `.env` values into it. Export the
-  keys in your shell or service manager, or tracing silently stays off.
+- **Langfuse keys in `.env` are ignored** when you run with `uv`. `@observe` relies on the SDK
+  reading `LANGFUSE_*` from the process environment, and pydantic-settings does not export `.env`
+  values into it. Export the keys in your shell or service manager, or tracing silently stays off.
+  This does not apply to [Docker Compose](#5-run-with-docker-compose), which exports `.env` into the
+  container's environment.
 - **Ingestion retries transient embedding failures, within a fixed bound.** Passages are embedded
   through Ollama's `/api/embed` in groups of `EMBED_BATCH_SIZE`. A call that fails with a timeout,
   a connection error or HTTP 408/429/500/502/503/504 is retried with exponential backoff and full

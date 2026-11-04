@@ -1,0 +1,128 @@
+# Local / single-host stack: PostgreSQL + pgvector, Ollama, schema migration and
+# the API.
+#
+#   cp .env.example .env     # optional; every value below has a default
+#   docker compose up -d
+#
+# Startup order (each step waits for the previous one to succeed):
+#   db (healthy) -> migrate (exits 0) -> app (healthy)
+#   ollama (healthy) -> ollama-pull (exits 0)        [not required by app]
+#
+# Migrations NEVER run when the app starts. The one-shot `migrate` service runs
+# `alembic upgrade head` and the app waits for it, so a failed migration stops
+# the stack instead of serving against a half-migrated schema. Run it again
+# after an upgrade with: docker compose run --rm migrate
+#
+# The app starts without Ollama: GET /ready then answers 200 "degraded"
+# (keyword-only search) rather than failing, which is how CI smoke-tests it.
+
+x-image: &image
+  build:
+    context: .
+    args:
+      # Empty builds the Ollama image. "local-embeddings" builds the torch
+      # variant (about 530 MB more); also set EMBEDDING_BACKEND=local and read
+      # the README before using it - it needs a different embedding width.
+      EXTRAS: ${EXTRAS:-}
+  image: nescio-memory:local
+
+x-app-env: &app-env
+  # `.env` is passed through whole, so everything .env.example documents applies
+  # in the container, including LANGFUSE_*. That means the README limitation
+  # "Langfuse keys in .env are ignored" does not apply here: compose exports the
+  # file into the process environment, which is where the Langfuse SDK reads it.
+  # Optional: the stack also starts without a .env file.
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    # These override the same keys in .env, which point at localhost for the
+    # non-container workflow. Inside the stack the services are reached by name.
+    DATABASE_URL: postgresql://${POSTGRES_USER:-nescio}:${POSTGRES_PASSWORD:-nescio}@db:5432/${POSTGRES_DB:-nescio_memory}
+    OLLAMA_URL: http://ollama:11434/api/embed
+
+services:
+  db:
+    image: pgvector/pgvector:0.8.7-pg17-trixie
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nescio}
+      # The default is only safe because the port is not published to the host.
+      # Set a real password in .env before exposing the database.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nescio}
+      POSTGRES_DB: ${POSTGRES_DB:-nescio_memory}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  ollama:
+    image: ollama/ollama:0.40.14
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    # GPU: uncomment and install the NVIDIA container toolkit on the host.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # One-shot: downloads the embedding model into the ollama volume, then exits.
+  # A second `up` is a cheap no-op once the model is present.
+  ollama-pull:
+    image: ollama/ollama:0.40.14
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "${OLLAMA_MODEL:-qwen3-embedding:0.6b}"]
+
+  # One-shot: applies the schema, then exits 0.
+  migrate:
+    <<: [*image, *app-env]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["alembic", "upgrade", "head"]
+
+  app:
+    <<: [*image, *app-env]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    healthcheck:
+      # /ready, not /health: the container is healthy only when it can reach the
+      # database. 200 "degraded" (Ollama down) still counts as healthy; 503
+      # (database down) does not, because urlopen raises on non-2xx.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=5)"
+      interval: 15s
+      timeout: 8s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  pgdata:
+  ollama:
