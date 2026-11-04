@@ -86,6 +86,7 @@ def _cmd_list(db: Session, client_name: str | None, include_revoked: bool) -> in
         ApiKey.key_prefix,
         ApiKey.created_at,
         ApiKey.revoked_at,
+        ApiKey.last_used_at,
     ).order_by(ApiKey.id)
     if client_name is not None:
         stmt = stmt.where(ApiKey.client_name == client_name)
@@ -98,7 +99,7 @@ def _cmd_list(db: Session, client_name: str | None, include_revoked: bool) -> in
         return EXIT_OK
 
     _print_table(
-        ["ID", "CLIENT", "PREFIX", "CREATED", "REVOKED"],
+        ["ID", "CLIENT", "PREFIX", "CREATED", "REVOKED", "LAST USED"],
         [
             [
                 str(row.id),
@@ -106,6 +107,7 @@ def _cmd_list(db: Session, client_name: str | None, include_revoked: bool) -> in
                 row.key_prefix,
                 _timestamp(row.created_at),
                 _timestamp(row.revoked_at),
+                _timestamp(row.last_used_at),
             ]
             for row in rows
         ],

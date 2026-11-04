@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from langfuse import observe
+from langfuse import observe, propagate_attributes
 from sqlalchemy.orm import Session
 
 from app.api.v1.validation import validate_path_or_uri
@@ -8,7 +8,9 @@ from app.core.embeddings import get_embeddings
 from app.core.pipeline import content_hash, embedding_input, fts_lead_a, fts_lead_c, pipeline_version
 from app.core.security import get_current_client
 from app.core.splitter import split_note
+from app.core.tracing import annotate_span
 from app.models import ApiKey
+from app.repositories.audit import AuditRepository
 from app.repositories.note import NoteRepository, PassageRow
 from app.schemas.ingest import IngestRequest, IngestResponse
 
@@ -63,6 +65,22 @@ def ingest_note(
     db: Session = Depends(get_db),
     client: ApiKey = Depends(get_current_client),
 ) -> IngestResponse:
+    # Trace attribution. path_or_uri is never attached: the trace may leave the
+    # machine, and a path can name a person. client_name is read here because the
+    # commit inside _ingest expires the ORM instance.
+    with propagate_attributes(
+        user_id=client.client_name, metadata={"scope": request.scope}
+    ):
+        response = _ingest(request, db, client)
+        annotate_span(
+            note_id=response.note_id,
+            skipped=response.skipped,
+            passages=response.passages,
+        )
+    return response
+
+
+def _ingest(request: IngestRequest, db: Session, client: ApiKey) -> IngestResponse:
     # Both validations run before anything is written or deleted.
     validate_path_or_uri(request.path_or_uri)
     _validate_content_size(request.content)
@@ -72,6 +90,8 @@ def ingest_note(
     version = pipeline_version()
 
     repo = NoteRepository(db, client_name=client.client_name)
+    # Every event below goes in the same transaction as the change it records.
+    audit = AuditRepository(db, client_name=client.client_name, api_key_id=client.id)
 
     # The FOR UPDATE lock lock_note takes is held across the batched get_embeddings call
     # below and released only by the single commit at the end. That is
@@ -103,12 +123,19 @@ def ingest_note(
         and locked.content_hash == digest
         and locked.pipeline_version == version
     ):
-        db.commit()  # releases the lock; nothing else to write
-        return IngestResponse(
-            note_id=locked.id,
-            passages=repo.count_passages(locked.id),
-            skipped=True,
+        passages = repo.count_passages(locked.id)
+        audit.record_ingest(
+            "skipped",
+            request.scope,
+            locked.id,
+            request.path_or_uri,
+            passages_before=passages,
+            passages_after=passages,
+            content_hash_before=locked.content_hash,
+            content_hash_after=digest,
         )
+        db.commit()  # releases the lock; the event is the only write
+        return IngestResponse(note_id=locked.id, passages=passages, skipped=True)
 
     note_id = repo.upsert_note(
         request.scope,
@@ -151,7 +178,24 @@ def ingest_note(
     # happened yet, so a failure here leaves the previous passages intact.
     # Transient ones were already retried inside get_embeddings, within the
     # budget described above the lock.
+    passages_before = repo.count_passages(note_id)
     count = repo.replace_passages(note_id, request.scope, rows)
+
+    # `locked` alone would mislabel the race upsert_note's docstring describes: a
+    # first ingest that loses it saw no row to lock, but upsert_note then waited
+    # for the winner and overwrote it. Its passages are still here to count. The
+    # winner's hash is not, so that event's content_hash_before stays NULL.
+    replaced = locked is not None or passages_before > 0
+    audit.record_ingest(
+        "replaced" if replaced else "created",
+        request.scope,
+        note_id,
+        request.path_or_uri,
+        passages_before=passages_before if replaced else None,
+        passages_after=count,
+        content_hash_before=locked.content_hash if locked is not None else None,
+        content_hash_after=digest,
+    )
 
     db.commit()  # single transaction boundary for the whole note
     return IngestResponse(note_id=note_id, passages=count, skipped=False)

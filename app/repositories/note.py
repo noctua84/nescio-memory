@@ -1,5 +1,5 @@
-"""All notes/passages SQL for writes and single-note reads. Nothing outside
-this module and passage_search.py touches those tables.
+"""All notes/passages SQL for writes and single-note reads. Only passage_search.py
+and the read-only passage count in audit.py touch those tables from outside.
 
 Tenant discipline, stated once so it is not re-argued per method: every statement
 here carries `client_name == self.client_name` as a DIRECT argument to
@@ -298,15 +298,15 @@ class NoteRepository:
         )
         return self.db.execute(stmt).scalar_one()
 
-    def delete_note(self, note_id: int) -> bool:
-        """Delete one note; True when a row was actually removed.
+    def delete_note(self, note_id: int) -> Row[Any] | None:
+        """Delete one note; returns its identity for the audit row, or None.
 
         Its passages go with it through the composite FK's ON DELETE CASCADE.
         They are deliberately NOT deleted explicitly first: a second statement
         would be a second place for the tenant filter to be wrong, and the
         cascade is exercised directly by the schema tests.
 
-        False covers both "no such note" and "another tenant's note", for the
+        None covers both "no such note" and "another tenant's note", for the
         same reason get_note returns None for both. Does not commit.
         """
         stmt = (
@@ -315,9 +315,9 @@ class NoteRepository:
                 Note.client_name == self.client_name,
                 Note.id == note_id,
             )
-            .returning(Note.id)
+            .returning(Note.id, Note.scope, Note.path_or_uri, Note.content_hash)
         )
-        return self.db.execute(stmt).one_or_none() is not None
+        return self.db.execute(stmt).one_or_none()
 
     def delete_by_path(
         self, scope: str, path_or_uri: str

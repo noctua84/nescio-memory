@@ -2,7 +2,7 @@
 path and delete by scope.
 
 Both routes share NOTE_NOT_FOUND_DETAIL and neither branches on *why* a note
-did not resolve: NoteRepository.get_note/delete_note return None/False for a
+did not resolve: NoteRepository.get_note/delete_note return None for a
 missing note AND for another tenant's note, on purpose (see
 app/repositories/note.py). A route that told those two cases apart would be
 an existence oracle over another tenant's id space -- "404 means it never
@@ -13,13 +13,15 @@ the *same* code path, not two paths that happen to agree today.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from langfuse import observe
+from langfuse import observe, propagate_attributes
 from sqlalchemy.orm import Session
 
 from app.api.v1.validation import validate_path_or_uri
 from app.core.db import get_db
 from app.core.security import get_current_client
+from app.core.tracing import annotate_span
 from app.models import ApiKey
+from app.repositories.audit import AuditRepository
 from app.repositories.note import DeletedNote as RepoDeletedNote
 from app.repositories.note import NoteRepository
 from app.schemas.errors import ErrorDetail
@@ -34,6 +36,7 @@ router = APIRouter()
 # process environment, so a deployment that sets LANGFUSE_* ships whatever is
 # captured off-site. Spans, timings and errors are still traced; only the
 # payloads are withheld. Do not turn these back on without a privacy review.
+# The delete routes attach who and how much to their trace, never path_or_uri.
 
 NOTE_NOT_FOUND_DETAIL = "Note not found"
 
@@ -113,14 +116,26 @@ def delete_note(
     db: Session = Depends(get_db),
     client: ApiKey = Depends(get_current_client),
 ) -> Response:
-    repo = NoteRepository(db, client_name=client.client_name)
-    # The passages go by cascade (the composite FK's ON DELETE CASCADE, see
-    # app/repositories/note.py), not by a second DELETE statement here.
-    if not repo.delete_note(note_id):
-        raise HTTPException(status_code=404, detail=NOTE_NOT_FOUND_DETAIL)
-    # Single transaction boundary, and it runs only on the success path: a
-    # 404 raised above leaves nothing to roll back.
-    db.commit()
+    with propagate_attributes(
+        user_id=client.client_name, metadata={"note_id": note_id}
+    ):
+        repo = NoteRepository(db, client_name=client.client_name)
+        # Counted first: the passages go by cascade (the composite FK's ON DELETE
+        # CASCADE, see app/repositories/note.py), not by a second DELETE statement
+        # here, so afterwards there is nothing left to count.
+        passages_before = repo.count_passages(note_id)
+        row = repo.delete_note(note_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=NOTE_NOT_FOUND_DETAIL)
+        _audit(db, client).record_deletes(
+            row.scope,
+            [RepoDeletedNote(row.id, row.path_or_uri, row.content_hash)],
+            {row.id: passages_before},
+        )
+        # Single transaction boundary, and it runs only on the success path: a
+        # 404 raised above leaves nothing to roll back.
+        db.commit()
+        annotate_span(scope=row.scope, passages_deleted=passages_before)
 
     # Deletes (this one, by path, by scope) are the ONLY erasure paths for a
     # note. Nothing reconciles a note against a deleted source file -- there is
@@ -162,18 +177,22 @@ def delete_note_by_path(
     db: Session = Depends(get_db),
     client: ApiKey = Depends(get_current_client),
 ) -> DeleteNotesResponse:
-    validate_path_or_uri(path_or_uri)
+    with propagate_attributes(user_id=client.client_name, metadata={"scope": scope}):
+        validate_path_or_uri(path_or_uri)
 
-    repo = NoteRepository(db, client_name=client.client_name)
-    deleted, passages_deleted = repo.delete_by_path(scope, path_or_uri)
-    # Same 404 as delete by id, and for the same reason it is not an oracle:
-    # the lookup is tenant-scoped, so "no match" and "another tenant's note"
-    # are one code path.
-    if not deleted:
-        raise HTTPException(status_code=404, detail=NOTE_NOT_FOUND_DETAIL)
-    # Single transaction boundary, success path only, as in delete_note.
-    db.commit()
-    return _delete_response(deleted, passages_deleted)
+        repo = NoteRepository(db, client_name=client.client_name)
+        audit = _audit(db, client)
+        deleted, passages_deleted = repo.delete_by_path(scope, path_or_uri)
+        # Same 404 as delete by id, and for the same reason it is not an oracle:
+        # the lookup is tenant-scoped, so "no match" and "another tenant's note"
+        # are one code path.
+        if not deleted:
+            raise HTTPException(status_code=404, detail=NOTE_NOT_FOUND_DETAIL)
+        # (scope, path_or_uri) is unique per client, so the total is this note's.
+        audit.record_deletes(scope, deleted, {deleted[0].note_id: passages_deleted})
+        # Single transaction boundary, success path only, as in delete_note.
+        db.commit()
+        return _traced_delete_response(deleted, passages_deleted)
 
 
 @router.delete(
@@ -224,13 +243,35 @@ def delete_scope(
     elif not scope:
         raise HTTPException(status_code=400, detail=SCOPE_REQUIRED_DETAIL)
 
-    repo = NoteRepository(db, client_name=client.client_name)
-    deleted, passages_deleted = repo.delete_scope(scope or "")
-    # No 404 for an empty scope: "nothing to delete" is the state the caller
-    # asked for, and 200 with zero counts keeps a retry after a partial
-    # failure idempotent. It is tenant-scoped, so it cannot reveal another
-    # tenant's scope either.
-    db.commit()
+    target_scope = scope or ""
+    with propagate_attributes(
+        user_id=client.client_name, metadata={"scope": target_scope}
+    ):
+        repo = NoteRepository(db, client_name=client.client_name)
+        audit = _audit(db, client)
+        passages_per_note = audit.passage_counts_in_scope(target_scope)
+        deleted, passages_deleted = repo.delete_scope(target_scope)
+        # No 404 for an empty scope: "nothing to delete" is the state the caller
+        # asked for, and 200 with zero counts keeps a retry after a partial
+        # failure idempotent. It is tenant-scoped, so it cannot reveal another
+        # tenant's scope either. No event either: nothing happened.
+        audit.record_deletes(target_scope, deleted, passages_per_note)
+        db.commit()
+        return _traced_delete_response(deleted, passages_deleted)
+
+
+def _audit(db: Session, client: ApiKey) -> AuditRepository:
+    # Read while the transaction is open: the commit expires the ORM instance.
+    return AuditRepository(db, client_name=client.client_name, api_key_id=client.id)
+
+
+def _traced_delete_response(
+    deleted: list[RepoDeletedNote], passages_deleted: int
+) -> DeleteNotesResponse:
+    metadata = {"notes_deleted": len(deleted), "passages_deleted": passages_deleted}
+    if len(deleted) == 1:
+        metadata["note_id"] = deleted[0].note_id
+    annotate_span(**metadata)
     return _delete_response(deleted, passages_deleted)
 
 

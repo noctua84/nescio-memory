@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
+from app.core.key_usage import KeyUsageRecorder, get_key_usage_recorder, key_use_is_due
 from app.models.api_key import ApiKey
 
 API_KEY_HEADER = "X-API-Key"
@@ -28,6 +29,7 @@ def generate_api_key(client_name: str) -> tuple[str, str, str]:
 def get_current_client(
     api_key: str | None = Security(_api_key_header),
     db: Session = Depends(get_db),
+    record_use: KeyUsageRecorder = Depends(get_key_usage_recorder),
 ) -> ApiKey:
     if not api_key:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing API key")
@@ -39,4 +41,6 @@ def get_current_client(
     record = db.execute(stmt).scalar_one_or_none()
     if record is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or revoked API key")
+    if key_use_is_due(record.last_used_at):
+        record_use(record.id)
     return record

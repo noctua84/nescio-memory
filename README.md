@@ -129,8 +129,9 @@ uv run python -m scripts.manage_api_keys revoke --id 1
 ```
 
 `list` shows each key's id, client, display prefix (the first 15 characters, so you can match a row to
-the key you copied), created time and revoked time. It never shows the secret or its hash. Revoked keys
-are hidden unless you pass `--include-revoked`.
+the key you copied), created time, revoked time and last-used time. It never shows the secret or its
+hash. Revoked keys are hidden unless you pass `--include-revoked`. The last-used time is written at most
+once per `KEY_LAST_USED_THROTTLE_S`, so a key can have been used more recently than it shows.
 
 - `revoke --id N` revokes one key. Revoking a key that is already revoked prints `revoked 0` and exits 0.
 - `revoke --client NAME --yes` revokes every active key of that client. It refuses without `--yes`.
@@ -615,6 +616,8 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `EMBED_RETRY_BASE_DELAY_S` | `0.5`                                  | backoff before the first retry, `0 < x <= EMBED_RETRY_MAX_DELAY_S`; it doubles each retry and the actual wait is uniformly random below that (full jitter) |
 | `EMBED_RETRY_MAX_DELAY_S` | `4.0`                                   | longest single backoff, `0 < x <= 10`; also the cap on a `Retry-After` the embedding server sends with a 429 or 503 |
 | `EMBED_RETRY_BUDGET`  | `2`                                         | retries shared by **all** calls of one ingest request, `0..10`; `0` disables retry. See "Ingestion retries" under Current limitations for the worst-case bound |
+| `KEY_LAST_USED_THROTTLE_S` | `300`                                  | `api_keys.last_used_at` is rewritten at most once per this many seconds per key, `0..86400`; `0` touches on every request — see [Audit trail](#audit-trail) |
+| `AUDIT_RETENTION_DAYS` | `400`                                      | days `ingest_events` rows survive `scripts/prune_ingest_events.py`, `30..3650` — see [Audit trail](#audit-trail) |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
 
 ### Logging
@@ -755,6 +758,107 @@ depend on the embedding backend, and an API that will not start because Ollama i
 worse failure than the one being guarded against. `tests/test_embedding_width_contract.py` runs the
 same probe in the suite and **skips** when no backend is reachable — the skip is printed in every
 run's summary (`addopts = "-ra"`), because a silent skip would leave the same hole.
+
+## Audit trail
+
+The `ingest_events` table records who changed which note, so a change can be attributed after the
+fact without Langfuse.
+
+**Why a table in the same database.** Each event is written in the transaction of the change it
+records, so there is no change without a record and no record without the change: an ingest that
+rolls back (an embedding `503`, say) leaves neither. A log line or a Langfuse trace can be lost
+separately from the write, and tracing is optional anyway. The table is append-only: the service
+only inserts into it, and only the prune script below deletes from it.
+
+**What is recorded.** One row per note, per outcome:
+
+| `action`   | Written by                         | `passages_*` and `content_hash_*`                  |
+| ---------- | ---------------------------------- | -------------------------------------------------- |
+| `created`  | ingest of a new note               | nothing before; the new values after               |
+| `replaced` | ingest that rewrote the note       | what it held before; the new values after          |
+| `skipped`  | ingest of unchanged content        | the same values before and after                   |
+| `deleted`  | delete by id, by path and by scope | what it held before; nothing after                 |
+
+Every row also has `at`, `client_name`, `scope`, `note_id`, `path_sha256` and `api_key_id`. `action`
+`replaced` can have a NULL `content_hash_before` when two first ingests of a new note raced, because
+the loser's upsert overwrote a hash it never read. No note content is stored, only its hash. A delete
+that matched nothing writes nothing. `api_key_id` is a plain integer with no foreign key: a foreign key
+check would take a lock on the key's row inside ingest's long transaction, and the record must not
+depend on the key row's lifecycle.
+
+**Path hashing.** A deleted note's path is stored hashed only: `path_sha256` is set and `path_or_uri`
+is NULL. Every other event also stores `path_or_uri` in plain text.
+
+- **Residual:** deleting a note does not rewrite its earlier `created`, `replaced` and `skipped`
+  events, so those rows still hold the plain path until retention removes them. Because
+  `path_sha256` is on every event, "everything that happened to path P" is one query by hash.
+- A plain SHA-256 of a guessable path can be confirmed by anyone who already knows the path. That is
+  the intended operator use, and it is accepted.
+
+**Retention.** `scripts/prune_ingest_events.py` deletes rows older than `AUDIT_RETENTION_DAYS` (400 by
+default). Nothing else does, so schedule it, on the same schedule as your database backup:
+
+```bash
+uv run python -m scripts.prune_ingest_events                  # from a checkout
+docker compose exec app python scripts/prune_ingest_events.py # in the Compose stack
+```
+
+It prints how many rows it deleted. A database failure exits non-zero.
+
+**Access.** Operators only, through SQL. There is no API route, so a client cannot read the trail, not
+even its own part of it. Query recipes:
+
+Which key replaced note X on date D, and what did it have before?
+
+<!-- recipe: replaced-on-date -->
+```sql
+SELECT e.at, e.api_key_id, k.key_prefix, k.revoked_at,
+       e.passages_before, e.passages_after, e.content_hash_before, e.content_hash_after
+FROM ingest_events e
+LEFT JOIN api_keys k ON k.id = e.api_key_id
+WHERE e.client_name = :client_name
+  AND e.note_id = :note_id
+  AND e.action = 'replaced'
+  AND e.at >= CAST(:day AS date)
+  AND e.at < CAST(:day AS date) + 1
+ORDER BY e.at;
+```
+
+Everything that happened to a path, the deletes included (Python's `hashlib.sha256` or
+`printf %s "$path" | sha256sum` gives the hash):
+
+<!-- recipe: path-history -->
+```sql
+SELECT at, action, api_key_id, note_id, passages_before, passages_after
+FROM ingest_events
+WHERE client_name = :client_name
+  AND path_sha256 = :path_sha256
+ORDER BY at;
+```
+
+What one key has done, most recent first:
+
+<!-- recipe: key-history -->
+```sql
+SELECT at, action, client_name, scope, note_id, path_or_uri
+FROM ingest_events
+WHERE api_key_id = :api_key_id
+ORDER BY at DESC
+LIMIT 100;
+```
+
+Values are written as `:name`, so these run as they are through a client that binds parameters;
+in `psql`, substitute them by hand or with `\set`.
+
+**Key usage.** `api_keys.last_used_at` is written on its own short transaction on a separate
+connection, never inside the request's, so a long ingest cannot hold the key's row locked. It is
+updated at most once per `KEY_LAST_USED_THROTTLE_S` per key. A failed update logs a `WARNING` and does
+not fail the request. An ingest that later rolls back still counts as a use: the key *was* used.
+
+**Langfuse.** When tracing is on, ingest, delete and search traces also carry the client name as the
+user id, and the scope and counts (`note_id`, `skipped`, passages, results) as metadata. `path_or_uri`
+and the search query are never attached. Langfuse drops a scope or client name longer than about 200
+characters from the trace, and logs a warning that does not contain the value.
 
 ## Development
 

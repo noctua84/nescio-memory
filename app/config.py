@@ -99,6 +99,13 @@ class Settings(BaseSettings):
     # result (a check that is still running is always shared regardless).
     ready_cache_ttl_s: float = 5.0
 
+    # Audit trail. How stale api_keys.last_used_at may get: the column is
+    # rewritten at most once per this many seconds per key, which is what keeps
+    # the extra connection app.core.key_usage takes rare. 0 touches every request.
+    key_last_used_throttle_s: int = 300
+    # How long ingest_events rows are kept (scripts/prune_ingest_events.py).
+    audit_retention_days: int = 400
+
     # langfuse:
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
@@ -325,6 +332,21 @@ class Settings(BaseSettings):
                 "EMBED_RETRY_BUDGET must be in range 0..10, got "
                 f"{self.embed_retry_budget}; 0 disables retry, and the budget "
                 "bounds how much longer ingest holds its row lock"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _audit_knobs_must_be_in_range(self) -> "Settings":
+        if not 0 <= self.key_last_used_throttle_s <= 86400:
+            raise ValueError(
+                "KEY_LAST_USED_THROTTLE_S must be in range 0..86400, got "
+                f"{self.key_last_used_throttle_s}; 0 touches on every request"
+            )
+        if not 30 <= self.audit_retention_days <= 3650:
+            raise ValueError(
+                "AUDIT_RETENTION_DAYS must be in range 30..3650, got "
+                f"{self.audit_retention_days}; the prune script deletes on this "
+                "number, so a typo must not erase the record of who changed what"
             )
         return self
 

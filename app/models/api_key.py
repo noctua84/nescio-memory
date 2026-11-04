@@ -19,3 +19,8 @@ class ApiKey(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Throttled by KEY_LAST_USED_THROTTLE_S and written on its own connection;
+    # see app/core/key_usage.py. Never written through this model.
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

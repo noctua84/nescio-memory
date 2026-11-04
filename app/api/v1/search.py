@@ -7,7 +7,7 @@ With VECTOR_WEIGHT=0 the vector arm is off and the query is never embedded.
 import logging
 
 from fastapi import APIRouter, Depends
-from langfuse import observe
+from langfuse import observe, propagate_attributes
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -15,6 +15,7 @@ from app.core.db import get_db
 from app.core.embeddings import get_query_embedding
 from app.core.errors import EmbeddingBackendError
 from app.core.security import get_current_client
+from app.core.tracing import annotate_span
 from app.models import ApiKey
 from app.repositories.passage_search import PassageSearchRepository
 from app.schemas.search import SearchRequest, SearchResponse, SearchResult
@@ -56,6 +57,16 @@ def search_passages(
     db: Session = Depends(get_db),
     client: ApiKey = Depends(get_current_client),
 ) -> SearchResponse:
+    # Trace attribution; the query text is never attached. A None value would be
+    # dropped with a warning on every unfiltered search, hence the condition.
+    metadata = {} if request.repo_filter is None else {"scope": request.repo_filter}
+    with propagate_attributes(user_id=client.client_name, metadata=metadata):
+        response = _search(request, db, client)
+        annotate_span(results=len(response.results), degraded=response.degraded)
+    return response
+
+
+def _search(request: SearchRequest, db: Session, client: ApiKey) -> SearchResponse:
     # Embed BEFORE the repository's first statement so no search work (and no
     # statement_timeout window) overlaps the HTTP call. get_current_client has
     # already run a SELECT on this session, which autobegins a transaction and
