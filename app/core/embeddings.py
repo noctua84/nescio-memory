@@ -197,7 +197,7 @@ def _sleep(seconds: float) -> None:
 
 def _rand() -> float:
     # Retry jitter, not a security context. SystemRandom only because Sonar's S2245
-    # flags the default generator and does not honour NOSONAR here.
+    # flags the default generator.
     return random.SystemRandom().random()
 
 
