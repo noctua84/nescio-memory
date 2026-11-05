@@ -78,7 +78,7 @@ def get_note(
     # Mapped field by field to the DTO. Never return a `Row`/model instance
     # directly -- the response shape is the contract, not whatever columns
     # get_note happens to select.
-    return NoteResponse(
+    response = NoteResponse(
         id=row.id,
         scope=row.scope,
         path_or_uri=row.path_or_uri,
@@ -96,6 +96,15 @@ def get_note(
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+    # Built first, released second: count_passages above is the last statement, and
+    # `row` is a plain Row, so nothing after this needs the session. The return is
+    # a thread hop (response validation runs in a separate threadpool task), and
+    # the invariant in get_db is that no connection is held across one. commit(),
+    # not rollback(): the transaction is read-only, and under the test fixture
+    # commit releases only the SAVEPOINT, whereas rollback would discard the
+    # seeded rows.
+    db.commit()
+    return response
 
 
 @router.delete(
@@ -261,7 +270,8 @@ def delete_scope(
 
 
 def _audit(db: Session, client: ApiKey) -> AuditRepository:
-    # Read while the transaction is open: the commit expires the ORM instance.
+    # `client` is detached by get_current_client (see get_db): its columns are
+    # plain values, so reading them needs no transaction, before a commit or after.
     return AuditRepository(db, client_name=client.client_name, api_key_id=client.id)
 
 
