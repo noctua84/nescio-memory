@@ -906,11 +906,64 @@ user id, and the scope and counts (`note_id`, `skipped`, passages, results) as m
 and the search query are never attached. Langfuse drops a scope or client name longer than about 200
 characters from the trace, and logs a warning that does not contain the value.
 
+## MCP server
+
+`nescio_mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI
+agent this memory as tools, over stdio. It calls the HTTP API and nothing else, using one client's
+own API key, so an agent can do exactly what that client could do with `curl`: it sees only that
+client's notes. It runs from a checkout and needs the optional `mcp` extra, not a database or the
+API's settings. The service itself runs separately.
+
+Register it with Claude Code, using a key from [step 4 of the Quick start](#4-create-an-api-key):
+
+```bash
+claude mcp add --env NESCIO_URL=http://localhost:8080 --env NESCIO_API_KEY=nm_your_key_here \
+  --transport stdio nescio-memory -- uv run --directory /path/to/nescio-memory --extra mcp python -m nescio_mcp
+```
+
+Options go before the server name and the command after `--`. `--env` takes several values, so an
+option has to separate the last one from the name, which is why `--transport stdio` sits there.
+`--directory` matters: the server has to run from the repository root. The key ends up in Claude
+Code's MCP configuration; use `--scope local` (the default) or `--scope user`, not `--scope project`,
+which writes it to a file you might commit.
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `NESCIO_URL` | *required* | base URL of the service, http or https, with no path, query or credentials; the host must be `localhost`, `127.0.0.1`, `::1` or on `NESCIO_ALLOWED_HOSTS`; anything else stops the server at startup, because the key is sent to this host |
+| `NESCIO_API_KEY` | *required* | the client's API key; must not be empty and must be printable ASCII with no whitespace |
+| `NESCIO_TIMEOUT_S` | `120` | seconds per HTTP request, `1..600`; generous because an ingest of a large note embeds many sub-batches before it answers |
+| `NESCIO_MAX_RETRY_AFTER_S` | `30` | longest wait before the one retry of a `429` or `503`, `0..60` |
+| `NESCIO_ALLOWED_HOSTS` | *(empty)* | comma-separated extra hosts for `NESCIO_URL`, the same variable `scripts/reingest.py` reads |
+
+All of these come from the process environment; this process reads no `.env` file.
+
+| Tool | Calls | Notes |
+| ---- | ----- | ----- |
+| `search_memory(query, top_k=5, repo_filter=None)` | `POST /api/v1/search` | read-only; `repo_filter` limits it to one scope; `degraded: true` in the result means keyword matches only |
+| `ingest_note(scope, path_or_uri, content, force=False)` | `POST /api/v1/ingest` | replaces any note at the same scope and path; unchanged content is skipped unless `force` is set |
+| `get_note(id)` | `GET /api/v1/notes/{id}` | read-only |
+| `delete_note(id)` | `DELETE /api/v1/notes/{id}` | destructive |
+| `delete_note_by_path(scope, path_or_uri)` | `DELETE /api/v1/notes` | destructive; for a caller that does not hold the id |
+| `memory_status()` | `GET /health`, `GET /ready` | read-only; `ready.status` is the [readiness](#get-ready) status, and `not_ready` is a result rather than an error |
+
+Deleting a whole scope and bulk sync are deliberately not tools: an agent should not be one call away
+from erasing a scope, and [`scripts/reingest.py`](#re-ingesting-a-corpus) is the bulk path.
+
+A `429` or `503` is retried once, after `min(Retry-After, NESCIO_MAX_RETRY_AFTER_S)`, or 5 seconds
+under the same cap when the response has no usable `Retry-After`. `/ready` is not retried. Any other
+failure becomes a tool error holding the server's `detail` and any `Retry-After`, so the limits on
+[ingest](#post-apiv1ingest) reach the agent as their own message. The API key never appears in a
+tool error or the log, even if a server echoes it back. A call takes at most two request timeouts
+plus one capped wait.
+
+stdout is the protocol channel, so the server logs to stderr only, at `WARNING`.
+
 ## Development
 
 ```bash
 uv sync --locked                      # install / refresh the environment
 uv sync --locked --extra local-embeddings  # only if using the in-process backend
+uv sync --locked --extra mcp          # only if using or testing the MCP server
 uv lock                               # after changing dependencies in pyproject.toml
 uv run python export_openapi.py       # regenerate openapi.json + openapi.yaml
 uv run uvicorn app.main:app --reload --port 8000  # dev server (from the repository root)
