@@ -766,9 +766,10 @@ Every night a systemd timer runs three steps, each only if the one before succee
 2. **Restore check** ([`scripts/restore_check.py`](scripts/restore_check.py)): fetch the newest dump
    back from the remote, check its sha256, restore it into a scratch database, and verify it. The
    alembic revision and every client's counts must match the manifest, the HNSW index must exist and
-   be valid, and a stored passage's embedding used as the query must return that passage's note as
-   the top hit, both through the production search and straight from the index with the planner
-   forced onto it. This needs no Ollama. The scratch database is then dropped.
+   be valid, and of 100 randomly drawn passages, fewer than a quarter may fail to return their own
+   note as the top hit from their own embedding, both through the production search and straight
+   from the index with the planner forced onto it. This needs no Ollama. The scratch database is
+   then dropped.
 3. **Heartbeat**: a `GET` of `BACKUP_HEARTBEAT_URL`, only if all of that passed. A dead-man's switch
    such as [healthchecks.io](https://healthchecks.io) alerts when the ping stops arriving, so **silence
    is the alert**: a broken timer, a dead VPS and a corrupt dump look the same and all of them page you.
@@ -931,7 +932,8 @@ databases. `GET /ready` must report the database `ok`; if the checkout is newer 
 | `pg_restore failed with exit code N` | repeat the restore step above to see why. The dump is suspect until it passes |
 | `does not match its manifest's sha256`, `counts differ`, `alembic revision` | **the backup is not what it claims to be.** Take a new one now and do not rely on this one |
 | `HNSW index … is missing` or `is not valid` | the restore did not reproduce the index. Check the restore server's `maintenance_work_mem` and disk |
-| `top hit` | the embeddings or the index did not survive, **or**, once, HNSW's own limit: part of the graph can be unreachable (see [Current limitations](#current-limitations)), and the probe is one passage. Measured on the synthetic data under [Measured restore time](#measured-restore-time), the share of passages the index could not find from their own embedding was 13 of 20,000 (0.07%) at 20,000 passages and 677 of a 20,000 sample (3.4%) at 100,000, so this rises with the corpus. Run the check again, since each restore builds the index anew. If it fails twice, treat the backup as bad |
+| `top hit` | **25 or more of the 100 passages checked could not find their own note, so the index or the embeddings did not survive.** This is not HNSW's ordinary misses, which stay well below that (see [What the search check can and cannot catch](#what-the-search-check-can-and-cannot-catch)). Treat the backup as bad and take a new one now; run the check again only to confirm |
+| `database error InternalError_ (sqlstate XX000)` from the search, or another database error after the index checks | the index file on the restore server's disk is corrupt: an unreadable index passes the catalog check and fails when the search reads it, and the Postgres log on the restore server says `hnsw index is not valid`. Check the restore server's disk |
 | `the heartbeat did not land` | the backup verified, but the ping failed three times. The run counts as failed, and you get the alert. Check the VPS's egress and the URL |
 
 ### Measured restore time
@@ -952,6 +954,70 @@ dominates the time, and once the graph outgrows `maintenance_work_mem` the build
 the restoring server more of it, and more `max_parallel_maintenance_workers`, before a large restore.
 `pg_restore --jobs` helps across indexes rather than within one build. `embedding_degenerate` is a
 generated column and is recomputed by the restore, not copied.
+
+### What the search check can and cannot catch
+
+From real restores and real check runs on 2026-11-05. **The vectors are synthetic, clustered and
+1024-wide, the restores were real `pg_restore` runs on PostgreSQL's defaults, and the machine was the
+same 24-core Docker VM as above, so these rates are not a prediction for your notes.** Each night the
+check draws a fresh random sample of 100 non-degenerate passages and asks, for each, both the
+production search and the forced-HNSW query for its own note. It fails when 25 or more miss on either
+arm. A top hit in another note of the same client holding the identical vector counts as a hit, so a
+passage sharing its vector with another note cannot count as a miss: the check compares only with the
+note that came back. On success it prints `restore search_probes=100 search_misses=N index_misses=N`.
+
+**Healthy restores.** A passage's own embedding missing its note is normal for HNSW, and the rate rises
+with the corpus.
+
+| Passages | Restores measured | Passages sampled per restore | Missed their own note | Chance of one night's check failing (calculated from the measured misses) | Real check runs, failed |
+| --- | --- | --- | --- | --- | --- |
+| 20,000 | 6 | all 20,000 | 0.08% | below 1e-15 | 300, 0 |
+| 100,000 | 5 | 20,000 | 3.41% | 4e-15 | 600, 0 |
+| 300,000 | 2 | 20,000 | 7.81% | 2e-7 | 300, 0 |
+
+The most misses in any real run were 1 of 100 at 20,000 passages, 14 at 100,000 and 17 at 300,000.
+For contrast, a check on one probe would have failed on 3.4% of nights at 100,000 passages, about once
+a month, and on 7.8% at 300,000.
+
+**Broken indexes the catalog reports as valid.** At 100,000 passages unless noted, each measured over
+5,000 passages, then over 200 real check runs.
+
+| Index state | Missed their own note | Check failed | "All of 3 miss" would catch (calculated) |
+| --- | --- | --- | --- |
+| 5% of rows absent | 8.0% | 0 of 200 | 0.05% |
+| 10% absent | 13.2% | 0 of 200 | 0.2% |
+| 25% absent | 27.6% | 140 of 200 | 2% |
+| 50% absent | 50.6% | 200 of 200 | 13% |
+| 50% absent, 20,000 passages | 49.8% | 200 of 200 | 12% |
+| 75% absent | 74.7% | 200 of 200 | 42% |
+| 90% absent | 89.9% | 200 of 200 | 73% |
+| all absent, at both 20,000 and 100,000 | 100% | 200 of 200 each | 100% |
+| graph built with m=2, ef_construction=4 | 95.4% (85.7% at 20,000) | 200 of 200 each | 87% (63%) |
+
+Two other states. With the index dropped, the catalog check fails it by name, and it must, because
+with no index both arms answer exactly and missed 0 of 100 in 12 of 12 runs. With the index file
+zeroed on disk, the catalog still says valid and the first search fails, with `hnsw index is not valid`
+in the restore server's Postgres log and `database error` in the journal; 6 of 6 runs failed.
+
+**What it does not catch.**
+
+- An index missing about a third of its rows or more is caught. A loss of 10% or less passes, since it
+  looks like the ordinary miss rate of a larger corpus. So does a shuffle of embeddings between notes,
+  since a probe's vector comes from the same restored table.
+- The vectors are synthetic. Real embeddings will miss at different rates, and the 300,000 rate was
+  the largest measured. Calculated, not measured: the chance of a false alarm reaches about 1 in 1,000
+  per night when 13% of passages miss. The miss rate rose from 3.4% to 7.8% between 100,000 and 300,000
+  passages, so if it keeps rising that way, 13% is on the order of 1,000,000 passages, which was not
+  measured.
+- So watch the `index_misses` figure in the journal's `restore search_probes=` line. Repeatedly near
+  25 means the threshold needs revisiting, or the index needs better build parameters, before it pages.
+
+**Cost.** One check took a median of 2.1 s at 100,000 passages and 3.2 s at 300,000 on an otherwise
+idle machine, and the slowest of five runs took 7.8 s. The sampling statement took 30 ms and 85 ms.
+The slowest single search statement across all the healthy runs was under 1 s, on a machine busy with
+concurrent restores, against the 5 s statement timeout. No statement scans a client's embeddings:
+comparing every stored vector for uniqueness was what the earlier single-probe query did, and it did
+not finish in 60 s at 100,000 passages once the table had statistics.
 
 ### Replacing the timer with a Kubernetes CronJob
 
