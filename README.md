@@ -1015,9 +1015,9 @@ in the restore server's Postgres log and `database error` in the journal; 6 of 6
 **Cost.** One check took a median of 2.1 s at 100,000 passages and 3.2 s at 300,000 on an otherwise
 idle machine, and the slowest of five runs took 7.8 s. The sampling statement took 30 ms and 85 ms.
 The slowest single search statement across all the healthy runs was under 1 s, on a machine busy with
-concurrent restores, against the 5 s statement timeout. No statement scans a client's embeddings:
-comparing every stored vector for uniqueness was what the earlier single-probe query did, and it did
-not finish in 60 s at 100,000 passages once the table had statistics.
+concurrent restores, against the 5 s statement timeout. The check does not compare a probe with every
+stored vector of its client to prove it unique: the earlier single-probe query did, and it did not
+finish in 60 s at 100,000 passages once the table had statistics.
 
 ### Replacing the timer with a Kubernetes CronJob
 
