@@ -8,14 +8,11 @@ runs these on a real restore on every run of the suite.
 from __future__ import annotations
 
 import json
-import logging
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from scripts._backup_common import BackupError, Manifest, read_db_facts
-
-logger = logging.getLogger(__name__)
 
 HNSW_INDEX = "passages_embedding_idx"
 
@@ -224,11 +221,10 @@ def assert_search_finds_a_stored_passage(db: Session) -> None:
             f"(fails at {MAX_MISS_SHARE:.0%})"
         )
 
-    logger.info(
-        "restore search check passed: probes=%d search_misses=%d index_misses=%d",
-        total,
-        search_misses,
-        index_misses,
+    print(
+        f"restore search_probes={total} search_misses={search_misses} "
+        f"index_misses={index_misses}",
+        flush=True,
     )
 
 
