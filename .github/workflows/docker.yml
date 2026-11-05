@@ -54,9 +54,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
+      # compose has no default database password and interpolates on every
+      # command, so each later step, `logs` and `down -v` included, needs this.
+      # It is generated per run; nothing is hardcoded.
+      - name: Generate a throwaway database password
+        run: echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" >> "$GITHUB_ENV"
+
       # db, migrate and app only: Ollama is deliberately left out. The model
       # download is large and slow, and the app is designed to start without it.
-      # With no .env file every setting falls back to its compose default.
+      # With no .env file every setting except the password falls back to its
+      # compose default.
       # `--wait` returns once the app is healthy (its healthcheck calls /ready,
       # which needs the database) and fails if migrate exits non-zero.
       - name: Start db, migrate and app
@@ -68,7 +75,7 @@ jobs:
         run: |
           status=""
           for _ in $(seq 1 30); do
-            status=$(curl -s http://localhost:8080/ready | python3 -c 'import json,sys; print(json.load(sys.stdin)["checks"]["database"]["status"])' || true)
+            status=$(curl -s http://localhost:8080/ready | jq -r '.checks.database.status' || true)
             [ "$status" = "ok" ] && break
             sleep 2
           done

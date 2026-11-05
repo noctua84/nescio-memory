@@ -150,13 +150,17 @@ and 3 (the `migrate` service applies the schema). To run the API from a Python c
 see [Development](#development).
 
 ```bash
+cp .env.example .env
+# set POSTGRES_PASSWORD in .env; this prints a URL-safe value to paste in:
+openssl rand -hex 16
 docker compose up -d
 docker compose exec app python scripts/create_api_key.py my-client   # step 4, inside the container
 curl http://localhost:8080/ready
 ```
 
-`.env` is optional here: every value has a default. Copy `.env.example` to `.env` to change
-`OLLAMA_MODEL`, enable Langfuse and so on.
+`.env` is required here, with `POSTGRES_PASSWORD` set: that value has no default, and every
+`docker compose` command fails until it is set. Every other value has a default; change them in
+`.env` to switch `OLLAMA_MODEL`, enable Langfuse and so on.
 
 The API is published on port **8080** (`APP_PORT` changes the host side); interactive docs are at
 <http://localhost:8080/docs>. The first `up` pulls the Ollama image and downloads the embedding
@@ -183,9 +187,9 @@ model, so `/ready` reports `degraded` until that finishes. The committed contrac
   the process environment, which is where the Langfuse SDK reads it, so the
   [`.env` limitation](#current-limitations) does not apply here. `DATABASE_URL` and `OLLAMA_URL`
   are overridden to point at the `db` and `ollama` services, whatever `.env` says. Database
-  credentials come from `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB` (default `nescio`,
-  `nescio`, `nescio_memory`); set a real password if the stack is reachable from anywhere but
-  your own machine, and keep it URL-safe because it is placed into `DATABASE_URL`.
+  credentials come from `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB`. `POSTGRES_USER`
+  and `POSTGRES_DB` default to `nescio` and `nescio_memory`; `POSTGRES_PASSWORD` has no default and
+  is required. Keep it URL-safe because it is placed into `DATABASE_URL`.
 - **Image variants.** The default image uses Ollama and has no torch. For the in-process backend,
   build with the `local-embeddings` extra:
 

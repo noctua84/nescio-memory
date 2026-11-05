@@ -196,7 +196,7 @@ def _sleep(seconds: float) -> None:
 
 
 def _rand() -> float:
-    return random.random()
+    return random.random()  # NOSONAR: retry jitter, not a security context
 
 
 def _clock() -> float:

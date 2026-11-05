@@ -1,8 +1,11 @@
 # Local / single-host stack: PostgreSQL + pgvector, Ollama, schema migration and
 # the API.
 #
-#   cp .env.example .env     # optional; every value below has a default
+#   cp .env.example .env     # required: set POSTGRES_PASSWORD in it
 #   docker compose up -d
+#
+# POSTGRES_PASSWORD has no default, so every docker compose command fails until
+# it is set. The other values below fall back to a default.
 #
 # Startup order (each step waits for the previous one to succeed):
 #   db (healthy) -> migrate (exits 0) -> app (healthy)
@@ -38,7 +41,10 @@ x-app-env: &app-env
   environment:
     # These override the same keys in .env, which point at localhost for the
     # non-container workflow. Inside the stack the services are reached by name.
-    DATABASE_URL: postgresql://${POSTGRES_USER:-nescio}:${POSTGRES_PASSWORD:-nescio}@db:5432/${POSTGRES_DB:-nescio_memory}
+    # The password is deliberately a bare variable: compose interpolates the whole
+    # file, so the `:?` on the db service already fails every command when it is
+    # unset or empty.
+    DATABASE_URL: postgresql://${POSTGRES_USER:-nescio}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-nescio_memory}
     OLLAMA_URL: http://ollama:11434/api/embed
 
 services:
@@ -47,9 +53,9 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-nescio}
-      # The default is only safe because the port is not published to the host.
-      # Set a real password in .env before exposing the database.
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nescio}
+      # Required: there is no default password. Unset or empty fails every compose
+      # command.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example)}
       POSTGRES_DB: ${POSTGRES_DB:-nescio_memory}
     volumes:
       - pgdata:/var/lib/postgresql/data
