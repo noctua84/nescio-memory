@@ -586,6 +586,7 @@ fixed message for each failure below, never an exception message.
 | 500 | `Embedding backend is misconfigured` | none | The embedding backend cannot work as deployed. Retrying will not help; the deployment must change. |
 | 500 | `Internal server error` | none | An unanticipated failure. The traceback is in the server log. |
 | 503 | `Database unavailable` | 30 | The database cannot be reached. |
+| 503 | `Database busy` | 30 | Every database connection was in use for longer than the pool allows waiting (30 s). The database itself is up; retry. |
 | 503 | `Query exceeded time limit` | none | A query was cancelled, in practice by the search `statement_timeout` (`STATEMENT_TIMEOUT_MS`). |
 | 503 | `Embedding backend unavailable` | 30 | The embedding backend cannot be reached, timed out, or answered with a transient HTTP status. |
 | 503 | `Embedding backend returned an unexpected response` | 30 | The embedding backend answered with something that is not a usable vector. |
