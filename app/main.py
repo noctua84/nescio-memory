@@ -54,9 +54,12 @@ def create_app() -> FastAPI:
     app.include_router(api_router, prefix="/api/v1")
 
     @app.get("/health", tags=["Ops"])
-    def health():
+    async def health():
         # Liveness only — deliberately does not contact Ollama or the database,
         # so an unhealthy dependency cannot get the pod restarted.
+        # Async on purpose: it does no blocking work, and an async route takes no
+        # threadpool token, so a probe does not queue behind API work under load.
+        # Do not add blocking work here; it would stall the event loop.
         model = (
             settings.ollama_model
             if settings.embedding_backend == "ollama"
