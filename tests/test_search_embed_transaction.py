@@ -4,8 +4,8 @@ get_current_client runs a SELECT on the request's session, which autobegins a
 transaction and checks a pool connection out. The query embed can then wait up
 to QUERY_EMBED_TIMEOUT_S on Ollama, so without an explicit release every slow
 embed would sit on an idle-in-transaction connection and a slow Ollama would
-exhaust the pool. app/api/v1/search.py therefore commits the read-only auth
-transaction before calling the embedder.
+exhaust the pool. get_current_client therefore ends that transaction before it
+returns (see get_db's docstring), and nothing reopens one before the embedder.
 
 The embedder is replaced by one that records the session's state at the moment
 it is called; that is the only point at which the property matters.
