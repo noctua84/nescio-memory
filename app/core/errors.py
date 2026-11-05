@@ -21,6 +21,10 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import DataError, OperationalError, StatementError
 
+# Aliased because the builtin TimeoutError is a different, unrelated class (an
+# OSError subclass); SQLAlchemy's is what the connection pool raises.
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -30,6 +34,7 @@ logger = logging.getLogger(__name__)
 RETRY_AFTER_SECONDS = 30
 
 DATABASE_UNAVAILABLE_DETAIL = "Database unavailable"
+DATABASE_BUSY_DETAIL = "Database busy"
 QUERY_TIMEOUT_DETAIL = "Query exceeded time limit"
 INVALID_DATA_DETAIL = "Request contains data the database cannot accept"
 INTERNAL_ERROR_DETAIL = "Internal server error"
@@ -237,6 +242,32 @@ def register_exception_handlers(app: FastAPI) -> None:
             )
             return _service_unavailable(QUERY_TIMEOUT_DETAIL, retry=False)
         return _service_unavailable(DATABASE_UNAVAILABLE_DETAIL)
+
+    @app.exception_handler(PoolTimeoutError)
+    async def _database_busy(request: Request, exc: PoolTimeoutError) -> JSONResponse:
+        # The connection pool had no free connection for pool_timeout seconds. That
+        # is saturation, not an outage: the database may be perfectly healthy, and
+        # the same request a moment later will usually find a connection. Hence a
+        # detail of its own, which tells a client and an operator apart from the
+        # "Database unavailable" of a refused connection, and the same Retry-After
+        # hint to back off.
+        #
+        # Not an OperationalError (it derives from SQLAlchemyError directly), so
+        # it would otherwise fall through to the catch-all below and answer 500.
+        # Starlette picks the handler nearest in the exception's MRO, which is
+        # what lets this one win over the Exception handler.
+        #
+        # The message is safe to log: SQLAlchemy builds it from the pool's size
+        # and timeout, never from a statement or its parameters, so it needs no
+        # _scrub_statement_errors (that walks StatementError, which this is not).
+        # No exc_info: the traceback is the request's own wait for a connection and
+        # says nothing the message does not.
+        logger.warning(
+            "Connection pool exhausted on %s (%s)",
+            request.url.path,
+            exc,
+        )
+        return _service_unavailable(DATABASE_BUSY_DETAIL)
 
     @app.exception_handler(DataError)
     async def _invalid_data(request: Request, exc: DataError) -> JSONResponse:

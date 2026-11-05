@@ -1,9 +1,14 @@
 """api_keys.last_used_at, written on its own short transaction.
 
-Never on the request's session. Ingest holds one transaction from the auth SELECT
-through embedding to its commit, so a touch inside it would keep the key's row
-locked for as long as that takes, and every other request with that key would
-queue behind it. On a separate connection the row lock lasts for one statement.
+Never on the request's session. Ingest holds one transaction from its first
+statement through embedding to its commit, so a touch inside it would keep the
+key's row locked for as long as that takes, and every other request with that key
+would queue behind it. On a separate connection the row lock lasts for one
+statement.
+
+get_current_client calls it only after ending the auth transaction, so the touch
+takes a connection while the request holds none, rather than a second under the
+first (the invariant is in app/core/db.py, get_db).
 
 An ingest that later rolls back still records the use, which is correct: the key
 *was* used.
@@ -38,11 +43,10 @@ def key_use_is_due(last_used_at: datetime | None) -> bool:
     """Whether a touch could change anything, judged from the row auth just read.
 
     This is what makes the extra connection rare. The statement above is throttled
-    but still needs a connection to find that out, and at that moment the request
-    is already holding one for its auth SELECT: taking a second on every request
-    would let a burst the size of the pool hold them all while each waits for
-    another. The app's clock only decides whether to ask; the statement stays the
-    authority.
+    but still needs a connection to find that out, and on every request that is a
+    checkout for nothing: a burst would spend its time queueing for pool slots to
+    learn that no write was due. The app's clock only decides whether to ask; the
+    statement stays the authority.
     """
     if last_used_at is None:
         return True

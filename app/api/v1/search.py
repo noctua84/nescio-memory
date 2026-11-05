@@ -76,23 +76,19 @@ def search_passages(
 
 def _search(request: SearchRequest, db: Session, client: ApiKey) -> SearchResponse:
     # Embed BEFORE the repository's first statement so no search work (and no
-    # statement_timeout window) overlaps the HTTP call. get_current_client has
-    # already run a SELECT on this session, which autobegins a transaction and
-    # checks a pool connection out, and the embed can wait up to
-    # QUERY_EMBED_TIMEOUT_S on Ollama (a cold model load is the slow case). So
-    # the auth read is ended first, or every in-flight embed would pin one
+    # statement_timeout window) overlaps the HTTP call. The embed can wait up to
+    # QUERY_EMBED_TIMEOUT_S on Ollama (a cold model load is the slow case), so no
+    # transaction may be open then, or every in-flight embed would pin one
     # idle-in-transaction connection and a slow Ollama would exhaust the pool.
-    # commit(), not rollback()/close(): it ends the read-only transaction and
-    # returns the connection to the pool, and under the test fixture it releases
-    # only the SAVEPOINT, whereas rollback would discard the seeded rows.
-    # client_name is read first because commit() expires the ORM instance. The
-    # repository's first statement re-begins a transaction, which its set_config
+    # None is open, and no statement here is needed to make it so: get_current_client
+    # and limit_search each end their own transaction before returning (see the
+    # invariant in get_db), and `client` is detached, so reading client_name below
+    # does not re-SELECT. tests/test_search_embed_transaction.py guards this; it is
+    # what fails if a dependency starts leaving a transaction behind.
+    # The repository's first statement begins a transaction, which its set_config
     # read-back guard relies on.
-    # limit_search ended the auth transaction itself, a step earlier, and reading
-    # client_name above re-began one. That is the transaction this commit ends.
     # VECTOR_WEIGHT=0 is the FTS-only baseline mode: the embedder is never called.
     client_name = client.client_name
-    db.commit()
     query_vector: list[float] | None = None
     degraded = False
     if settings.vector_weight > 0:
@@ -124,6 +120,14 @@ def _search(request: SearchRequest, db: Session, client: ApiKey) -> SearchRespon
 
     repo = PassageSearchRepository(db, client_name=client_name)
     rows = repo.search(request.q, query_vector, request.top_k, request.repo_filter)
+    # The route's return is the second place a session crosses a thread hop (see
+    # get_db): FastAPI validates the response in a separate threadpool task, and
+    # the search transaction would stay open, connection and all, until a thread
+    # was free for that. Everything is already fetched (repo.search ends in .all()
+    # and returns plain Rows), so nothing below needs the session. commit(), not
+    # rollback(): the transaction is read-only, and under the test fixture commit
+    # releases only the SAVEPOINT, whereas rollback would discard the seeded rows.
+    db.commit()
 
     # Mapped field by field to the DTO. Never return a `Row`/model instance
     # directly -- the response shape is the contract, not whatever columns

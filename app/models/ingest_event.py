@@ -41,7 +41,7 @@ class IngestEvent(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     # clock_timestamp(), not now(): now() is the start of the transaction, and
-    # ingest's began at the auth SELECT, before it waited for the note lock and
+    # ingest's began at its first statement, before it waited for the note lock and
     # embedded. Two ingests of one note could then sort in the opposite order to
     # the one they were applied in.
     at: Mapped[datetime] = mapped_column(

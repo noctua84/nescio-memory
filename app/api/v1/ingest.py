@@ -73,8 +73,7 @@ def ingest_note(
     client: ApiKey = Depends(get_current_client),
 ) -> IngestResponse:
     # Trace attribution. path_or_uri is never attached: the trace may leave the
-    # machine, and a path can name a person. client_name is read here because the
-    # commit inside _ingest expires the ORM instance.
+    # machine, and a path can name a person.
     with propagate_attributes(
         user_id=client.client_name, metadata={"scope": request.scope}
     ):

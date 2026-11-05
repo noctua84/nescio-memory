@@ -7,7 +7,7 @@ cannot be checked does not silently stop applying.
 
 Ingest is capped by concurrency alone, since what it can exhaust is the embedding
 backend for as long as it holds a slot. It has no per-request counter on purpose:
-ingest keeps one transaction open from the auth SELECT through embedding to its
+ingest keeps one transaction open from its first statement through embedding to its
 commit, so a counter row updated inside it would stay locked for all of that, and
 every other request of that client would queue behind it.
 """
@@ -93,8 +93,9 @@ def acquire_ingest_slot(db: Session, client_name: str) -> None:
 
 # clock_timestamp(), not now(): the database's clock is the one every replica
 # shares, and now() would be frozen at the start of a transaction that began at
-# the auth SELECT. A boundary crossed while waiting for this row's lock can leave
-# seconds_left at zero or below, which limit_search raises to 1.
+# the first statement of limit_search's own transaction. A boundary crossed while
+# waiting for this row's lock can leave seconds_left at zero or below, which
+# limit_search raises to 1.
 _COUNT_REQUEST = text(
     """
     WITH current_window AS (
@@ -142,18 +143,21 @@ def limit_search(
 ) -> None:
     """Count this request against the client's window; over the limit, raise.
 
-    Runs inside the auth transaction and ENDS it, a little before the commit in
-    app/api/v1/search.py would have. That is what keeps the counter row's lock to
-    milliseconds. FastAPI runs this dependency and the route in separate threadpool
-    tasks, so if the route's commit were the one releasing it, a burst could fill
-    the threadpool with same-client requests waiting on the row while the holder
+    Runs in its own transaction, which begins at the counting statement (the auth
+    transaction was already ended by get_current_client) and ends with the commit
+    below. That commit is what keeps the counter row's lock to milliseconds, and it
+    must stay: FastAPI runs this dependency and the route in separate threadpool
+    tasks, so were the lock left to the route to release, a burst could fill the
+    threadpool with same-client requests waiting on the row while the holder
     queues for a thread to commit from. Those waiters have no lock timeout, so only
-    the connection pool's own timeout would break the stall.
+    the connection pool's own timeout would break the stall. It is the invariant
+    in get_db, and the one place it matters for a lock rather than a connection.
 
-    Two consequences. The commit expires `client`, so the route's next read of it
-    re-selects the row, and search.py's early commit still ends that transaction
-    before embedding. And it runs ahead of body validation, so a request answered
-    with 422 has been counted, which is right for a limit on request rate.
+    `client` is detached, so reading client_name here costs no statement, and the
+    route's later reads of it open no transaction either: the route begins none
+    until its own first statement, which is what search.py's embed relies on. And
+    this runs ahead of body validation, so a request answered with 422 has been
+    counted, which is right for a limit on request rate.
 
     A refused request commits as well, so that the sweep sticks and it holds no lock
     while the response is written. Its count keeps climbing past the limit, which

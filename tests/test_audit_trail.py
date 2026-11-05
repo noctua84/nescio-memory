@@ -186,8 +186,15 @@ def test_an_event_does_not_survive_the_rollback_of_its_change(client, db_session
     written takes the note and the event back together."""
     key = make_api_key(db_session, "acme")
     db_session.commit()
+    real_commit = db_session.commit
+    commits = []
 
     def commit_fails():
+        commits.append(1)
+        if len(commits) == 1:
+            # The auth dependency ends its own transaction before the route runs
+            # (see get_db), so the first commit on the session is not the ingest's.
+            return real_commit()
         assert len(_events(db_session)) == 1, "the event should be written by now"
         raise RuntimeError("commit failed")
 
