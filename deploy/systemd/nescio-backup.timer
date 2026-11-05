@@ -1,0 +1,14 @@
+[Unit]
+Description=Nightly Nescio memory backup and restore check
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+# Off the exact minute shared stores see most load on. The README's grace advice
+# for the heartbeat allows for this.
+RandomizedDelaySec=15min
+# A VPS that was down at 03:30 runs the backup as soon as it is back.
+Persistent=true
+Unit=nescio-backup.service
+
+[Install]
+WantedBy=timers.target
