@@ -34,7 +34,8 @@ x-app-env: &app-env
   # in the container, including LANGFUSE_*. That means the README limitation
   # "Langfuse keys in .env are ignored" does not apply here: compose exports the
   # file into the process environment, which is where the Langfuse SDK reads it.
-  # Optional: the stack also starts without a .env file.
+  # required: false because POSTGRES_PASSWORD may come from the shell instead; the
+  # stack refuses to start only if it is set in neither place.
   env_file:
     - path: .env
       required: false
