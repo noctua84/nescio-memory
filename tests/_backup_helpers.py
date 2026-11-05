@@ -145,7 +145,7 @@ def seed_source(db: Session) -> None:
     """Enough shape to fail on: two clients, an embedding shared by two notes, and
     a degenerate zero vector.
 
-    The shared embedding comes first by id, so the probe has to look past it.
+    The shared embedding must never count as a search miss, whichever twin comes back.
     """
     twin_a = make_note(db, "acme", path_or_uri="twin_a.md", body=SECRET_BODY)
     twin_b = make_note(db, "acme", path_or_uri="twin_b.md", body=SECRET_BODY)

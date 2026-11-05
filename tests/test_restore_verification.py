@@ -2,8 +2,15 @@
 
 The whole pipeline, with the heartbeat, is in tests/test_restore_check.py.
 """
+import json
+import re
+from collections import Counter
+from itertools import count
+from types import SimpleNamespace
+
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from app.config import settings as app_settings
@@ -18,20 +25,31 @@ from scripts.restore_check import (
 from scripts.restore_verification import (
     HNSW_INDEX,
     VerificationError,
+    assert_alembic_revision,
+    assert_client_counts,
     assert_hnsw_index_valid,
     assert_search_finds_a_stored_passage,
     force_hnsw_plan,
     verify_restored_database,
 )
 from tests._backup_helpers import (
+    SEEDED_CLIENTS,
     ContainerTools,
     backed_up,  # noqa: F401  (fixture)
     source_url,  # noqa: F401  (fixture)
 )
+from tests.factories import make_note, make_passage
 from tests.fakes import fake_embedding
 from tests.test_search_index_usage import walk
 
 SCRATCH = "restore_check_test"
+
+# seed_source's passages less its one zero vector. Below the sample size, so a run
+# on the seed alone always draws every one of them, whatever the random order.
+SEEDED_ELIGIBLE = sum(client["passages"] for client in SEEDED_CLIENTS.values()) - 1
+FILLER = "filler passage"
+NO_SUCH_NOTE = -1
+ARMS = ["search", "index"]
 
 
 @pytest.fixture
@@ -82,6 +100,8 @@ def test_verification_fails_on_a_revision_mismatch(restored):
 
 
 def test_verification_fails_when_the_hnsw_index_is_missing(restored):
+    # Nothing else catches this: with no index both arms answer from an exact scan
+    # and pass, so the catalog check is the only thing standing here.
     db, manifest = restored
     db.execute(text(f"DROP INDEX {HNSW_INDEX}"))
     db.commit()
@@ -136,16 +156,6 @@ def test_a_restore_with_no_passages_cannot_pass(restored):
     db.commit()
     with pytest.raises(VerificationError, match="no passage to search for"):
         assert_search_finds_a_stored_passage(db)
-
-
-def test_the_probe_looks_past_an_embedding_two_notes_share(restored):
-    # Their shared vector could rank either note first on a healthy restore.
-    db, _ = restored
-    note_id = db.execute(restore_verification._PROBE_SQL).one()[0]
-    path = db.execute(
-        text("SELECT path_or_uri FROM notes WHERE id = :id"), {"id": note_id}
-    ).scalar_one()
-    assert path == "plain.md"
 
 
 def test_vector_weight_zero_is_refused_by_name(restored, monkeypatch):
@@ -216,3 +226,321 @@ def test_generated_columns_are_recomputed_not_copied(restored, backed_up, pg_too
     )
     assert flags["zero vector"] is True
     assert flags["first plain passage"] is False
+
+
+def _reported(capsys) -> dict[str, int]:
+    """The counts on the line a successful check prints."""
+    line = next(
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("restore ")
+    )
+    return {name: int(value) for name, value in re.findall(r"(\w+)=(\d+)", line)}
+
+
+def _note_id(db, path: str) -> int:
+    return db.execute(
+        text("SELECT id FROM notes WHERE path_or_uri = :path"), {"path": path}
+    ).scalar_one()
+
+
+def _stored_vector(db, note_id: int) -> str:
+    return db.execute(
+        text("SELECT CAST(embedding AS text) FROM passages WHERE note_id = :id ORDER BY ordinal"),
+        {"id": note_id},
+    ).scalars().first()
+
+
+def test_a_twin_note_with_the_identical_vector_is_not_a_miss(restored):
+    db, _ = restored
+    twin_a, twin_b = _note_id(db, "twin_a.md"), _note_id(db, "twin_b.md")
+    stored = _stored_vector(db, twin_a)
+    assert restore_verification._is_miss(db, twin_b, twin_a, "acme", stored) is False
+
+
+def test_another_note_with_a_different_vector_is_a_miss(restored):
+    db, _ = restored
+    twin_a, plain = _note_id(db, "twin_a.md"), _note_id(db, "plain.md")
+    stored = _stored_vector(db, twin_a)
+    assert restore_verification._is_miss(db, plain, twin_a, "acme", stored) is True
+
+
+def test_an_identical_vector_only_counts_within_the_same_client(restored):
+    db, _ = restored
+    twin_a, twin_b = _note_id(db, "twin_a.md"), _note_id(db, "twin_b.md")
+    stored = _stored_vector(db, twin_a)
+    assert restore_verification._is_miss(db, twin_b, twin_a, "globex", stored) is True
+
+
+def test_the_probes_own_note_is_a_hit_and_no_top_hit_is_a_miss(restored):
+    db, _ = restored
+    twin_a = _note_id(db, "twin_a.md")
+    stored = _stored_vector(db, twin_a)
+    assert restore_verification._is_miss(db, twin_a, twin_a, "acme", stored) is False
+    assert restore_verification._is_miss(db, None, twin_a, "acme", stored) is True
+
+
+def test_both_arms_count_a_real_twin_answer_as_a_hit(restored, monkeypatch, capsys):
+    # Two probes ask the same question and get the same note back, so one of them
+    # is answered by its twin, in each arm, through the real search and index.
+    db, _ = restored
+    twins = {_note_id(db, "twin_a.md"), _note_id(db, "twin_b.md")}
+    real_is_miss = restore_verification._is_miss
+    answers = []
+
+    def recording(session, top_note_id, probe_note_id, client_name, stored):
+        miss = real_is_miss(session, top_note_id, probe_note_id, client_name, stored)
+        answers.append((top_note_id, probe_note_id, miss))
+        return miss
+
+    monkeypatch.setattr(restore_verification, "_is_miss", recording)
+    assert_search_finds_a_stored_passage(db)
+
+    # Every probe answers once per arm, the search arm first.
+    assert len(answers) == 2 * SEEDED_ELIGIBLE
+    for arm in (answers[:SEEDED_ELIGIBLE], answers[SEEDED_ELIGIBLE:]):
+        twin_answers = [
+            miss for top, probe, miss in arm
+            if top != probe and top in twins and probe in twins
+        ]
+        assert twin_answers == [False]
+    reported = _reported(capsys)
+    assert (reported["search_misses"], reported["index_misses"]) == (0, 0)
+
+
+@pytest.fixture
+def hundred_probes(restored):
+    """Exactly 100 eligible passages, so the real SEARCH_PROBE_COUNT draws all of them.
+
+    Seeded rather than lowering the constants: the seed's handful of probes cannot
+    land on 25%, and 24 and 25 of 100 pin the production constants themselves.
+    Flushed, not committed: the check runs on this same session.
+
+    All in one note, so an approximate answer among them is still a hit and only
+    the misses a test arranges are counted, whatever HNSW does on this draw.
+    """
+    db, _ = restored
+    note = make_note(db, "acme", path_or_uri="filler.md")
+    for ordinal in range(100 - SEEDED_ELIGIBLE):
+        make_passage(db, note, ordinal=ordinal, content=f"{FILLER} {ordinal}")
+    return db
+
+
+def _make_the_search_miss(monkeypatch, misses: int) -> None:
+    # The first calls, not chosen probes: the draw decides nothing about the count.
+    real_search = PassageSearchRepository.search
+    calls = count()
+
+    def search(self, query, query_vector, top_k, repo_filter=None):
+        rows = real_search(self, query, query_vector, top_k, repo_filter)
+        return [SimpleNamespace(note_id=NO_SUCH_NOTE)] if next(calls) < misses else rows
+
+    monkeypatch.setattr(PassageSearchRepository, "search", search)
+
+
+def _make_the_index_miss(monkeypatch, misses: int) -> None:
+    # An exact lookup of the stored vector that misses for a fixed set of filler
+    # passages, none of which shares its vector, so exactly that many probes miss.
+    monkeypatch.setattr(
+        restore_verification,
+        "_INDEX_PROBE_SQL",
+        text(
+            f"""
+            SELECT CASE WHEN p.id IN (
+                SELECT id FROM passages WHERE content LIKE '{FILLER} %' ORDER BY id LIMIT {misses}
+            ) THEN {NO_SUCH_NOTE} ELSE p.note_id END
+            FROM passages p
+            WHERE p.client_name = :client_name AND p.embedding = CAST(:embedding AS vector)
+            ORDER BY p.id LIMIT 1
+            """
+        ),
+    )
+
+
+MAKE_ARM_MISS = {"search": _make_the_search_miss, "index": _make_the_index_miss}
+ARM_FAILURE = {
+    "search": r"25 of 100 .*through the search",
+    "index": r"HNSW index .*25 of 100 ",
+}
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_one_miss_among_many_does_not_fail_the_check(hundred_probes, arm, monkeypatch, capsys):
+    # What this check exists for: HNSW misses about 3.4% of stored vectors at 100k
+    # passages on a healthy index, and that must not page the operator.
+    MAKE_ARM_MISS[arm](monkeypatch, 1)
+    assert_search_finds_a_stored_passage(hundred_probes)
+    reported = _reported(capsys)
+    assert reported["search_probes"] == 100
+    assert reported[f"{arm}_misses"] == 1
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_a_miss_share_just_below_the_limit_passes(hundred_probes, arm, monkeypatch, capsys):
+    MAKE_ARM_MISS[arm](monkeypatch, 24)
+    assert_search_finds_a_stored_passage(hundred_probes)
+    reported = _reported(capsys)
+    assert reported["search_probes"] == 100
+    assert reported[f"{arm}_misses"] == 24
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_a_miss_share_of_exactly_the_limit_fails(hundred_probes, arm, monkeypatch):
+    MAKE_ARM_MISS[arm](monkeypatch, 25)
+    with pytest.raises(VerificationError, match=ARM_FAILURE[arm]):
+        assert_search_finds_a_stored_passage(hundred_probes)
+
+
+@pytest.fixture
+def probe_log(restored, monkeypatch):
+    """Each step as it happens: ("search" or "index", client, vector), or ("force",)."""
+    db, _ = restored
+    log = []
+    real_search = PassageSearchRepository.search
+    real_force = restore_verification.force_hnsw_plan
+    real_execute = db.execute
+
+    def search(self, query, query_vector, top_k, repo_filter=None):
+        log.append(("search", self.client_name, tuple(query_vector)))
+        return real_search(self, query, query_vector, top_k, repo_filter)
+
+    def force(session):
+        log.append(("force",))
+        real_force(session)
+
+    def execute(statement, params=None, **kwargs):
+        if statement is restore_verification._INDEX_PROBE_SQL:
+            vector = tuple(json.loads(params["embedding"]))
+            log.append(("index", params["client_name"], vector))
+        return real_execute(statement, params, **kwargs)
+
+    monkeypatch.setattr(PassageSearchRepository, "search", search)
+    monkeypatch.setattr(restore_verification, "force_hnsw_plan", force)
+    monkeypatch.setattr(db, "execute", execute)
+    return log
+
+
+def _probes_of(log, arm: str) -> Counter:
+    return Counter(step[1:] for step in log if step[0] == arm)
+
+
+def test_both_arms_probe_the_same_sample_of_the_configured_size(restored, probe_log, monkeypatch):
+    # Half the eligible passages, so a run that ignored the bound would be visible
+    # and the two arms could each draw a different sample.
+    db, _ = restored
+    monkeypatch.setattr(restore_verification, "SEARCH_PROBE_COUNT", SEEDED_ELIGIBLE // 2)
+    assert_search_finds_a_stored_passage(db)
+    search_probes = _probes_of(probe_log, "search")
+    assert search_probes.total() == SEEDED_ELIGIBLE // 2
+    assert _probes_of(probe_log, "index") == search_probes
+
+
+def test_degenerate_passages_are_never_probed_in_either_arm(restored, probe_log):
+    # The sample is larger than the eligible set, so every passage the query would
+    # admit is drawn, and the zero vector would be among them.
+    db, _ = restored
+    assert_search_finds_a_stored_passage(db)
+    for arm in ARMS:
+        probes = _probes_of(probe_log, arm)
+        assert probes.total() == SEEDED_ELIGIBLE
+        assert all(any(vector) for _client, vector in probes)
+
+
+def test_the_probe_sample_is_drawn_afresh(restored):
+    # Fixed probes would keep testing the same corner of the graph every night.
+    # 3 of 6 is 20 possible samples: 20 identical draws in a row will not happen.
+    db, _ = restored
+    draws = {
+        frozenset(db.execute(restore_verification._PROBE_SQL, {"count": 3}).all())
+        for _ in range(20)
+    }
+    assert len(draws) > 1
+
+
+def test_every_search_runs_before_the_one_force_of_the_planner(restored, probe_log):
+    # The forced settings are SET LOCAL, so they outlive force_hnsw_plan for the rest
+    # of the transaction, and the hybrid search under them is a nested loop over the
+    # tenant that would hit the 5 s statement timeout at scale.
+    db, _ = restored
+    assert_search_finds_a_stored_passage(db)
+    assert [step[0] for step in probe_log] == (
+        ["search"] * SEEDED_ELIGIBLE + ["force"] + ["index"] * SEEDED_ELIGIBLE
+    )
+
+
+def _leave_the_index_empty_but_valid(db) -> None:
+    """Every row back in the table, none in the HNSW index, and the catalog none the
+    wiser: indisready false is what lets the rows back in without being indexed.
+
+    TRUNCATE rebuilds the index with nothing to read, in one transaction, where
+    DELETE would need a VACUUM outside it to keep the dead rows from the build.
+    """
+    columns = ", ".join(
+        db.execute(
+            text(
+                "SELECT quote_ident(attname) FROM pg_attribute "
+                "WHERE attrelid = 'passages'::regclass AND attnum > 0 "
+                "AND NOT attisdropped AND attgenerated = ''"
+            )
+        ).scalars()
+    )
+    set_ready = f"UPDATE pg_index SET indisready = {{}} WHERE indexrelid = '{HNSW_INDEX}'::regclass"
+    db.execute(text("CREATE TEMP TABLE passages_aside ON COMMIT DROP AS SELECT * FROM passages"))
+    db.execute(text("TRUNCATE passages"))
+    db.execute(text(set_ready.format("false")))
+    db.execute(text(f"INSERT INTO passages ({columns}) SELECT {columns} FROM passages_aside"))
+    db.execute(text(set_ready.format("true")))
+    db.commit()
+
+
+def test_a_broken_index_the_catalog_calls_valid_is_caught_by_the_index_arm(restored):
+    # The acceptance case. The table is small enough for the production search to
+    # answer from an exact scan and pass, the counts match, and indisvalid is true:
+    # only the question put straight to the index can tell.
+    db, manifest = restored
+    _leave_the_index_empty_but_valid(db)
+
+    # Proves the setup, not the code: the rows are there and the index cannot see them.
+    force_hnsw_plan(db)
+    assert db.execute(
+        restore_verification._INDEX_PROBE_SQL,
+        {"client_name": "acme", "embedding": str(fake_embedding("first plain passage"))},
+    ).first() is None
+    db.rollback()
+
+    assert_alembic_revision(db, manifest)
+    assert_client_counts(db, manifest)
+    assert_hnsw_index_valid(db)
+    with pytest.raises(VerificationError, match=f"HNSW index {HNSW_INDEX} did not return"):
+        assert_search_finds_a_stored_passage(db)
+
+
+def test_success_prints_the_probe_counts_on_stdout(restored, capsys):
+    db, _ = restored
+    capsys.readouterr()
+    assert_search_finds_a_stored_passage(db)
+    assert (
+        f"restore search_probes={SEEDED_ELIGIBLE} search_misses=0 index_misses=0"
+        in capsys.readouterr().out.splitlines()
+    )
+
+
+def test_a_database_error_in_the_search_arm_is_not_counted_as_a_miss(restored, monkeypatch):
+    # A statement timeout or an unreadable index must fail loudly as what it is.
+    db, _ = restored
+    monkeypatch.setattr(
+        PassageSearchRepository,
+        "search",
+        lambda self, *a, **k: self.db.execute(text("SELECT 1/0")).all(),
+    )
+    with pytest.raises(DBAPIError, match="division by zero"):
+        assert_search_finds_a_stored_passage(db)
+
+
+def test_a_database_error_in_the_index_arm_is_not_counted_as_a_miss(restored, monkeypatch):
+    db, _ = restored
+    monkeypatch.setattr(
+        restore_verification,
+        "_INDEX_PROBE_SQL",
+        text("SELECT 1/0 WHERE :client_name <> '' AND :embedding <> ''"),
+    )
+    with pytest.raises(DBAPIError, match="division by zero"):
+        assert_search_finds_a_stored_passage(db)
