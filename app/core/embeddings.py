@@ -1,3 +1,7 @@
+import logging
+import math
+import random
+import time
 from typing import NamedTuple
 
 import httpx
@@ -17,17 +21,37 @@ from app.core.errors import (
     EmbeddingBackendError,
     EmbeddingBackendMisconfigured,
 )
+from app.core.retry import RetryBudget, retry_transient
+
+logger = logging.getLogger(__name__)
 
 _local_model = None
 
-# Kept hardcoded deliberately. Because the first failure aborts the request, this
-# bounds a failed ingest at roughly one timeout rather than one per chunk.
+# Kept hardcoded deliberately. One call may take this long, so a failed ingest is
+# bounded by (1 + EMBED_RETRY_BUDGET) calls of at most this long plus the
+# backoff sleeps between them (see _embed), not by one timeout per chunk.
 OLLAMA_TIMEOUT_SECONDS = 30.0
 
 # The only HTTP statuses worth retrying: request timeout, rate limit, and the
 # server-side faults that mean "overloaded or restarting". 501 and 505 are
 # deliberately absent -- they are permanent capability answers.
 _TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Seconds from a Retry-After header, or None when absent or unusable.
+
+    Only the delta-seconds form is read. The HTTP-date form needs a clock
+    comparison and Ollama does not send it; None falls back to the jittered
+    backoff, which is always safe.
+    """
+    if value is None:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 def _get_local_model():
@@ -120,7 +144,12 @@ def _fetch_batch(texts: list[str], timeout: float) -> list[object]:
                 "model, the server lacks /api/embed, or the URL redirects "
                 "(trailing slash, http->https); check OLLAMA_URL and OLLAMA_MODEL"
             ) from exc
-        raise EmbeddingBackendError(f"Ollama request failed: HTTP {code}") from exc
+        error = EmbeddingBackendError(f"Ollama request failed: HTTP {code}")
+        if code in (429, 503):
+            error.backoff_hint_s = _parse_retry_after(
+                exc.response.headers.get("Retry-After")
+            )
+        raise error from exc
     except httpx.HTTPError as exc:
         # httpx.HTTPError is the base of RequestError (connection, timeout), so
         # every remaining transport failure is caught here and the httpx
@@ -160,18 +189,102 @@ def _fetch(text: str) -> object:
     return vectors[0]
 
 
-def _embed(texts: list[str], timeout: float) -> list[list[float]]:
-    """Embed texts in order, in sub-batches, validating every vector."""
+# Indirections the retry tests replace. Looked up at call time (not bound as
+# defaults) so monkeypatching the module attribute takes effect.
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _rand() -> float:
+    # Retry jitter, not a security context. SystemRandom only because Sonar's S2245
+    # flags the default generator.
+    return random.SystemRandom().random()
+
+
+def _clock() -> float:
+    return time.monotonic()
+
+
+def _is_transient(exc: Exception) -> bool:
+    # Exact class, the rule app/api/v1/search.py uses to degrade. The subclasses
+    # (bad response, misconfigured) are faults a retry cannot fix.
+    return type(exc) is EmbeddingBackendError
+
+
+def _log_retry(attempt: int, delay: float, exc: Exception) -> None:
+    # Class name, attempt and delay only. str(exc) is left out on purpose: a
+    # local model's runtime error may quote the input text.
+    logger.warning(
+        "embedding backend call failed; retrying",
+        extra={
+            "error_class": type(exc).__name__,
+            "attempt": attempt,
+            "delay_s": round(delay, 3),
+        },
+    )
+
+
+def _embed(
+    texts: list[str], timeout: float, *, within_timeout: bool = False
+) -> list[list[float]]:
+    """Embed texts in order, in sub-batches, validating every vector.
+
+    Each sub-batch is retried on a transient failure, bounded three ways:
+
+    - at most EMBED_RETRY_ATTEMPTS attempts per sub-batch;
+    - EMBED_RETRY_BUDGET retries in total for this call, shared by all its
+      sub-batches. That is what keeps the lock hold in app/api/v1/ingest.py
+      bounded however large the note is: the worst case is
+      EMBED_RETRY_BUDGET * (OLLAMA_TIMEOUT_SECONDS + EMBED_RETRY_MAX_DELAY_S)
+      beyond the no-retry case;
+    - with within_timeout=True (the search path), the whole call, retries
+      included, stays inside `timeout`: at most one retry, only when time
+      remains, and it gets only the time that remains as its own timeout.
+    """
     if not texts:
         return []
     # Sub-batches bound each request under the 30 s timeout on a CPU Ollama,
     # and bound how long ingest holds its FOR UPDATE lock across these calls
     # (see app/api/v1/ingest.py).
     size = settings.embed_batch_size
+    attempts = settings.embed_retry_attempts
+    retries = settings.embed_retry_budget
+    deadline: float | None = None
+    if within_timeout:
+        deadline = _clock() + timeout
+        attempts = min(attempts, 2)
+        retries = min(retries, 1)
+    budget = RetryBudget(retries)
+
+    first_attempt = True
+
+    def per_attempt_timeout() -> float:
+        nonlocal first_attempt
+        if deadline is None or first_attempt:
+            # The first attempt gets the full timeout; only a retry is squeezed
+            # into what is left of it.
+            first_attempt = False
+            return timeout
+        # Floored so a sleep that overshot cannot hand httpx a zero timeout.
+        return max(deadline - _clock(), 0.05)
+
     vectors: list[list[float]] = []
     for start in range(0, len(texts), size):
         batch = texts[start : start + size]
-        result = _fetch_batch(batch, timeout)
+        result = retry_transient(
+            lambda batch=batch: _fetch_batch(batch, per_attempt_timeout()),
+            retryable=_is_transient,
+            attempts=attempts,
+            base_delay_s=settings.embed_retry_base_delay_s,
+            max_delay_s=settings.embed_retry_max_delay_s,
+            budget=budget,
+            deadline=deadline,
+            retry_after=lambda exc: getattr(exc, "backoff_hint_s", None),
+            on_retry=_log_retry,
+            sleep=_sleep,
+            rand=_rand,
+            clock=_clock,
+        )
         if len(result) != len(batch):
             # Counts only: the texts are note content and must not be logged.
             raise EmbeddingBackendBadResponse(
@@ -195,7 +308,7 @@ def get_query_embedding(query: str) -> list[float]:
     # QUERY_INSTRUCTION never invalidates stored embeddings.
     if settings.query_instruction:
         query = f"Instruct: {settings.query_instruction}\nQuery:{query}"
-    return _embed([query], settings.query_embed_timeout_s)[0]
+    return _embed([query], settings.query_embed_timeout_s, within_timeout=True)[0]
 
 
 # Short and fixed. The probe's only job is to make the backend emit one vector,

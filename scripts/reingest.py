@@ -44,7 +44,7 @@ EXIT_USAGE_ERROR = 2
 
 # A hostile or misconfigured server could send an arbitrarily large
 # Retry-After (or we could misparse one), stalling a ~574-file run for
-# hours. Cap the single 503 retry delay so a bad header degrades to a
+# hours. Cap the single 429/503 retry delay so a bad header degrades to a
 # slow retry instead of an effectively hung process.
 MAX_RETRY_AFTER_S = 60.0
 
@@ -178,9 +178,10 @@ def _ingest_one(
 
     response = client.post(url, json=payload, headers=headers)
 
-    if response.status_code == 503:
-        # Embedding backend down: one retry after Retry-After seconds (or 5
-        # if the header is absent), then treat whatever happens next as final.
+    if response.status_code in (429, 503):
+        # Over a rate limit, or the embedding backend is down: one retry after
+        # Retry-After seconds (or 5 if the header is absent), then treat whatever
+        # happens next as final.
         delay = 5.0
         retry_after = response.headers.get("Retry-After")
         if retry_after is not None:

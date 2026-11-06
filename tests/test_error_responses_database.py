@@ -14,13 +14,13 @@ from sqlalchemy.exc import DataError, OperationalError
 
 from app.api.v1 import ingest as ingest_module
 from app.api.v1 import search as search_module
-from app.core import errors as errors_module
 from app.core.db import get_db
 from app.core.errors import (
     INVALID_DATA_DETAIL,
     QUERY_TIMEOUT_DETAIL,
     RETRY_AFTER_SECONDS,
 )
+from app.core.key_usage import get_key_usage_recorder
 from app.main import app
 from app.models.note import Note
 from app.models.passage import Passage
@@ -56,6 +56,7 @@ def http(db_session, monkeypatch):
     monkeypatch.setattr(ingest_module, "get_embeddings", fake_embeddings)
     monkeypatch.setattr(search_module, "get_query_embedding", fake_embedding)
     app.dependency_overrides[get_db] = lambda: db_session
+    app.dependency_overrides[get_key_usage_recorder] = lambda: lambda key_id: None
     try:
         yield TestClient(app, raise_server_exceptions=False)
     finally:
@@ -63,17 +64,12 @@ def http(db_session, monkeypatch):
 
 
 @pytest.fixture
-def handler_log(monkeypatch, caplog):
+def handler_log(caplog):
     """Records from app.core.errors only, at WARNING and above.
 
-    The session-scoped `engine` fixture runs Alembic, whose env.py calls
-    logging.config.fileConfig(), which disables every logger that already
-    existed -- app.core.errors' included. That is test wiring, so it is undone
-    here rather than in app/ or alembic.ini. Filtering by name keeps the
-    negative assertions about this one logger, not about whatever SQLAlchemy or
-    testcontainers happened to log.
+    Filtering by name keeps the negative assertions about this one logger, not
+    about whatever SQLAlchemy or testcontainers happened to log.
     """
-    monkeypatch.setattr(errors_module.logger, "disabled", False)
     with caplog.at_level(logging.WARNING, logger="app.core.errors"):
         yield lambda: [
             r.getMessage() for r in caplog.records if r.name == "app.core.errors"

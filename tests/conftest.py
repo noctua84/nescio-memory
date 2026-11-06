@@ -64,6 +64,7 @@ from app.api.v1 import ingest as ingest_module
 from app.api.v1 import search as search_module
 from app.config import settings
 from app.core.db import get_db
+from app.core.key_usage import get_key_usage_recorder
 from app.main import app
 from tests.fakes import fake_embedding, fake_embeddings
 
@@ -176,7 +177,13 @@ def db_session(connection):
 
 
 @pytest.fixture
-def client(db_session, monkeypatch):
+def key_uses():
+    """The key ids the `client` fixture's recorder was called with, in order."""
+    return []
+
+
+@pytest.fixture
+def client(db_session, monkeypatch, key_uses):
     """A TestClient wired to the test transaction, with embeddings faked.
 
     The patch targets matter. app/api/v1/ingest.py does
@@ -201,11 +208,31 @@ def client(db_session, monkeypatch):
     # get_db means a factory-created ApiKey row is immediately visible to
     # authentication -- no separate seeding path, nothing committed to clean up.
     app.dependency_overrides[get_db] = lambda: db_session
+    # The real recorder writes on its own connection, which cannot see a key
+    # created in this test's transaction. tests/test_api_key_last_used.py covers it.
+    app.dependency_overrides[get_key_usage_recorder] = lambda: key_uses.append
     yield TestClient(app)
     # Clearing matters: a leftover override leaks this test's closed session
     # into the next one, which then fails somewhere that points at the wrong
     # test.
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def no_embedding_retry(monkeypatch):
+    """Switch embedding retry off, and make sure nothing could sleep for it.
+
+    Most tests stub a failing backend to check how the failure is classified or
+    surfaced, and assert it was called exactly once. With the default budget
+    they would see a second call and, unstubbed, wait out a real backoff.
+    EMBED_RETRY_BUDGET=0 is the documented off switch. The retry behaviour is
+    covered in tests/test_embeddings_retry.py, which sets its own budget and
+    injects its own sleep, clock and jitter.
+    """
+    from app.core import embeddings as embeddings_module
+
+    monkeypatch.setattr(settings, "embed_retry_budget", 0)
+    monkeypatch.setattr(embeddings_module, "_sleep", lambda seconds: None)
 
 
 @pytest.fixture

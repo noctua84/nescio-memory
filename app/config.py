@@ -5,6 +5,9 @@ from urllib.parse import urlparse
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
 class Settings(BaseSettings):
     # Database
     database_url: str
@@ -74,6 +77,44 @@ class Settings(BaseSettings):
     # Texts per /api/embed request. Bounds each request under the 30 s ingest
     # timeout on a CPU Ollama and bounds how long ingest holds its row lock.
     embed_batch_size: int = 16
+    # Retry of transient embedding failures (see app.core.retry). Attempts are
+    # per sub-batch; the budget is shared by all sub-batches of one request,
+    # which is what bounds the ingest lock hold however large the note is.
+    embed_retry_attempts: int = 3
+    embed_retry_base_delay_s: float = 0.5
+    embed_retry_max_delay_s: float = 4.0
+    embed_retry_budget: int = 2
+
+    # Readiness probe (GET /ready). Each dependency check is given this long
+    # before the response reports it as "timeout"; the two run in parallel, so
+    # the endpoint answers within max(READY_DB_TIMEOUT_S, READY_EMBEDDING_TIMEOUT_S)
+    # plus a small overhead. 2 s sits under a typical orchestrator probe
+    # timeout (kubelet and Docker both default to 1-3 s), so a hung dependency
+    # produces a "timeout" body rather than a probe that gave up first.
+    ready_db_timeout_s: float = 2.0
+    ready_embedding_timeout_s: float = 2.0
+    # How long a finished check result is reused. Probes arrive from several
+    # replicas' orchestrators and monitors at once; without this each one would
+    # open a database connection and hit Ollama. 0 disables reuse of a finished
+    # result (a check that is still running is always shared regardless).
+    ready_cache_ttl_s: float = 5.0
+
+    # Audit trail. How stale api_keys.last_used_at may get: the column is
+    # rewritten at most once per this many seconds per key, which is what keeps
+    # the extra connection app.core.key_usage takes rare. 0 touches every request.
+    key_last_used_throttle_s: int = 300
+    # How long ingest_events rows are kept (scripts/prune_ingest_events.py).
+    audit_retention_days: int = 400
+
+    # Per-tenant limits, enforced in Postgres so they hold across replicas (see
+    # app.core.rate_limit). No off switch: nobody attends this service, so the
+    # bounds are guarantees. Ingest slots held at once, per client:
+    rate_limit_ingest_concurrency: int = 2
+    # Retry-After on an ingest refused for want of a slot.
+    rate_limit_ingest_retry_after_s: int = 5
+    # Searches per client per fixed window of RATE_LIMIT_WINDOW_S seconds.
+    rate_limit_search_requests: int = 120
+    rate_limit_window_s: int = 60
 
     # langfuse:
     langfuse_public_key: str = ""
@@ -82,7 +123,12 @@ class Settings(BaseSettings):
 
     # app
     app_name: str = "Nescio Semantic Memory API"
+    # Applies to the app.* and uvicorn.* loggers; the root logger stays at
+    # WARNING so third-party chatter (httpx, SQLAlchemy) does not follow it.
     log_level: str = "INFO"
+    # "json" is one OpenTelemetry-shaped object per line, for a collector;
+    # "text" is the human-readable form for a local terminal.
+    log_format: Literal["json", "text"] = "json"
 
     # server
     host: str = "localhost"
@@ -225,6 +271,108 @@ class Settings(BaseSettings):
                 f"{self.embed_batch_size}; 0 would never advance through the "
                 "texts and a huge batch defeats the per-request timeout bound"
             )
+        return self
+
+    # logging.config.dictConfig would otherwise reject an unknown level with a
+    # bare "Unable to configure logger" that names neither the variable nor the
+    # accepted values. Normalised to upper case so LOG_LEVEL=debug works; WARN
+    # and NOTSET are refused on purpose, so the documented five are the only ones.
+    @model_validator(mode="after")
+    def _log_level_must_be_a_level_name(self) -> "Settings":
+        level = self.log_level.strip().upper()
+        if level not in _LOG_LEVELS:
+            raise ValueError(
+                f"LOG_LEVEL must be one of {', '.join(_LOG_LEVELS)}, got "
+                f"{self.log_level!r}"
+            )
+        self.log_level = level
+        return self
+
+    # Bounded for the same reason as the knobs above: the readiness endpoint is
+    # unauthenticated, so a typo must not turn it into an unbounded wait (a
+    # huge timeout) or a check-per-request amplifier (a negative TTL is
+    # meaningless; 0 is the supported way to switch reuse off). The 10 s and
+    # 60 s ceilings are misconfiguration guards, well past any sane probe.
+    @model_validator(mode="after")
+    def _readiness_knobs_must_be_in_range(self) -> "Settings":
+        for name, value in (
+            ("READY_DB_TIMEOUT_S", self.ready_db_timeout_s),
+            ("READY_EMBEDDING_TIMEOUT_S", self.ready_embedding_timeout_s),
+        ):
+            # isfinite first: NaN compares false against everything.
+            if not (math.isfinite(value) and 0 < value <= 10):
+                raise ValueError(f"{name} must satisfy 0 < x <= 10, got {value}")
+        if not (
+            math.isfinite(self.ready_cache_ttl_s) and 0 <= self.ready_cache_ttl_s <= 60
+        ):
+            raise ValueError(
+                "READY_CACHE_TTL_S must satisfy 0 <= x <= 60, got "
+                f"{self.ready_cache_ttl_s}; 0 disables reuse of a finished result"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _embed_retry_knobs_must_be_in_range(self) -> "Settings":
+        if not 1 <= self.embed_retry_attempts <= 5:
+            raise ValueError(
+                "EMBED_RETRY_ATTEMPTS must be in range 1..5, got "
+                f"{self.embed_retry_attempts}; 1 means no retry and 0 would "
+                "never make the first attempt"
+            )
+        if not (
+            math.isfinite(self.embed_retry_max_delay_s)
+            and 0 < self.embed_retry_max_delay_s <= 10
+        ):
+            raise ValueError(
+                "EMBED_RETRY_MAX_DELAY_S must satisfy 0 < x <= 10, got "
+                f"{self.embed_retry_max_delay_s}; it is part of the ingest "
+                "lock-hold bound"
+            )
+        if not (
+            math.isfinite(self.embed_retry_base_delay_s)
+            and 0 < self.embed_retry_base_delay_s <= self.embed_retry_max_delay_s
+        ):
+            raise ValueError(
+                "EMBED_RETRY_BASE_DELAY_S must satisfy 0 < x <= "
+                f"EMBED_RETRY_MAX_DELAY_S ({self.embed_retry_max_delay_s}), got "
+                f"{self.embed_retry_base_delay_s}"
+            )
+        if not 0 <= self.embed_retry_budget <= 10:
+            raise ValueError(
+                "EMBED_RETRY_BUDGET must be in range 0..10, got "
+                f"{self.embed_retry_budget}; 0 disables retry, and the budget "
+                "bounds how much longer ingest holds its row lock"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _audit_knobs_must_be_in_range(self) -> "Settings":
+        if not 0 <= self.key_last_used_throttle_s <= 86400:
+            raise ValueError(
+                "KEY_LAST_USED_THROTTLE_S must be in range 0..86400, got "
+                f"{self.key_last_used_throttle_s}; 0 touches on every request"
+            )
+        if not 30 <= self.audit_retention_days <= 3650:
+            raise ValueError(
+                "AUDIT_RETENTION_DAYS must be in range 30..3650, got "
+                f"{self.audit_retention_days}; the prune script deletes on this "
+                "number, so a typo must not erase the record of who changed what"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _rate_limit_knobs_must_be_in_range(self) -> "Settings":
+        for name, value, low, high in (
+            ("RATE_LIMIT_INGEST_CONCURRENCY", self.rate_limit_ingest_concurrency, 1, 32),
+            ("RATE_LIMIT_INGEST_RETRY_AFTER_S", self.rate_limit_ingest_retry_after_s, 1, 60),
+            ("RATE_LIMIT_SEARCH_REQUESTS", self.rate_limit_search_requests, 1, 10000),
+            ("RATE_LIMIT_WINDOW_S", self.rate_limit_window_s, 1, 3600),
+        ):
+            if not low <= value <= high:
+                raise ValueError(
+                    f"{name} must be in range {low}..{high}, got {value}; the "
+                    "limits have no off switch, so 0 would refuse every request"
+                )
         return self
 
 

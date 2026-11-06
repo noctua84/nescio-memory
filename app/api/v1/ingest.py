@@ -1,16 +1,17 @@
-import re
-from pathlib import Path
-
 from fastapi import APIRouter, Depends, HTTPException
-from langfuse import observe
+from langfuse import observe, propagate_attributes
 from sqlalchemy.orm import Session
 
+from app.api.v1.validation import validate_path_or_uri
 from app.core.db import get_db
 from app.core.embeddings import get_embeddings
 from app.core.pipeline import content_hash, embedding_input, fts_lead_a, fts_lead_c, pipeline_version
+from app.core.rate_limit import acquire_ingest_slot, rate_limited_response
 from app.core.security import get_current_client
 from app.core.splitter import split_note
+from app.core.tracing import annotate_span
 from app.models import ApiKey
+from app.repositories.audit import AuditRepository
 from app.repositories.note import NoteRepository, PassageRow
 from app.schemas.ingest import IngestRequest, IngestResponse
 
@@ -33,29 +34,6 @@ MAX_CONTENT_CHARS = 500_000
 # before the body is ever buffered or parsed, including for unauthenticated
 # clients; MAX_CONTENT_CHARS below is a separate, later check that bounds the
 # decoded character count once the JSON body has been parsed.
-
-_URI_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://")
-
-
-def _validate_path_or_uri(path_or_uri: str) -> None:
-    """Accept any URI as-is; reject an absolute path or one with '..'.
-
-    A value matching ``scheme://`` is treated as a URI and is not subject to
-    the path rule at all. Anything else is a path, stored and reflected back
-    the same way the removed learnings API's file_path was, so it gets the
-    same rule: no leading '/'
-    and no '..' path component.
-    """
-    if _URI_RE.match(path_or_uri):
-        return
-    if path_or_uri.startswith("/") or ".." in Path(path_or_uri).parts:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "path_or_uri must be a relative path without '..', or an "
-                "absolute URI"
-            ),
-        )
 
 
 def _validate_content_size(content: str) -> None:
@@ -81,6 +59,12 @@ def _validate_content_size(content: str) -> None:
         "unless force=True."
     ),
     operation_id="ingestNote",
+    responses={
+        429: rate_limited_response(
+            "All of this client's ingest slots are in use. A re-ingest that "
+            "would be skipped is never refused."
+        ),
+    },
 )
 @observe(name="note-ingestion", capture_input=False, capture_output=False)
 def ingest_note(
@@ -88,8 +72,23 @@ def ingest_note(
     db: Session = Depends(get_db),
     client: ApiKey = Depends(get_current_client),
 ) -> IngestResponse:
+    # Trace attribution. path_or_uri is never attached: the trace may leave the
+    # machine, and a path can name a person.
+    with propagate_attributes(
+        user_id=client.client_name, metadata={"scope": request.scope}
+    ):
+        response = _ingest(request, db, client)
+        annotate_span(
+            note_id=response.note_id,
+            skipped=response.skipped,
+            passages=response.passages,
+        )
+    return response
+
+
+def _ingest(request: IngestRequest, db: Session, client: ApiKey) -> IngestResponse:
     # Both validations run before anything is written or deleted.
-    _validate_path_or_uri(request.path_or_uri)
+    validate_path_or_uri(request.path_or_uri)
     _validate_content_size(request.content)
 
     result = split_note(request.content)
@@ -97,6 +96,8 @@ def ingest_note(
     version = pipeline_version()
 
     repo = NoteRepository(db, client_name=client.client_name)
+    # Every event below goes in the same transaction as the change it records.
+    audit = AuditRepository(db, client_name=client.client_name, api_key_id=client.id)
 
     # The FOR UPDATE lock lock_note takes is held across the batched get_embeddings call
     # below and released only by the single commit at the end. That is
@@ -108,7 +109,10 @@ def ingest_note(
     # delete with the other's insert.
     #
     # The cost is lock hold time of about ceil(passages / embed_batch_size)
-    # embedding round-trips -- one per sub-batch, not one per passage. It is acceptable
+    # embedding round-trips -- one per sub-batch, not one per passage -- plus,
+    # when the backend is flaky, the retries: at most EMBED_RETRY_BUDGET of them
+    # for the whole note (shared across sub-batches), each costing up to one
+    # 30 s call and EMBED_RETRY_MAX_DELAY_S of backoff. It is acceptable
     # because the lock is per NOTE identity and the only contender is another
     # ingest of that same note, which has nothing useful to do concurrently
     # anyway; reads never take this lock.
@@ -125,12 +129,25 @@ def ingest_note(
         and locked.content_hash == digest
         and locked.pipeline_version == version
     ):
-        db.commit()  # releases the lock; nothing else to write
-        return IngestResponse(
-            note_id=locked.id,
-            passages=repo.count_passages(locked.id),
-            skipped=True,
+        passages = repo.count_passages(locked.id)
+        audit.record_ingest(
+            "skipped",
+            request.scope,
+            locked.id,
+            request.path_or_uri,
+            passages_before=passages,
+            passages_after=passages,
+            content_hash_before=locked.content_hash,
+            content_hash_after=digest,
         )
+        db.commit()  # releases the lock; the event is the only write
+        return IngestResponse(note_id=locked.id, passages=passages, skipped=True)
+
+    # After the skip check, so a skipped re-ingest never touches the limiter, and
+    # before the first write, so a refusal has nothing to undo: RateLimited rolls
+    # back, which releases the note lock and writes no event, because nothing
+    # changed. Held until the commit below, so embedding and its retries are inside.
+    acquire_ingest_slot(db, client.client_name)
 
     note_id = repo.upsert_note(
         request.scope,
@@ -171,7 +188,26 @@ def ingest_note(
     # Embedding failures (EmbeddingBackendError) propagate uncaught and are
     # mapped to 503 + Retry-After by app/core/errors.py. No commit has
     # happened yet, so a failure here leaves the previous passages intact.
+    # Transient ones were already retried inside get_embeddings, within the
+    # budget described above the lock.
+    passages_before = repo.count_passages(note_id)
     count = repo.replace_passages(note_id, request.scope, rows)
+
+    # `locked` alone would mislabel the race upsert_note's docstring describes: a
+    # first ingest that loses it saw no row to lock, but upsert_note then waited
+    # for the winner and overwrote it. Its passages are still here to count. The
+    # winner's hash is not, so that event's content_hash_before stays NULL.
+    replaced = locked is not None or passages_before > 0
+    audit.record_ingest(
+        "replaced" if replaced else "created",
+        request.scope,
+        note_id,
+        request.path_or_uri,
+        passages_before=passages_before if replaced else None,
+        passages_after=count,
+        content_hash_before=locked.content_hash if locked is not None else None,
+        content_hash_after=digest,
+    )
 
     db.commit()  # single transaction boundary for the whole note
     return IngestResponse(note_id=note_id, passages=count, skipped=False)

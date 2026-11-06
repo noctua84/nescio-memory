@@ -110,20 +110,25 @@ def test_the_client_filter_is_what_prevents_the_delete(client, db_session):
     make_passage(db_session, acme_note, content=f"{ACME_MARKER} a passage.")
     acme_key = make_api_key(db_session, "acme")
     globex_key = make_api_key(db_session, "globex")
+    # Read once, up front. Every request now commits the shared session (the auth
+    # dependency ends its transaction), which expires acme_note, and the ORM
+    # DELETE cannot then detach it: reading .id after the delete would try to
+    # refresh a row that is gone. The id is all this test needs from the object.
+    note_id = acme_note.id
 
-    other_attempt = _delete_note(client, globex_key, acme_note.id)
+    other_attempt = _delete_note(client, globex_key, note_id)
     assert other_attempt.status_code == 404
     db_session.expire_all()
     assert (
-        db_session.scalars(select(Note.id).where(Note.id == acme_note.id)).one_or_none()
-        == acme_note.id
+        db_session.scalars(select(Note.id).where(Note.id == note_id)).one_or_none()
+        == note_id
     )
 
-    owner_attempt = _delete_note(client, acme_key, acme_note.id)
+    owner_attempt = _delete_note(client, acme_key, note_id)
     assert owner_attempt.status_code == 204
     db_session.expire_all()
     assert (
-        db_session.scalars(select(Note.id).where(Note.id == acme_note.id)).one_or_none()
+        db_session.scalars(select(Note.id).where(Note.id == note_id)).one_or_none()
         is None
     )
 

@@ -249,12 +249,15 @@ def test_selective_repo_filter_returns_exactly_the_matching_passages(
                             path_or_uri="target.md")
     # 197 bulk passages beat every target passage on BOTH arms: three query
     # hits each and a vector equal to the query. Filtering only after the
-    # arms' LIMIT would leave nothing of the target scope to return.
+    # arms' LIMIT would leave nothing of the target scope to return. The tsv
+    # carries weight B, as make_passage's content does: unweighted (D), three hits
+    # rank 0.3 against a target's 0.4, and whether a target then reached the top
+    # results hung on which of the tied vector rows the scan happened to keep.
     exact = "[" + ",".join(repr(x) for x in unit_vector(0)) + "]"
     db_session.execute(
         text("INSERT INTO passages (note_id, client_name, scope, ordinal, content,"
              " embedding, tsv) VALUES (:n, 'acme', 'repo_bulk', :o, :t,"
-             " CAST(:e AS vector), to_tsvector('english', :t))"),
+             " CAST(:e AS vector), setweight(to_tsvector('english', :t), 'B'))"),
         [{"n": bulk_note.id, "o": i, "e": exact,
           "t": f"pelicanium pelicanium pelicanium bulk {i}"} for i in range(197)],
     )

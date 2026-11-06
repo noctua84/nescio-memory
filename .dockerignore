@@ -1,0 +1,19 @@
+# Allow-list: nothing enters the build context unless it is named here. That
+# keeps .env (credentials), .git, the local .venv, tests and docs out of the
+# image and out of the build cache key.
+*
+
+!pyproject.toml
+!uv.lock
+# pyproject.toml names it as the package readme.
+!README.md
+!alembic.ini
+!alembic/
+!app/
+# create_api_key.py and the other operator scripts: minting the first API key
+# in a container needs them (docker compose exec app python scripts/create_api_key.py).
+!scripts/
+
+# Bytecode and caches from a local run would be stale or the wrong version.
+**/__pycache__
+**/*.pyc

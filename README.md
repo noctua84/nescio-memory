@@ -37,8 +37,8 @@ separate Ollama pod behind a Service. An optional in-process backend using
 [sentence-transformers](https://sbert.net) is available for deployments that cannot run a second
 service; see [Embedding backends](#embedding-backends). Handlers are traced with
 [Langfuse](https://langfuse.com) when `LANGFUSE_*` are exported into the **process environment** —
-values that only live in `.env` are not picked up, see
-[Current limitations](#current-limitations).
+when you run with `uv`, values that only live in `.env` are not picked up, see
+[Current limitations](#current-limitations); Docker Compose exports `.env` for you.
 
 ## Requirements
 
@@ -46,7 +46,8 @@ values that only live in `.env` are not picked up, see
 - **[uv](https://docs.astral.sh/uv/)** — manages the virtualenv and the lockfile
 - **PostgreSQL 16+** with the `pgvector` extension, **`pgvector` >= 0.8.0 required** — search sets
   `hnsw.iterative_scan`, which earlier versions reject outright
-- **Docker** — only to run the test suite, which starts a real PostgreSQL + pgvector container
+- **Docker** — to run the test suite, which starts a real PostgreSQL + pgvector container, and
+  for the optional [Docker Compose](#5-run-with-docker-compose) setup
 - **Ollama** running an embedding model (e.g. `qwen3-embedding`) — unless you use the optional
   in-process backend instead
 
@@ -100,7 +101,7 @@ v1 storage.
 Every `/api/v1` route requires an API key. Mint one per client:
 
 ```bash
-uv run python scripts/create_api_key.py my-client
+uv run python -m scripts.create_api_key my-client
 ```
 
 ```
@@ -112,20 +113,98 @@ api_key     : nm_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 Only a SHA-256 hash of the key is stored, so the plaintext cannot be recovered — mint a new key if
 you lose it. Omit the argument and the client is named `default`.
 
+#### Key rotation
+
+Rotate a client's key without SQL, in three steps:
+
+```bash
+# 1. Mint the replacement. Copy its api_key line now: it is shown once.
+uv run python -m scripts.manage_api_keys create my-client
+
+# 2. Deploy the new key to the client and check that it authenticates.
+
+# 3. Find the old key's id, then revoke it.
+uv run python -m scripts.manage_api_keys list --client my-client
+uv run python -m scripts.manage_api_keys revoke --id 1
+```
+
+`list` shows each key's id, client, display prefix (the first 15 characters, so you can match a row to
+the key you copied), created time, revoked time and last-used time. It never shows the secret or its
+hash. Revoked keys are hidden unless you pass `--include-revoked`. The last-used time is written at most
+once per `KEY_LAST_USED_THROTTLE_S`, so a key can have been used more recently than it shows.
+
+- `revoke --id N` revokes one key. Revoking a key that is already revoked prints `revoked 0` and exits 0.
+- `revoke --client NAME --yes` revokes every active key of that client. It refuses without `--yes`.
+
+A revoked key is rejected with `401` on its next request. Revoking sets `revoked_at` rather than
+deleting the row, so the audit trail is kept.
+
 The `client_name` is not just a label: every ingested note and passage is tagged with it, and each client sees
 only its own data. See [Authentication](#authentication).
 
-### 5. Run
+### 5. Run with Docker Compose
+
+The [`Dockerfile`](Dockerfile) and [`compose.yaml`](compose.yaml) run PostgreSQL + pgvector,
+Ollama, the schema migration and the API as one stack, so with containers you can skip steps 1
+and 3 (the `migrate` service applies the schema). To run the API from a Python checkout instead,
+see [Development](#development).
 
 ```bash
-uv run uvicorn app.main:app --reload --port 8000
+cp .env.example .env
+# set POSTGRES_PASSWORD in .env; this prints a URL-safe value to paste in:
+openssl rand -hex 16
+docker compose up -d
+docker compose exec app python scripts/create_api_key.py my-client   # step 4, inside the container
+curl http://localhost:8080/ready
 ```
 
-Run this **from the repository root**: `app` is imported from the working directory, and `.env` is
-resolved relative to it as well.
+`.env` is required here, with `POSTGRES_PASSWORD` set: that value has no default, and every
+`docker compose` command fails until it is set. Every other value has a default; change them in
+`.env` to switch `OLLAMA_MODEL`, enable Langfuse and so on.
 
-Interactive docs are served by FastAPI at <http://localhost:8000/docs>. The committed contract
-lives in [`openapi.json`](openapi.json) / [`openapi.yaml`](openapi.yaml).
+The API is published on port **8080** (`APP_PORT` changes the host side); interactive docs are at
+<http://localhost:8080/docs>. The first `up` pulls the Ollama image and downloads the embedding
+model, so `/ready` reports `degraded` until that finishes. The committed contract lives in
+[`openapi.json`](openapi.json) / [`openapi.yaml`](openapi.yaml).
+
+| Service       | What it does                                                                                 |
+| ------------- | -------------------------------------------------------------------------------------------- |
+| `db`          | `pgvector/pgvector` (PostgreSQL 17, pgvector 0.8.x), data in the `pgdata` volume. Not published to the host. |
+| `ollama`      | Ollama server, models in the `ollama` volume. For a GPU, uncomment the `deploy` block in `compose.yaml`. |
+| `ollama-pull` | One-shot: downloads `OLLAMA_MODEL` into the volume, then exits.                              |
+| `migrate`     | One-shot: runs `alembic upgrade head` once `db` is healthy, then exits.                      |
+| `app`         | The API. Starts only after `migrate` exited successfully.                                    |
+
+- **Migrations never run on app start.** Only the `migrate` service applies them. After upgrading
+  the image, run `docker compose run --rm migrate` (or just `docker compose up -d`, which re-runs
+  it) before the new `app` starts.
+- **The `app` health check calls `/ready`**, so the container is healthy only when PostgreSQL
+  answers. A missing Ollama gives `degraded` (still healthy); a dead database makes it unhealthy.
+  The image's own `HEALTHCHECK` calls `/health`, which touches no dependency.
+- **Ollama is optional for startup.** `docker compose up -d db migrate app` runs the API without it;
+  search then falls back to keyword-only and ingest fails until an embedding backend is reachable.
+- **`.env` is passed into the container whole**, including `LANGFUSE_*`. Compose exports it into
+  the process environment, which is where the Langfuse SDK reads it, so the
+  [`.env` limitation](#current-limitations) does not apply here. `DATABASE_URL` and `OLLAMA_URL`
+  are overridden to point at the `db` and `ollama` services, whatever `.env` says. Database
+  credentials come from `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB`. `POSTGRES_USER`
+  and `POSTGRES_DB` default to `nescio` and `nescio_memory`; `POSTGRES_PASSWORD` has no default and
+  is required. Keep it URL-safe because it is placed into `DATABASE_URL`.
+- **Image variants.** The default image uses Ollama and has no torch. For the in-process backend,
+  build with the `local-embeddings` extra:
+
+  ```bash
+  EXTRAS=local-embeddings docker compose build
+  ```
+
+  and set `EMBEDDING_BACKEND=local`; read [Embedding backends](#embedding-backends) first, since
+  that backend has a different embedding width. CI only builds the default image.
+- **Image builds.** Pull requests build the image and smoke-test the stack in CI
+  ([`docker.yml`](.github/workflows/docker.yml)). This repository does not publish an image;
+  publishing is handled outside it by Devtron.
+
+The container runs as an unprivileged user (uid 10001) and listens on port 8080 inside, regardless
+of `HOST` and `PORT` in `.env` (see [Configuration](#configuration)).
 
 ## API
 
@@ -145,10 +224,51 @@ curl http://localhost:8000/health
 nothing. To check it against what the model really emits, see
 [Checking the dimension](#checking-the-dimension).
 
+### `GET /ready`
+
+Readiness probe. Where `/health` asks "is the process alive?" and contacts nothing, `/ready` asks
+"can it serve right now?" and checks PostgreSQL (`SELECT 1` under a statement timeout) and the
+embedding backend (Ollama `POST /api/show` for `OLLAMA_MODEL`, which proves the server is up and
+the model is pulled without loading it; the `local` backend runs in-process and reports
+`not_checked`). Use `/health` for restart decisions and `/ready` for traffic and monitoring: a
+dead dependency should take a replica out of rotation, not get it killed.
+
+```bash
+curl -i http://localhost:8000/ready
+# HTTP/1.1 200 OK
+# {"status":"ready","checks":{"database":{"status":"ok"},
+#  "embedding_backend":{"status":"ok"}}}
+```
+
+| Overall `status` | HTTP | Meaning                                                               |
+| ---------------- | ---- | --------------------------------------------------------------------- |
+| `ready`          | 200  | database `ok`; embedding backend `ok` or `not_checked`                 |
+| `degraded`       | 200  | database `ok`, embedding backend `fail` or `timeout`                   |
+| `not_ready`      | 503  | database `fail` or `timeout`                                           |
+
+Each check reports `ok`, `fail` or `timeout` (`not_checked` for the `local` embedding backend).
+Neither the exception text nor any host name is returned; the detail is logged at `WARNING`.
+
+An Ollama outage is deliberately `200 degraded`, not `503`: Ollama is shared by every replica, so
+failing readiness on it would eject all of them at once, and search already degrades to keyword
+results without it. The consequence is that an orchestrator only ever sees the `200`, so
+**alert on `status` not being `ready`**, and read `checks.embedding_backend.status` to see which
+dependency failed.
+
+The probe is safe to poll hard and is unauthenticated (no `X-API-Key`):
+
+- The response arrives within `max(READY_DB_TIMEOUT_S, READY_EMBEDDING_TIMEOUT_S)` plus a small
+  overhead, even if a dependency hangs; a check that has not answered by then reports `timeout`.
+- At most one check per dependency is ever in flight. Concurrent requests share it, and a hung
+  dependency keeps one background thread busy until its own connect or HTTP timeout fires instead
+  of piling up connections.
+- A finished result is reused for `READY_CACHE_TTL_S`, so a readiness failure can take up to that
+  long to be reported and to clear.
+
 ### Authentication
 
-Every route under `/api/v1` requires an `X-API-Key` header. `GET /health` does not, so a liveness
-probe needs no credentials.
+Every route under `/api/v1` requires an `X-API-Key` header. `GET /health` and `GET /ready` do not,
+so a liveness or readiness probe needs no credentials.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/search \
@@ -191,10 +311,10 @@ The key does more than authenticate. Every note and passage written through it i
 Design rationale and the retrieval-quality baseline live in
 [`docs/superpowers/specs/2026-10-29-notes-passages-slice-1-design.md`](docs/superpowers/specs/2026-10-29-notes-passages-slice-1-design.md).
 The routes are tagged `Ingest`, `Notes` and `Search` in the OpenAPI document, with operation ids
-`ingestNote`, `getNote`, `deleteNote` and `searchPassages`.
+`ingestNote`, `getNote`, `deleteNote`, `deleteNoteByPath`, `deleteScope` and `searchPassages`.
 
-Every `/api/v1` route except `GET /health` requires the `X-API-Key` header, and all data is
-tenant-scoped by it.
+Every `/api/v1` route requires the `X-API-Key` header (only `GET /health` and `GET /ready`, which
+sit outside `/api/v1`, do not), and all data is tenant-scoped by it.
 
 #### `POST /api/v1/ingest`
 
@@ -239,6 +359,7 @@ the embedding-input composition, and the embedding backend + dimension) match th
 hash match behind a changed pipeline version still re-splits and re-embeds. `force: true` is the
 escape hatch for a change the pipeline version cannot see — most plausibly a re-pulled embedding
 model behind an unchanged backend name and dimension — and always costs the work, never skipping.
+A skip never counts against the [ingest limit](#rate-limits).
 
 #### `GET /api/v1/notes/{id}`
 
@@ -277,12 +398,67 @@ curl http://localhost:8000/api/v1/notes/42 -H "X-API-Key: nm_your_key_here"
 
 The erasure path: removes a note and, by cascade, every one of its passages. Returns `204` with
 no body on success, and the same indistinguishable `404` as `GET` for a missing or foreign id.
-This is the **only** way to remove a note — nothing reconciles notes against a source tree, so a
-client that stops holding a file must call this itself.
+Nothing reconciles notes against a source tree, so a client that stops holding a file must call a
+delete route itself — this one if it kept the id, or the two below if it only has the path or the
+scope.
 
 ```bash
 curl -X DELETE http://localhost:8000/api/v1/notes/42 -H "X-API-Key: nm_your_key_here"
 ```
+
+#### `DELETE /api/v1/notes?scope=…&path_or_uri=…`
+
+Deletes the one note stored at `(scope, path_or_uri)`, for a client that does not hold the id. Both
+query parameters are required; `scope` may be the empty string, which is the root scope. They are
+query parameters rather than path segments because a scope can be empty and a path contains
+slashes. `path_or_uri` follows the same rule as ingest (a relative path without `..`, or a
+`scheme://` URI), so a value ingest would refuse is refused here too.
+
+```bash
+curl -X DELETE -G http://localhost:8000/api/v1/notes -H "X-API-Key: nm_your_key_here" \
+  --data-urlencode "scope=nescio-memory" \
+  --data-urlencode "path_or_uri=docs/architecture.md"
+```
+
+```json
+{
+  "notes_deleted": 1,
+  "passages_deleted": 3,
+  "notes": [
+    {"note_id": 42, "path_or_uri": "docs/architecture.md", "content_hash": "..."}
+  ]
+}
+```
+
+No match is `404 {"detail": "Note not found"}`, byte-identical to delete by id and the same whether
+the note never existed or belongs to another client. The lookup is scoped to the calling client, so
+it cannot be used to probe another client's paths. Unlike delete by id the success response is
+`200` with a body, so the caller learns what was removed (the id and content hash are gone from the
+database by then).
+
+#### `DELETE /api/v1/scopes?scope=…`
+
+Retires a whole scope: deletes every note in it and, by cascade, their passages. The response has
+the same shape as delete by path, with one entry in `notes` per removed note. A scope with no
+notes — including one that belongs to another client — is **not** an error: the answer is `200`
+with `notes_deleted` and `passages_deleted` of `0` and an empty `notes` list, which keeps a retry
+after a partial failure harmless.
+
+```bash
+curl -X DELETE "http://localhost:8000/api/v1/scopes?scope=nescio-memory" -H "X-API-Key: nm_your_key_here"
+```
+
+**The root scope cannot be deleted by accident.** Notes ingested without a scope live in the empty
+scope `""`, and a client that builds this URL from a variable that turned out empty would
+otherwise erase them. So an empty or omitted `scope` is refused with `400` before anything runs.
+To delete the root scope on purpose, say so:
+
+```bash
+curl -X DELETE "http://localhost:8000/api/v1/scopes?root_scope=true" -H "X-API-Key: nm_your_key_here"
+```
+
+With `root_scope=true`, `scope` must be empty or omitted and only the root scope is deleted;
+combining `root_scope=true` with a non-empty `scope` is a `400` as well.
 
 #### `POST /api/v1/search`
 
@@ -356,6 +532,80 @@ an error: the keyword branch contributes nothing and the vector branch still ans
 response is a `200` with semantic matches (and an empty `results` only if the caller holds no
 passages).
 
+### Rate limits
+
+Ingest and search are limited per client. The limits are keyed by `client_name`, so the old and new
+key of a [rotation](#key-rotation) share one budget. They are kept in PostgreSQL, so **they hold across
+replicas**: adding a replica adds no budget. There is no off switch; raise a limit instead. A refusal
+is a `429` with `Retry-After` (see [Error responses](#error-responses)), and the service logs a
+`WARNING` naming the client. The other routes are not limited.
+
+**Ingest: a concurrency cap.** At most `RATE_LIMIT_INGEST_CONCURRENCY` ingests per client embed at
+once; there is no per-minute rate. A slot is taken after the skip check and released when the ingest
+commits or rolls back.
+
+- **Skips are free.** A re-ingest that would be skipped never touches the limiter, so it succeeds with
+  every slot in use, and it still writes its `skipped` [audit event](#audit-trail).
+- A refused ingest changes nothing, so it writes no audit event.
+- `Retry-After` is the fixed `RATE_LIMIT_INGEST_RETRY_AFTER_S`, and it is a hint rather than a promise.
+  A slot is held while the whole note is embedded, including
+  [embedding retries](#current-limitations), which can add up to
+  `EMBED_RETRY_BUDGET × (30 s + EMBED_RETRY_MAX_DELAY_S)` (68 s by default). With a slow or flaky
+  backend, a retry after that many seconds can be refused again.
+
+**Search: a request rate.** At most `RATE_LIMIT_SEARCH_REQUESTS` requests per client in each fixed
+window of `RATE_LIMIT_WINDOW_S` seconds.
+
+- Windows are aligned to the clock of the database, not to a client's first request: with the default
+  60 s, one starts on every minute. `Retry-After` is the seconds left in the current window, rounded up.
+- Because the window is fixed, a client can send up to twice the limit across a boundary: a full
+  budget just before it and another just after.
+- Every authenticated request counts, including one answered with `422` or `429`. A refused request
+  does not push the window back. A request that fails authentication does not count.
+- The counters are in an `UNLOGGED` table, so a database crash resets them and hands every client a
+  fresh budget.
+
+**Clients should honour `Retry-After` over their own backoff.** `scripts/reingest.py` does: see
+[Re-ingesting a corpus](#re-ingesting-a-corpus).
+
+### Error responses
+
+Errors from `/api/v1` carry a JSON body, `{"detail": ...}`. Except for `422`, `detail` is a string: a
+fixed message for each failure below, never an exception message.
+
+| Status | `detail` | Retry-After (seconds) | When |
+| ------ | -------- | --------------------- | ---- |
+| 400 | `Request contains data the database cannot accept` | none | The database rejected a value, such as a NUL byte in text. |
+| 400 | `path_or_uri must be a relative path without '..', or an absolute URI` | none | `POST /api/v1/ingest` or `DELETE /api/v1/notes?scope=…&path_or_uri=…` with an absolute path or a `..` component. |
+| 400 | `scope is required. To delete the root (empty) scope, send root_scope=true with no scope.` | none | `DELETE /api/v1/scopes` with an empty or omitted `scope`. |
+| 400 | `root_scope=true deletes the root (empty) scope and cannot be combined with a non-empty scope.` | none | `DELETE /api/v1/scopes` with `root_scope=true` and a non-empty `scope`. |
+| 400 | `content is too large: N characters exceeds the 500000 limit.` | none | `POST /api/v1/ingest` with `content` over 500,000 characters. `N` is the submitted length. |
+| 400 | `Invalid Content-Length header.` | none | Any `/api/v1` route, with a `Content-Length` that is not a non-negative integer. Rejected before authentication. |
+| 401 | `Missing API key` | none | The `X-API-Key` header is absent. |
+| 401 | `Invalid or revoked API key` | none | The key is unknown or revoked. |
+| 404 | `Note not found` | none | `GET` or `DELETE /api/v1/notes/{id}` for a note that does not exist, or belongs to another client. |
+| 413 | `Request body too large: limit is 8388608 bytes.` | none | Any `/api/v1` route, with a body over the limit. Rejected before authentication. |
+| 422 | list of error objects | none | Request validation failed. Each object has `loc`, `msg` and `type`. |
+| 429 | `Rate limit exceeded` | ingest: `RATE_LIMIT_INGEST_RETRY_AFTER_S`; search: seconds left in the window | `POST /api/v1/ingest` with all of the client's slots in use, or `POST /api/v1/search` over the client's limit for the window. See [Rate limits](#rate-limits). |
+| 500 | `Embedding backend is misconfigured` | none | The embedding backend cannot work as deployed. Retrying will not help; the deployment must change. |
+| 500 | `Internal server error` | none | An unanticipated failure. The traceback is in the server log. |
+| 503 | `Database unavailable` | 30 | The database cannot be reached. |
+| 503 | `Database busy` | 30 | Every database connection was in use for longer than the pool allows waiting (30 s). The database itself is up; retry. |
+| 503 | `Query exceeded time limit` | none | A query was cancelled, in practice by the search `statement_timeout` (`STATEMENT_TIMEOUT_MS`). |
+| 503 | `Embedding backend unavailable` | 30 | The embedding backend cannot be reached, timed out, or answered with a transient HTTP status. |
+| 503 | `Embedding backend returned an unexpected response` | 30 | The embedding backend answered with something that is not a usable vector. |
+| 503 | no `detail`: the body is the readiness report, with `status` `not_ready` | none | `GET /ready`, which sits outside `/api/v1`, when the database check fails or times out. See [`GET /ready`](#get-ready). |
+
+Retry-After is sent only when a retry can succeed. A dependency that is down may recover, so the 30
+seconds is a hint to back off, not a promise. A rate limit clears by itself, so a `429` always carries
+one. A bad request, a misconfiguration and a bug fail the same way on every retry, so their responses
+carry no header.
+
+A transient embedding failure is handled differently by the two routes that embed. `POST /api/v1/ingest`
+returns the `503` above. `POST /api/v1/search` answers `200` with full-text results and
+`degraded: true` instead (see `degraded` under `POST /api/v1/search`). A bad response or a
+misconfiguration is not degraded on either route.
+
 ## Upgrading to 0.6.0
 
 0.6.0 is a breaking release.
@@ -396,14 +646,64 @@ see [`.env.example`](.env.example) for the annotated template. Unknown keys are 
 | `LANGFUSE_SECRET_KEY` | *(empty → tracing off)*                     |                                                      |
 | `LANGFUSE_HOST`       | `https://cloud.langfuse.com`                | Langfuse instance                                    |
 | `APP_NAME`            | `Nescio Semantic Memory API`                | title shown in the OpenAPI docs                      |
-| `LOG_LEVEL`           | `INFO`                                      | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL` |
+| `LOG_LEVEL`           | `INFO`                                      | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL` (case-insensitive; anything else fails at startup); applies to the `app.*` and `uvicorn.*` loggers, the root logger stays at `WARNING` so httpx and SQLAlchemy stay quiet — see [Logging](#logging) |
+| `LOG_FORMAT`          | `json`                                      | `json` (one OpenTelemetry-shaped object per line, for a collector) or `text` (human-readable, for a local terminal); any other value fails at startup |
+| `OTEL_SERVICE_NAME`   | *(unset → `APP_NAME`)*                      | `service.name` on every log line. **Process environment only**, not read from `.env`, like `LANGFUSE_*`: Langfuse's tracer reads it from the process environment too, so logs and traces carry one service identity |
+| `OTEL_RESOURCE_ATTRIBUTES` | *(unset)*                              | extra resource fields on every log line, as comma-separated `key=value` pairs (percent-decoded); `service.name` and `service.version` inside it are honoured. A malformed entry is skipped with one warning. **Process environment only**, not read from `.env` |
 | `SEARCH_CANDIDATES`   | `50`                                        | candidates each search branch (keyword, vector) contributes before fusion; `1..1000`; the effective number is `max(SEARCH_CANDIDATES, top_k)` |
 | `RRF_K`               | `60`                                        | reciprocal-rank-fusion damping constant, `>= 1`; a passage scores `weight / (RRF_K + rank)` per branch |
 | `FTS_WEIGHT` / `VECTOR_WEIGHT` | `1.0` / `1.0`                      | per-branch multipliers on the fused score, finite and `>= 0`; `0` switches that branch off (`VECTOR_WEIGHT=0` is the keyword-only baseline); both `0` is rejected at startup |
 | `QUERY_INSTRUCTION`   | *(Qwen3 retrieval instruction)*             | prefix added to **query** embeddings only, never to passages, for instruction-tuned models such as Qwen3-Embedding; empty string disables it. Set `QUERY_INSTRUCTION=""` for a model that is not instruction-tuned (the `local` backend's sentence-transformers model, or any non-Qwen3 Ollama model): the prefix is applied to queries only and would skew ranking |
 | `QUERY_EMBED_TIMEOUT_S` | `15`                                      | seconds a search waits to embed the query, `0 < x <= 30`; on a transient failure the search degrades to keyword-only (`degraded: true`). The default covers a cold model load: Ollama unloads an idle model after its `keep_alive` (5 minutes by default), so the first search after an idle period waits for a reload. A startup warm-up would not help, since it only covers the first load after a deploy; to avoid the reload, set `OLLAMA_KEEP_ALIVE` on the Ollama server. A longer wait does not hold a database connection |
 | `EMBED_BATCH_SIZE`    | `16`                                        | passages per `/api/embed` call at ingest, `1..256` |
+| `READY_DB_TIMEOUT_S`  | `2.0`                                       | seconds `GET /ready` waits for the database check before reporting `timeout`, `0 < x <= 10`; see [`GET /ready`](#get-ready) |
+| `READY_EMBEDDING_TIMEOUT_S` | `2.0`                                 | seconds `GET /ready` waits for the Ollama check before reporting `timeout`, `0 < x <= 10` |
+| `READY_CACHE_TTL_S`   | `5.0`                                       | seconds a finished readiness result is reused, `0 <= x <= 60`; `0` disables reuse (a check already running is still shared) |
+| `EMBED_RETRY_ATTEMPTS` | `3`                                        | tries per embedding call, the first included, `1..5`; `1` means no retry. Only transient failures are retried (timeouts, connection errors, HTTP 408/429/500/502/503/504); a bad response or a misconfiguration never is |
+| `EMBED_RETRY_BASE_DELAY_S` | `0.5`                                  | backoff before the first retry, `0 < x <= EMBED_RETRY_MAX_DELAY_S`; it doubles each retry and the actual wait is uniformly random below that (full jitter) |
+| `EMBED_RETRY_MAX_DELAY_S` | `4.0`                                   | longest single backoff, `0 < x <= 10`; also the cap on a `Retry-After` the embedding server sends with a 429 or 503 |
+| `EMBED_RETRY_BUDGET`  | `2`                                         | retries shared by **all** calls of one ingest request, `0..10`; `0` disables retry. See "Ingestion retries" under Current limitations for the worst-case bound |
+| `KEY_LAST_USED_THROTTLE_S` | `300`                                  | `api_keys.last_used_at` is rewritten at most once per this many seconds per key, `0..86400`; `0` touches on every request — see [Audit trail](#audit-trail) |
+| `AUDIT_RETENTION_DAYS` | `400`                                      | days `ingest_events` rows survive `scripts/prune_ingest_events.py`, `30..3650` — see [Audit trail](#audit-trail) |
+| `RATE_LIMIT_INGEST_CONCURRENCY` | `2`                                 | ingests per client that may embed at once, `1..32`; skipped re-ingests do not count — see [Rate limits](#rate-limits) |
+| `RATE_LIMIT_INGEST_RETRY_AFTER_S` | `5`                               | `Retry-After`, in seconds, on an ingest refused for want of a slot, `1..60`; a hint, because a slot is held across embedding and its retries — see [Rate limits](#rate-limits) |
+| `RATE_LIMIT_SEARCH_REQUESTS` | `120`                                  | searches per client per window, `1..10000` |
+| `RATE_LIMIT_WINDOW_S` | `60`                                        | length of the fixed search window in seconds, `1..3600` |
 | `HOST` / `PORT`       | `localhost` / `8080`                        | *currently not applied* — pass these to `uvicorn` instead |
+
+### Logging
+
+Every record goes to **stdout** as one line of JSON (`LOG_FORMAT=json`, the default): from the
+`app.*` loggers and from `uvicorn.error` and `uvicorn.access`. A traceback is one escaped string
+inside the line, never several lines. Fields:
+
+| Field | Value |
+| ----- | ----- |
+| `timestamp` | ISO 8601, UTC, milliseconds, `Z` suffix |
+| `level`, `severity_number` | `DEBUG` 5, `INFO` 9, `WARNING` 13, `ERROR` 17, `CRITICAL` 21 (OpenTelemetry severity numbers; a level in between maps to the nearest lower one) |
+| `logger`, `message` | the logger name and the formatted message |
+| `service.name`, `service.version` | see `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` above; the version is the project version |
+| `trace_id`, `span_id` | 32 and 16 hex characters, present only while an OpenTelemetry span is active |
+| `exception.type`, `exception.message`, `exception.stacktrace` | present when an exception is logged |
+| anything passed as `extra=` | emitted as its own field |
+
+Request logs from `uvicorn.access` carry `http.request.method`, `url.path`, `http.response.status_code`,
+`client.address` and `client.port`, plus a message rebuilt from them. **The query string is dropped**:
+it can carry a note path or a search term, so the raw uvicorn message is never emitted. Request
+bodies, note content, paths and API keys are not logged, and the keys `content`, `body`, `q`,
+`query`, `api_key`, `x_api_key`, `headers` and `path_or_uri` are replaced with `[redacted]` if a call
+site ever passes them.
+
+**Delivery is stdout only.** To get the records into Dash0 (or any OpenTelemetry backend), point a
+collector's `filelog` receiver at the container's stdout. There is deliberately no OTLP log
+exporter: exporting as well would deliver every record twice.
+
+**Trace correlation.** `trace_id` and `span_id` come from `opentelemetry.trace.get_current_span()`.
+Inside a route decorated with Langfuse's `@observe`, that is the Langfuse span (checked against
+langfuse 5.0.4: a valid, recording span with real ids) **when the `LANGFUSE_*` keys are set**. With
+the keys unset, or with `LANGFUSE_TRACING_ENABLED=false`, Langfuse hands out a non-recording span
+with an invalid (all-zero) context, so the log lines carry no `trace_id`/`span_id`. That is correct,
+since there is no trace to link to, but it means correlation needs Langfuse tracing switched on.
 
 ### Embedding backends
 
@@ -510,6 +810,107 @@ worse failure than the one being guarded against. `tests/test_embedding_width_co
 same probe in the suite and **skips** when no backend is reachable — the skip is printed in every
 run's summary (`addopts = "-ra"`), because a silent skip would leave the same hole.
 
+## Audit trail
+
+The `ingest_events` table records who changed which note, so a change can be attributed after the
+fact without Langfuse.
+
+**Why a table in the same database.** Each event is written in the transaction of the change it
+records, so there is no change without a record and no record without the change: an ingest that
+rolls back (an embedding `503`, say) leaves neither. A log line or a Langfuse trace can be lost
+separately from the write, and tracing is optional anyway. The table is append-only: the service
+only inserts into it, and only the prune script below deletes from it.
+
+**What is recorded.** One row per note, per outcome:
+
+| `action`   | Written by                         | `passages_*` and `content_hash_*`                  |
+| ---------- | ---------------------------------- | -------------------------------------------------- |
+| `created`  | ingest of a new note               | nothing before; the new values after               |
+| `replaced` | ingest that rewrote the note       | what it held before; the new values after          |
+| `skipped`  | ingest of unchanged content        | the same values before and after                   |
+| `deleted`  | delete by id, by path and by scope | what it held before; nothing after                 |
+
+Every row also has `at`, `client_name`, `scope`, `note_id`, `path_sha256` and `api_key_id`. `action`
+`replaced` can have a NULL `content_hash_before` when two first ingests of a new note raced, because
+the loser's upsert overwrote a hash it never read. No note content is stored, only its hash. A delete
+that matched nothing writes nothing. `api_key_id` is a plain integer with no foreign key: a foreign key
+check would take a lock on the key's row inside ingest's long transaction, and the record must not
+depend on the key row's lifecycle.
+
+**Path hashing.** A deleted note's path is stored hashed only: `path_sha256` is set and `path_or_uri`
+is NULL. Every other event also stores `path_or_uri` in plain text.
+
+- **Residual:** deleting a note does not rewrite its earlier `created`, `replaced` and `skipped`
+  events, so those rows still hold the plain path until retention removes them. Because
+  `path_sha256` is on every event, "everything that happened to path P" is one query by hash.
+- A plain SHA-256 of a guessable path can be confirmed by anyone who already knows the path. That is
+  the intended operator use, and it is accepted.
+
+**Retention.** `scripts/prune_ingest_events.py` deletes rows older than `AUDIT_RETENTION_DAYS` (400 by
+default). Nothing else does, so schedule it, on the same schedule as your database backup:
+
+```bash
+uv run python -m scripts.prune_ingest_events                  # from a checkout
+docker compose exec app python scripts/prune_ingest_events.py # in the Compose stack
+```
+
+It prints how many rows it deleted. A database failure exits non-zero.
+
+**Access.** Operators only, through SQL. There is no API route, so a client cannot read the trail, not
+even its own part of it. Query recipes:
+
+Which key replaced note X on date D, and what did it have before?
+
+<!-- recipe: replaced-on-date -->
+```sql
+SELECT e.at, e.api_key_id, k.key_prefix, k.revoked_at,
+       e.passages_before, e.passages_after, e.content_hash_before, e.content_hash_after
+FROM ingest_events e
+LEFT JOIN api_keys k ON k.id = e.api_key_id
+WHERE e.client_name = :client_name
+  AND e.note_id = :note_id
+  AND e.action = 'replaced'
+  AND e.at >= CAST(:day AS date)
+  AND e.at < CAST(:day AS date) + 1
+ORDER BY e.at;
+```
+
+Everything that happened to a path, the deletes included (Python's `hashlib.sha256` or
+`printf %s "$path" | sha256sum` gives the hash):
+
+<!-- recipe: path-history -->
+```sql
+SELECT at, action, api_key_id, note_id, passages_before, passages_after
+FROM ingest_events
+WHERE client_name = :client_name
+  AND path_sha256 = :path_sha256
+ORDER BY at;
+```
+
+What one key has done, most recent first:
+
+<!-- recipe: key-history -->
+```sql
+SELECT at, action, client_name, scope, note_id, path_or_uri
+FROM ingest_events
+WHERE api_key_id = :api_key_id
+ORDER BY at DESC
+LIMIT 100;
+```
+
+Values are written as `:name`, so these run as they are through a client that binds parameters;
+in `psql`, substitute them by hand or with `\set`.
+
+**Key usage.** `api_keys.last_used_at` is written on its own short transaction on a separate
+connection, never inside the request's, so a long ingest cannot hold the key's row locked. It is
+updated at most once per `KEY_LAST_USED_THROTTLE_S` per key. A failed update logs a `WARNING` and does
+not fail the request. An ingest that later rolls back still counts as a use: the key *was* used.
+
+**Langfuse.** When tracing is on, ingest, delete and search traces also carry the client name as the
+user id, and the scope and counts (`note_id`, `skipped`, passages, results) as metadata. `path_or_uri`
+and the search query are never attached. Langfuse drops a scope or client name longer than about 200
+characters from the trace, and logs a warning that does not contain the value.
+
 ## Development
 
 ```bash
@@ -517,13 +918,17 @@ uv sync --locked                      # install / refresh the environment
 uv sync --locked --extra local-embeddings  # only if using the in-process backend
 uv lock                               # after changing dependencies in pyproject.toml
 uv run python export_openapi.py       # regenerate openapi.json + openapi.yaml
-uv run uvicorn app.main:app --reload  # dev server (from the repository root)
+uv run uvicorn app.main:app --reload --port 8000  # dev server (from the repository root)
 uv run pytest                         # integration suite (needs Docker)
 uv run alembic upgrade head           # apply migrations
 uv run python -m scripts.check_embedding_dimension  # does the model's width match EMBEDDING_DIMENSION?
 ```
 
-Four things are enforced by CI:
+Run the dev server **from the repository root**: `app` is imported from the working directory, and
+`.env` is resolved relative to it as well. Interactive docs are then at
+<http://localhost:8000/docs>. This path needs steps 1 to 3 of the [Quick start](#quick-start).
+
+Five things are enforced by CI:
 
 - **The test suite must pass.** `uv run pytest` runs the integration suite against a real
   PostgreSQL + pgvector container on every push and pull request. No count is quoted here because
@@ -535,6 +940,9 @@ Four things are enforced by CI:
   `openapi.yaml`.
 - **The `local-embeddings` extra must still resolve.** A `--dry-run` sync verifies it against the
   lockfile on every run without downloading torch, so the opt-in backend cannot rot unnoticed.
+- **The container image must build and boot.** [`docker.yml`](.github/workflows/docker.yml)
+  builds the image on every pull request and starts `db`, `migrate` and `app` (without Ollama),
+  asserting that `/ready` reports the database `ok`.
 
 ### Re-ingesting a corpus
 
@@ -557,6 +965,10 @@ skipped — useful after a model change the pipeline version does not see. `--dr
 would be posted and makes no HTTP call. `--url` must point at an allowed host (`localhost`,
 `127.0.0.1`, `::1` by default); extend the allowlist with the comma-separated
 `NESCIO_ALLOWED_HOSTS` environment variable.
+
+A `429` or `503` gets one retry after the response's `Retry-After` (5 s if it has none, and never more
+than 60 s). A second one is reported as `FAILED 429` or `FAILED 503`, and the run moves on to the next
+file. The files are sent one at a time, so a single run needs only one [ingest slot](#rate-limits).
 
 ### Measuring retrieval quality
 
@@ -608,28 +1020,37 @@ This is a PoC. Known rough edges, roughly in order of how much they matter:
   other non-2xx status (a 404 for a model that is not pulled, a 501 for a non-embedding model, a
   redirect such as the 307 from a trailing-slash `OLLAMA_URL`) returns a `500` with no `Retry-After`. Treat `degraded: true` as a weaker result,
   not an error; `scripts/eval_queries.py` refuses to score one.
-- **Langfuse keys in `.env` are ignored.** `@observe` relies on the SDK reading `LANGFUSE_*` from
-  the process environment, and pydantic-settings does not export `.env` values into it. Export the
-  keys in your shell or service manager, or tracing silently stays off.
-- **Unmapped errors still return a bare `500`.** `EmbeddingBackendError`, `OperationalError`,
-  and `DataError` are mapped, so the common failure families now return a documented `503`,
-  `500`, or `400` with a `{"detail": ...}` body. But there is no catch-all handler for
-  `Exception`, so any genuinely unanticipated failure still surfaces as plain-text
-  `Internal Server Error` rather than JSON, and a client still cannot rely on parsing
-  `detail` from every error.
-- **Ingestion has no retry or backoff.** Passages are embedded through Ollama's `/api/embed` in
-  groups of `EMBED_BATCH_SIZE`, but a failed call is not retried; the request fails and the client
-  re-sends it.
-- **There is no list or export route.** No enumeration, no fetch-by-path: a note is reachable
-  by id (`GET /api/v1/notes/{id}`) or as passages through a search that matched it. This is an
-  architectural property and **not a security boundary**: there is no rate limiting, so bulk
-  retrieval is bounded by query effort rather than refused. Recovering the corpus itself is a
+- **Langfuse keys in `.env` are ignored** when you run with `uv`. `@observe` relies on the SDK
+  reading `LANGFUSE_*` from the process environment, and pydantic-settings does not export `.env`
+  values into it. Export the keys in your shell or service manager, or tracing silently stays off.
+  This does not apply to [Docker Compose](#5-run-with-docker-compose), which exports `.env` into the
+  container's environment.
+- **Ingestion retries transient embedding failures, within a fixed bound.** Passages are embedded
+  through Ollama's `/api/embed` in groups of `EMBED_BATCH_SIZE`. A call that fails with a timeout,
+  a connection error or HTTP 408/429/500/502/503/504 is retried with exponential backoff and full
+  jitter (`EMBED_RETRY_BASE_DELAY_S`, doubling, capped at `EMBED_RETRY_MAX_DELAY_S`; a `Retry-After`
+  from a 429 or 503 is honoured up to that cap), at most `EMBED_RETRY_ATTEMPTS` tries per group.
+  A bad response or a misconfiguration is never retried. The retries are drawn from one pool of
+  `EMBED_RETRY_BUDGET` per request, shared by all groups, so a large note cannot retry once per
+  group. Ingest holds a row lock while it embeds, so the worst case is stated: the lock is held
+  at most `EMBED_RETRY_BUDGET × (30 s + EMBED_RETRY_MAX_DELAY_S)` longer than a request that never
+  retries (defaults: `2 × (30 + 4) = 68 s`), whatever the note's size, and so is the ingest's
+  [slot](#rate-limits). When the budget runs out
+  the request fails with `503` as before and the client re-sends it. A search retries at most
+  once and only inside `QUERY_EMBED_TIMEOUT_S`; if that is not enough it degrades to keyword-only
+  as before.
+- **There is no list or export route.** No enumeration, and no fetch-by-path (deleting by path
+  exists, reading by path does not): a note is readable by id (`GET /api/v1/notes/{id}`) or as
+  passages through a search that matched it. This is an
+  architectural property and **not a security boundary**: the [search rate limit](#rate-limits) slows
+  bulk retrieval but does not refuse it. Recovering the corpus itself is a
   `pg_dump`/restore concern, not an API one. A note changes only by re-ingesting it whole.
 - **Changing the FTS configuration or weights forces a full re-ingest**, because `tsv` is
   materialized at ingest time, not computed on the fly.
-- **A note whose source file was deleted is not removed automatically.**
-  `DELETE /api/v1/notes/{id}` is the only erasure path; reconciling notes against a source tree
-  is not something the service does.
+- **A note whose source file was deleted is not removed automatically.** A client removes it
+  with `DELETE /api/v1/notes/{id}` or `DELETE /api/v1/notes?scope=…&path_or_uri=…`, or retires a
+  whole scope with `DELETE /api/v1/scopes`; reconciling notes against a source tree is not
+  something the service does.
 
 Contributions addressing any of the above are welcome.
 

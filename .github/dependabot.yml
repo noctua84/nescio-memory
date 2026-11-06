@@ -43,3 +43,33 @@ updates:
       - dependencies
     # Only five actions are in use, and each is a distinct trust decision.
     open-pull-requests-limit: 5
+
+  # Dockerfile base images (python, uv). Both are pinned by tag AND digest;
+  # Dependabot bumps the two together.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:17"
+    commit-message:
+      prefix: build
+      include: scope
+    labels:
+      - dependencies
+    open-pull-requests-limit: 5
+
+  # compose.yaml images (pgvector, ollama). Review each bump on its own: the
+  # schema depends on the pgvector version and the embedding width on Ollama.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:17"
+    commit-message:
+      prefix: build
+      include: scope
+    labels:
+      - dependencies
+    open-pull-requests-limit: 5

@@ -1,5 +1,5 @@
-"""All notes/passages SQL for writes and single-note reads. Nothing outside
-this module and passage_search.py touches those tables.
+"""All notes/passages SQL for writes and single-note reads. Only passage_search.py
+and the read-only passage count in audit.py touch those tables from outside.
 
 Tenant discipline, stated once so it is not re-argued per method: every statement
 here carries `client_name == self.client_name` as a DIRECT argument to
@@ -43,6 +43,20 @@ class LockedNote:
     id: int
     content_hash: str
     pipeline_version: str
+
+
+@dataclass(frozen=True)
+class DeletedNote:
+    """Identity of one note a delete removed, as RETURNING reported it.
+
+    Carries the content hash and the plain path because the caller needs both
+    to reconcile its own index (and, later, to build an audit row) without a
+    second query -- by the time the delete returns, the row is gone.
+    """
+
+    note_id: int
+    path_or_uri: str
+    content_hash: str
 
 
 @dataclass(frozen=True)
@@ -284,15 +298,15 @@ class NoteRepository:
         )
         return self.db.execute(stmt).scalar_one()
 
-    def delete_note(self, note_id: int) -> bool:
-        """Delete one note; True when a row was actually removed.
+    def delete_note(self, note_id: int) -> Row[Any] | None:
+        """Delete one note; returns its identity for the audit row, or None.
 
         Its passages go with it through the composite FK's ON DELETE CASCADE.
         They are deliberately NOT deleted explicitly first: a second statement
         would be a second place for the tenant filter to be wrong, and the
         cascade is exercised directly by the schema tests.
 
-        False covers both "no such note" and "another tenant's note", for the
+        None covers both "no such note" and "another tenant's note", for the
         same reason get_note returns None for both. Does not commit.
         """
         stmt = (
@@ -301,6 +315,79 @@ class NoteRepository:
                 Note.client_name == self.client_name,
                 Note.id == note_id,
             )
-            .returning(Note.id)
+            .returning(Note.id, Note.scope, Note.path_or_uri, Note.content_hash)
         )
-        return self.db.execute(stmt).one_or_none() is not None
+        return self.db.execute(stmt).one_or_none()
+
+    def delete_by_path(
+        self, scope: str, path_or_uri: str
+    ) -> tuple[list[DeletedNote], int]:
+        """Delete the one note at (scope, path_or_uri).
+
+        Returns (deleted notes, passages gone) -- the same shape as
+        delete_scope, because the response reports the passage count for both
+        and it cannot be recovered after the cascade. The list is empty when
+        there is no such note; empty covers "no such note" and "another tenant's note" alike, for the
+        reason get_note returns None for both. `scope` may be "" -- the root
+        scope is real data, and it is the route, not this method, that guards
+        against deleting it by accident. Does not commit.
+        """
+        return self._delete_matching(scope, path_or_uri)
+
+    def delete_scope(self, scope: str) -> tuple[list[DeletedNote], int]:
+        """Delete every note in `scope`; returns (deleted notes, passages gone).
+
+        Deliberately takes the scope literally, "" included: refusing to wipe
+        the root scope by accident is the route's job (it needs the
+        `root_scope` flag), and a repository that second-guessed an empty
+        string would make the "" scope impossible to delete on purpose. Does
+        not commit.
+        """
+        return self._delete_matching(scope, None)
+
+    def _delete_matching(
+        self, scope: str, path_or_uri: str | None
+    ) -> tuple[list[DeletedNote], int]:
+        """Count the passages about to go, then delete the matching notes.
+
+        Every WHERE below spells `client_name == self.client_name` out as its
+        own argument rather than sharing a splatted list of conditions: the
+        invariant at the top of this module is that the filter is visible and
+        direct at each statement. The passage count carries its own tenant
+        filter on Passage instead of borrowing the one inside the note
+        subquery.
+
+        The count comes FIRST because the passages leave through the composite
+        FK's ON DELETE CASCADE as part of the DELETE; afterwards there is
+        nothing left to count. A note ingested between the two statements
+        would be deleted but not counted, so the number is a report, never a
+        bound on what is deleted -- the `notes` list is the authoritative one.
+        """
+        matching_notes = select(Note.id).where(
+            Note.client_name == self.client_name,
+            Note.scope == scope,
+        )
+        delete_stmt = delete(Note).where(
+            Note.client_name == self.client_name,
+            Note.scope == scope,
+        )
+        if path_or_uri is not None:
+            matching_notes = matching_notes.where(Note.path_or_uri == path_or_uri)
+            delete_stmt = delete_stmt.where(Note.path_or_uri == path_or_uri)
+
+        passage_count = self.db.execute(
+            select(func.count())
+            .select_from(Passage)
+            .where(
+                Passage.client_name == self.client_name,
+                Passage.note_id.in_(matching_notes),
+            )
+        ).scalar_one()
+
+        rows = self.db.execute(
+            delete_stmt.returning(Note.id, Note.path_or_uri, Note.content_hash)
+        ).all()
+        return (
+            [DeletedNote(row.id, row.path_or_uri, row.content_hash) for row in rows],
+            passage_count,
+        )

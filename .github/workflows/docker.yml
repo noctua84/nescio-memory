@@ -1,0 +1,88 @@
+name: docker
+
+# Pull requests build the image (nothing is pushed), then start it with Postgres
+# and run the migrations to prove the container boots; this repo publishes no image,
+# publishing is handled outside it by Devtron.
+#
+# Only the default (Ollama) image is built. The torch variant
+# (EXTRAS=local-embeddings) is a build-it-yourself option documented in the
+# README: it is several hundred MB larger and needs a different embedding width.
+
+on:
+  pull_request:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Actions are pinned to commit SHAs rather than tags, so a retagged or
+      # compromised release cannot redirect a workflow. Dependabot's
+      # github-actions ecosystem updates the SHA and the version comment together.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+
+      # push: false and no registry login: a pull request, including one from a
+      # fork, builds without any credential.
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          push: false
+
+  smoke:
+    name: compose smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # compose has no default database password and interpolates on every
+      # command, so each later step, `logs` and `down -v` included, needs this.
+      # It is generated per run; nothing is hardcoded.
+      - name: Generate a throwaway database password
+        run: echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" >> "$GITHUB_ENV"
+
+      # db, migrate and app only: Ollama is deliberately left out. The model
+      # download is large and slow, and the app is designed to start without it.
+      # With no .env file every setting except the password falls back to its
+      # compose default.
+      # `--wait` returns once the app is healthy (its healthcheck calls /ready,
+      # which needs the database) and fails if migrate exits non-zero.
+      - name: Start db, migrate and app
+        run: docker compose up -d --build --wait --wait-timeout 300 db migrate app
+
+      # /ready is 200 "degraded" here: the database works, Ollama does not exist.
+      # What matters is that the database check passed after the migration ran.
+      - name: Check /ready
+        run: |
+          status=""
+          for _ in $(seq 1 30); do
+            status=$(curl -s http://localhost:8080/ready | jq -r '.checks.database.status' || true)
+            [ "$status" = "ok" ] && break
+            sleep 2
+          done
+          curl -s -i http://localhost:8080/ready
+          echo
+          if [ "$status" != "ok" ]; then
+            echo "::error::checks.database.status is '$status', expected 'ok'"
+            exit 1
+          fi
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
