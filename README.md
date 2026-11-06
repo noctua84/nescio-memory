@@ -965,7 +965,14 @@ stdout is the protocol channel, so the server logs to stderr only, at `WARNING`.
 
 ## Backup and recovery
 
-Every night a Kubernetes CronJob runs three steps, each only if the one before succeeded:
+**Optional.** The API doesn't need any of this, and nothing here runs unless you deploy it. Without it,
+recovering means re-ingesting your notes from wherever they're version controlled, which costs the
+embedding time again. It doesn't bring back what only the database holds: API keys, the audit trail,
+and any note with no source elsewhere. Set this up once that matters, for example before other people
+store notes here. The nightly restore also needs room on the Postgres server, so it's a real cost on a
+small machine.
+
+Once deployed, every night a Kubernetes CronJob runs these steps, each only if the one before succeeded:
 
 1. **Back up** ([`scripts/backup.py`](scripts/backup.py)): `pg_dump -Fc` into the spool, a sidecar
    manifest (sha256, alembic revision, per-client note and passage counts, pgvector version), upload
@@ -977,7 +984,7 @@ Every night a Kubernetes CronJob runs three steps, each only if the one before s
    note as the top hit from their own embedding, both through the production search and straight
    from the index with the planner forced onto it. This needs no Ollama. The scratch database is
    then dropped.
-3. **Heartbeat**: a `GET` of `BACKUP_HEARTBEAT_URL`, only if all of that passed. A dead-man's switch
+3. **Heartbeat** (optional): a `GET` of `BACKUP_HEARTBEAT_URL`, only if all of that passed. A dead-man's switch
    such as [healthchecks.io](https://healthchecks.io) alerts when the ping stops arriving, so **silence
    is the alert**: a broken CronJob, a down cluster and a corrupt dump look the same and all of them
    page you.
@@ -1011,7 +1018,7 @@ these. Invalid values stop the script before it touches anything, with exit code
 | `DATABASE_URL` | *required* | the source, the same variable the API uses |
 | `RESTORE_CHECK_DATABASE_URL` | *required* | a maintenance database (`postgres`) on the server that hosts the scratch database. The role must be a **superuser**: the restore runs `CREATE EXTENSION vector` and pgvector is not a trusted extension. The server needs pgvector at the source's version or newer; the check says so if not |
 | `BACKUP_RCLONE_REMOTE` | *required* | `name:path` of an rclone **crypt** remote. The dumps hold personal notes, so any other remote type is refused |
-| `BACKUP_HEARTBEAT_URL` | *(unset)* | `http(s)` URL to ping after a verified restore. Treat it as a credential. `restore_check --scheduled`, which is what the CronJob runs, refuses to start without it |
+| `BACKUP_HEARTBEAT_URL` | *(unset)* | `http(s)` URL to ping after a verified restore. Treat it as a credential. Optional for the CronJob, which pings it whenever it's set. `restore_check --scheduled` refuses to start without it |
 | `BACKUP_SPOOL_DIR` | `/var/lib/nescio-backup` | must exist and be writable. Holds as many dumps as retention keeps, plus one being checked |
 | `BACKUP_RETENTION_DAILY` | `14` | `1..90` |
 | `BACKUP_RETENTION_WEEKLY` | `8` | `0..52` |
@@ -1042,8 +1049,7 @@ server's major version (17).
 kubectl create secret generic nescio-backup-env \
   --from-literal=DATABASE_URL=postgresql://nescio:password@postgres.default.svc:5432/nescio_memory \
   --from-literal=RESTORE_CHECK_DATABASE_URL=postgresql://postgres:password@postgres.default.svc:5432/postgres \
-  --from-literal=BACKUP_RCLONE_REMOTE=secret:nescio \
-  --from-literal=BACKUP_HEARTBEAT_URL=https://hc-ping.com/your-check-uuid
+  --from-literal=BACKUP_RCLONE_REMOTE=secret:nescio
 
 # An S3-compatible store, and a crypt remote over it, same as before. `rclone
 # config` asks for both; keep the crypt passwords somewhere other than this
@@ -1068,7 +1074,28 @@ restore measured dump=nescio-20261104T182659Z.dump size_bytes=94297717 clients=3
 restore verified heartbeat=sent
 ```
 
+With no heartbeat configured, the last line says `heartbeat=not_configured`.
+
 `activeDeadlineSeconds` in the manifest bounds a whole run. Raise it if the measured time gets close.
+
+### Alerting on a stale backup
+
+With kube-state-metrics, as in kube-prometheus-stack, no heartbeat is needed. A job only succeeds if the
+restore verified, so alert when the last success is too old:
+
+```yaml
+- alert: NescioBackupStale
+  expr: time() - kube_cronjob_status_last_successful_time{cronjob="nescio-backup"} > 93600  # 26 hours
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    summary: No verified Nescio backup in over 26 hours
+```
+
+The metric appears only after the first success, so this can't fire before then: check the first run
+by hand. An alert running in the same cluster also can't report that cluster being down. For that, add
+`BACKUP_HEARTBEAT_URL` with an outside dead-man's switch as well; the job pings it whenever it's set.
 
 ### Runbook
 

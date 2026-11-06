@@ -1,4 +1,6 @@
-# Nightly backup, restore check, heartbeat. See "Backup and recovery" in the README
+# Optional: the API runs without this. Apply it only if you want scheduled backups.
+#
+# Nightly backup, restore check, optional heartbeat. See "Backup and recovery" in the README
 # for the two scripts, the heartbeat and the runbook. Fill in the IMAGE
 # placeholder and create the two Secrets named below before applying this.
 apiVersion: batch/v1
@@ -12,14 +14,14 @@ spec:
   concurrencyPolicy: Forbid
   # A run the control plane could not start within this window of its scheduled
   # time (cluster down, etc.) is skipped rather than started arbitrarily late.
-  # The missing heartbeat is what reports it.
+  # The alert on the last successful run is what reports it.
   startingDeadlineSeconds: 3600
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      # Never retry: a failed run must reach the heartbeat as silence, which is
-      # the alert, not keep retrying through the night and page nobody.
+      # Never retry: a failed run must show up as no new success, which is the
+      # alert, not keep retrying through the night and page nobody.
       backoffLimit: 0
       # Bounds a whole run, so a hung one can't block the next night's under
       # Forbid. Killing it is safe: the next run replaces the scratch database.
@@ -50,12 +52,11 @@ spec:
                 readOnlyRootFilesystem: true
               envFrom:
                 # DATABASE_URL, RESTORE_CHECK_DATABASE_URL, BACKUP_RCLONE_REMOTE,
-                # BACKUP_HEARTBEAT_URL and the retention settings. Create with:
+                # and optionally BACKUP_HEARTBEAT_URL and the retention settings. Create with:
                 #   kubectl create secret generic nescio-backup-env \
                 #     --from-literal=DATABASE_URL=... \
                 #     --from-literal=RESTORE_CHECK_DATABASE_URL=... \
-                #     --from-literal=BACKUP_RCLONE_REMOTE=secret:nescio \
-                #     --from-literal=BACKUP_HEARTBEAT_URL=https://hc-ping.com/your-check-uuid
+                #     --from-literal=BACKUP_RCLONE_REMOTE=secret:nescio
                 - secretRef:
                     name: nescio-backup-env
               env:

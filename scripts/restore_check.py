@@ -9,7 +9,7 @@ rclone on PATH, and a role on RESTORE_CHECK_DATABASE_URL that can create a
 database and the vector extension. What "verified" means is in
 scripts/restore_verification.py.
 
---scheduled is the scheduled job's mode, the one the Kubernetes CronJob runs: it
+--scheduled is for a schedule whose only alert is the heartbeat: it
 refuses to run with no BACKUP_HEARTBEAT_URL, because a dead-man's switch nobody
 pings is silence by design and a backup nobody checks. BACKUP_HEARTBEAT_URL is
 pinged in both modes, and only after every assertion has passed and the
@@ -300,7 +300,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--scheduled",
         action="store_true",
-        help="The CronJob's mode: refuse to run with no BACKUP_HEARTBEAT_URL.",
+        help="Refuse to run with no BACKUP_HEARTBEAT_URL, when that ping is the only alert.",
     )
     parser.add_argument(
         "--scratch-db",

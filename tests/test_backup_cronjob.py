@@ -36,7 +36,7 @@ def test_concurrency_is_forbidden():
 
 
 def test_a_failed_run_is_never_retried():
-    # A retry would delay the heartbeat's silence, which is the alert.
+    # A retry would delay the missing success, which is the alert.
     assert _job_spec(_load())["backoffLimit"] == 0
 
 

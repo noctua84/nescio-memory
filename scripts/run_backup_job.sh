@@ -28,5 +28,7 @@ if [ "$backup_status" -ne 0 ]; then
     exit "$backup_status"
 fi
 
-python -m scripts.restore_check --scheduled
+# Not --scheduled: the heartbeat is optional here, because a Prometheus alert on
+# this job's last success does the same job. It is still sent if configured.
+python -m scripts.restore_check
 exit $?
