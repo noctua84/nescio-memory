@@ -89,7 +89,7 @@ def run_tool(args: Sequence[str], env: Mapping[str, str] | None = None) -> ToolR
     """Run a tool to completion, keeping stderr out of every output stream.
 
     No timeout here: a dump takes as long as the data does, so the bound is the
-    systemd unit's TimeoutStartSec, which kills the whole control group.
+    CronJob's activeDeadlineSeconds, which kills the whole pod.
     """
     try:
         completed = subprocess.run(

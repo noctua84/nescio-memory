@@ -7,7 +7,6 @@
 *.sh   text eol=lf
 *.yml  text eol=lf
 *.yaml text eol=lf
-deploy/systemd/* text eol=lf
 
 # Generated: collapsed by default in GitHub diffs (still expandable - lock
 # changes are supply-chain relevant and should stay reviewable).

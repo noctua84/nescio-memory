@@ -34,7 +34,8 @@ class BackupSettings(BaseSettings):
     # The source. Reused rather than renamed so the backup reads the same
     # database the API writes to, with no second URL to drift out of step.
     database_url: str = Field(repr=False)
-    # Holds dumps of personal notes: the systemd unit creates it 0700.
+    # Holds dumps of personal notes: the CronJob's pod security context creates
+    # it 0700 (fsGroup plus the image's own directory mode).
     backup_spool_dir: Path = Path("/var/lib/nescio-backup")
     # Must name an rclone crypt remote. The form is checked here; the type is
     # checked against rclone's own config by scripts/_backup_common.py.

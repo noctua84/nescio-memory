@@ -1,0 +1,102 @@
+# Nightly backup, restore check, heartbeat. See "Backup and recovery" in the README
+# for the two scripts, the heartbeat and the runbook. Fill in the IMAGE
+# placeholder and create the two Secrets named below before applying this.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nescio-backup
+spec:
+  schedule: "30 3 * * *"
+  timeZone: Etc/UTC
+  # Only one run at a time: a second run must never restore into the scratch database a first run is still using.
+  concurrencyPolicy: Forbid
+  # A run the control plane could not start within this window of its scheduled
+  # time (cluster down, etc.) is skipped rather than started arbitrarily late.
+  # The missing heartbeat is what reports it.
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Never retry: a failed run must reach the heartbeat as silence, which is
+      # the alert, not keep retrying through the night and page nobody.
+      backoffLimit: 0
+      # Bounds a whole run, so a hung one can't block the next night's under
+      # Forbid. Killing it is safe: the next run replaces the scratch database.
+      # Raise it if the measured restore time (README, "Measured restore
+      # time") gets close.
+      activeDeadlineSeconds: 21600
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            # Owns the emptyDir volumes below so the backup user can write them
+            # without the image needing to chown anything at startup.
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: nescio-backup
+              # Replace with the image Devtron builds from Dockerfile.backup.
+              image: REPLACE_ME/nescio-backup:REPLACE_ME
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+                readOnlyRootFilesystem: true
+              envFrom:
+                # DATABASE_URL, RESTORE_CHECK_DATABASE_URL, BACKUP_RCLONE_REMOTE,
+                # BACKUP_HEARTBEAT_URL and the retention settings. Create with:
+                #   kubectl create secret generic nescio-backup-env \
+                #     --from-literal=DATABASE_URL=... \
+                #     --from-literal=RESTORE_CHECK_DATABASE_URL=... \
+                #     --from-literal=BACKUP_RCLONE_REMOTE=secret:nescio \
+                #     --from-literal=BACKUP_HEARTBEAT_URL=https://hc-ping.com/your-check-uuid
+                - secretRef:
+                    name: nescio-backup-env
+              env:
+                # Points rclone at the config mounted below.
+                - name: RCLONE_CONFIG
+                  value: /etc/nescio/rclone/rclone.conf
+              resources:
+                # Not measured against production load; adjust from real runs.
+                requests:
+                  cpu: "250m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "1"
+                  memory: "1Gi"
+              volumeMounts:
+                - name: spool
+                  mountPath: /var/lib/nescio-backup
+                - name: tmp
+                  mountPath: /tmp
+                - name: rclone-config
+                  mountPath: /etc/nescio/rclone
+                  readOnly: true
+          volumes:
+            # BackupSettings.backup_spool_dir's default. Not persistent: the
+            # remote holds the only durable copies, and the dumps are deleted
+            # from here on exit regardless (see scripts/run_backup_job.sh).
+            # Peak use is two dumps at once: the copy backup.py writes and the
+            # copy restore_check.py fetches back. Size for the largest dump you
+            # expect, times two; going over evicts the pod.
+            - name: spool
+              emptyDir:
+                sizeLimit: 2Gi
+            - name: tmp
+              emptyDir:
+                sizeLimit: 256Mi
+            - name: rclone-config
+              secret:
+                # The crypt remote's config, including its (obscured) passwords.
+                # Create with:
+                #   kubectl create secret generic nescio-backup-rclone \
+                #     --from-file=rclone.conf=/path/to/rclone.conf
+                # Keep a copy of the crypt passwords somewhere other than this
+                # cluster: without them nobody can read the backups, you included.
+                secretName: nescio-backup-rclone

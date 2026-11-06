@@ -9,10 +9,11 @@ rclone on PATH, and a role on RESTORE_CHECK_DATABASE_URL that can create a
 database and the vector extension. What "verified" means is in
 scripts/restore_verification.py.
 
---scheduled is the systemd timer's mode: it refuses to run with no
-BACKUP_HEARTBEAT_URL, because a dead-man's switch nobody pings is silence by
-design and a backup nobody checks. BACKUP_HEARTBEAT_URL is pinged in both modes,
-and only after every assertion has passed and the scratch database is gone.
+--scheduled is the scheduled job's mode, the one the Kubernetes CronJob runs: it
+refuses to run with no BACKUP_HEARTBEAT_URL, because a dead-man's switch nobody
+pings is silence by design and a backup nobody checks. BACKUP_HEARTBEAT_URL is
+pinged in both modes, and only after every assertion has passed and the
+scratch database is gone.
 
 Exit codes: 0 verified (and pinged, if configured), 1 failed: the backup did not
 verify, a tool failed, or the ping did not land. 2 refused or invalid settings.
@@ -299,7 +300,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--scheduled",
         action="store_true",
-        help="The timer's mode: refuse to run with no BACKUP_HEARTBEAT_URL.",
+        help="The CronJob's mode: refuse to run with no BACKUP_HEARTBEAT_URL.",
     )
     parser.add_argument(
         "--scratch-db",
