@@ -1,0 +1,100 @@
+# syntax=docker/dockerfile:1
+
+# The backup image: scripts/backup.py and scripts/restore_check.py, plus the
+# external tools they shell out to (pg_dump, pg_restore, rclone), none of which
+# the app image carries. Devtron builds this image straight from this
+# Dockerfile path and runs it as the Kubernetes CronJob in
+# deploy/kubernetes/nescio-backup-cronjob.yaml; nothing in this repo publishes it.
+#
+# The builder stage mirrors Dockerfile exactly (same uv stage, same pinned base
+# digests) so Dependabot's docker ecosystem tracks both images from the same
+# FROM lines.
+
+# uv is a named stage so Dependabot can track its version.
+FROM ghcr.io/astral-sh/uv:0.13.7@sha256:96f40d3904aad8d0bd010539001d36c8e2188b981e1334471a90c4a1d93bb490 AS uv
+
+FROM python:3.12-slim-trixie@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30 AS builder
+
+COPY --from=uv /uv /uvx /bin/
+
+# COMPILE_BYTECODE: faster container start. LINK_MODE=copy: the cache mount is
+# on a different filesystem, so hardlinks would only produce a warning.
+# PYTHON_DOWNLOADS=0: use the base image's Python, never fetch another one.
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=0
+
+WORKDIR /app
+
+# Dependencies first, so this layer is rebuilt only when the lockfile changes.
+# --locked fails the build if uv.lock is stale. --no-build forbids building
+# sdists, matching CI: every locked package ships a wheel. No extras: the
+# backup scripts need neither local-embeddings nor the MCP server's optional
+# dependencies, only what restore_check imports from app for its production
+# search check.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --locked --no-build --no-dev --no-install-project
+
+COPY pyproject.toml uv.lock README.md ./
+COPY app ./app
+
+# The project itself. It has no [build-system], so uv treats it as a virtual
+# project and installs nothing more here; the scripts run from /app with
+# PYTHONPATH set below. Kept so that adding a build backend later does not
+# silently ship an image without the project installed.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-build --no-dev --no-editable
+
+
+FROM python:3.12-slim-trixie@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b262da527dda1d031ab30
+
+# postgresql-client-17 matches compose.yaml's pgvector/pgvector:0.8.7-pg17-trixie:
+# pg_dump/pg_restore must be no older than the server. Debian trixie ships both
+# it and rclone directly, so no extra apt repository is needed.
+#
+# The user has the same uid/gid as the app image, but no login shell or home
+# directory: this image runs one job and exits. HOME is set below to a writable
+# path, for a read-only root filesystem. It is named "nescio", not "backup",
+# because Debian's base system already owns "backup" at a different uid/gid.
+RUN apt-get update \
+ && apt-get install --no-install-recommends -y postgresql-client-17 rclone \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 nescio \
+ && useradd --system --uid 10001 --gid nescio --no-create-home --shell /usr/sbin/nologin nescio
+
+WORKDIR /app
+
+# Code is root-owned and read-only to the backup user.
+COPY --from=builder /app/.venv /app/.venv
+COPY app ./app
+COPY scripts ./scripts
+
+# The spool: owned by the backup user and 0700, since it holds unencrypted
+# dumps of personal notes. In the CronJob this path is an emptyDir mount, which
+# arrives owned by fsGroup and overlays this; kept here too so the image is
+# correct and runnable stand-alone (e.g. docker run, outside Kubernetes).
+RUN mkdir -p /var/lib/nescio-backup \
+ && chown 10001:10001 /var/lib/nescio-backup \
+ && chmod 0700 /var/lib/nescio-backup
+
+# PYTHONPATH: the project is not installed into the venv, and running a script
+# with -m from /app needs /app on sys.path to `import app` and `import scripts`.
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/tmp
+
+USER nescio
+
+# No EXPOSE, no HEALTHCHECK: this is a batch job with no listening port and no
+# liveness to probe between runs.
+
+# The two steps in order, restore check only if the backup succeeded, and the
+# combined exit code preserved either way. See scripts/run_backup_job.sh for
+# why a tiny script reads better here than an inline `sh -c`. Invoked through
+# `sh`, not as an executable, so the image does not depend on the build
+# context preserving the script's executable bit across platforms.
+CMD ["sh", "scripts/run_backup_job.sh"]

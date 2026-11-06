@@ -1,10 +1,12 @@
 name: docker
 
-# Pull requests build the image (nothing is pushed), then start it with Postgres
-# and run the migrations to prove the container boots; this repo publishes no image,
-# publishing is handled outside it by Devtron.
+# Pull requests build the app image (nothing is pushed), then start it with
+# Postgres and run the migrations to prove the container boots; build the
+# backup image (Dockerfile.backup) and check it carries pg_dump, pg_restore and
+# rclone; this repo publishes neither image, publishing is handled outside it
+# by Devtron.
 #
-# Only the default (Ollama) image is built. The torch variant
+# Only the default (Ollama) app image is built. The torch variant
 # (EXTRAS=local-embeddings) is a build-it-yourself option documented in the
 # README: it is several hundred MB larger and needs a different embedding width.
 
@@ -39,6 +41,43 @@ jobs:
         with:
           context: .
           push: false
+
+  build-backup:
+    name: build backup image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+
+      # The image the backup CronJob runs (see "Backup and recovery" in the
+      # README). Devtron builds and publishes it, so this job only proves it still builds and carries the tools the
+      # CronJob needs. push: false, no registry login, same as `build` above.
+      - name: Build backup image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.backup
+          push: false
+          load: true
+          tags: nescio-backup:ci
+
+      # The app image deliberately ships none of these; this image must, since
+      # the CronJob runs scripts.backup / scripts.restore_check with it.
+      - name: Check pg_dump, pg_restore and rclone are present
+        run: |
+          docker run --rm nescio-backup:ci pg_dump --version
+          docker run --rm nescio-backup:ci pg_dump --version | grep -q ' 17\.' || {
+            echo "::error::pg_dump is not major version 17, matching the pgvector/pgvector:0.8.7-pg17-trixie server"
+            exit 1
+          }
+          docker run --rm nescio-backup:ci pg_restore --version
+          docker run --rm nescio-backup:ci rclone version
+
+      - name: Check the scripts import
+        run: docker run --rm nescio-backup:ci python -c "import scripts.backup, scripts.restore_check"
 
   smoke:
     name: compose smoke test

@@ -111,7 +111,7 @@ jobs:
       # every dependency in uv.lock ships a wheel; an sdist-only addition would
       # fail this step loudly instead of silently running its build script.
       - name: Install dependencies (fails if uv.lock is stale)
-        run: uv sync --locked --no-build --python 3.12
+        run: uv sync --locked --no-build --extra mcp --python 3.12
 
       # coverage.xml feeds SonarCloud below. scripts/ is measured too: its
       # tests import the scripts in-process rather than spawning them.
