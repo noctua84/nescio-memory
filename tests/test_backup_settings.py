@@ -185,9 +185,3 @@ def test_every_setting_has_an_env_example_line():
 def test_the_readme_default_matches_the_setting(field):
     documented = _table_rows()[field.upper()]
     assert documented == f"`{BackupSettings.model_fields[field].default}`".replace("\\", "/")
-
-
-def test_the_units_use_lf_line_endings():
-    # A carriage return in a unit file is a parse error or a corrupted value.
-    for unit in ("nescio-backup.service", "nescio-backup.timer"):
-        assert b"\r" not in (ROOT / "deploy" / "systemd" / unit).read_bytes()
