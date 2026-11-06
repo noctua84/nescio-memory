@@ -965,7 +965,7 @@ stdout is the protocol channel, so the server logs to stderr only, at `WARNING`.
 
 ## Backup and recovery
 
-Every night a systemd timer runs three steps, each only if the one before succeeded:
+Every night a Kubernetes CronJob runs three steps, each only if the one before succeeded:
 
 1. **Back up** ([`scripts/backup.py`](scripts/backup.py)): `pg_dump -Fc` into the spool, a sidecar
    manifest (sha256, alembic revision, per-client note and passage counts, pgvector version), upload
@@ -979,10 +979,11 @@ Every night a systemd timer runs three steps, each only if the one before succee
    then dropped.
 3. **Heartbeat**: a `GET` of `BACKUP_HEARTBEAT_URL`, only if all of that passed. A dead-man's switch
    such as [healthchecks.io](https://healthchecks.io) alerts when the ping stops arriving, so **silence
-   is the alert**: a broken timer, a dead VPS and a corrupt dump look the same and all of them page you.
+   is the alert**: a broken CronJob, a down cluster and a corrupt dump look the same and all of them
+   page you.
 
-Set the switch's period to 1 day and its grace to more than a whole run takes: the timer starts up to
-15 minutes late, and the run's time is in the journal as `elapsed_s` plus the dump and the upload.
+Set the switch's period to 1 day and its grace to more than a whole run takes: the run's time is in
+the job's logs as `elapsed_s` plus the dump and the upload.
 
 The manifest's counts and the dump come from one exported snapshot, so an ingest during the backup
 cannot make a good backup fail its check. The check refuses a newest dump with no manifest rather than
@@ -1010,64 +1011,53 @@ these. Invalid values stop the script before it touches anything, with exit code
 | `DATABASE_URL` | *required* | the source, the same variable the API uses |
 | `RESTORE_CHECK_DATABASE_URL` | *required* | a maintenance database (`postgres`) on the server that hosts the scratch database. The role must be a **superuser**: the restore runs `CREATE EXTENSION vector` and pgvector is not a trusted extension. The server needs pgvector at the source's version or newer; the check says so if not |
 | `BACKUP_RCLONE_REMOTE` | *required* | `name:path` of an rclone **crypt** remote. The dumps hold personal notes, so any other remote type is refused |
-| `BACKUP_HEARTBEAT_URL` | *(unset)* | `http(s)` URL to ping after a verified restore. Treat it as a credential. `restore_check --scheduled`, which is what the timer runs, refuses to start without it |
+| `BACKUP_HEARTBEAT_URL` | *(unset)* | `http(s)` URL to ping after a verified restore. Treat it as a credential. `restore_check --scheduled`, which is what the CronJob runs, refuses to start without it |
 | `BACKUP_SPOOL_DIR` | `/var/lib/nescio-backup` | must exist and be writable. Holds as many dumps as retention keeps, plus one being checked |
 | `BACKUP_RETENTION_DAILY` | `14` | `1..90` |
 | `BACKUP_RETENTION_WEEKLY` | `8` | `0..52` |
 
 `VECTOR_WEIGHT` and `EMBEDDING_DIMENSION` from the API's configuration also apply to the restore
 check, which runs the production search: `VECTOR_WEIGHT=0` fails it, and a non-default width has to
-be set in the unit's environment as well.
+be set alongside the CronJob's own environment as well.
 
-### Setting it up on the VPS
+### Setting it up on Kubernetes
 
-The scripts run on the host, against the database through a loopback-only port, and need
-`pg_dump`/`pg_restore` no older than the server. The app image is not involved. `compose.yaml`
-publishes no database port, so add an override, and give `POSTGRES_PASSWORD` a real value in `.env`
-first, because its default is only safe while the port is not published:
-
-```yaml
-# compose.override.yaml
-services:
-  db:
-    ports:
-      - "127.0.0.1:5432:5432"
-```
+The deployment is Devtron on Kubernetes, with Postgres in the same cluster, so the CronJob in
+[`deploy/kubernetes/nescio-backup-cronjob.yaml`](deploy/kubernetes/nescio-backup-cronjob.yaml) runs
+in-cluster against the Postgres Service rather than over a published host port. The app image is not
+involved: it deliberately ships neither `pg_dump`/`pg_restore` nor `rclone`, so the CronJob runs a
+separate image, built from [`Dockerfile.backup`](Dockerfile.backup), which has both and matches the
+server's major version (17).
 
 ```bash
-sudo apt install postgresql-client-17 rclone
-sudo useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin nescio-backup
+# Build Dockerfile.backup through Devtron the same way the app image is built;
+# this repo does not publish either image. Note the resulting image reference.
 
-# The checkout the unit runs. --no-dev: tests are not needed on the host.
-sudo git clone https://github.com/noctua84/nescio-memory /opt/nescio-memory
-cd /opt/nescio-memory && sudo uv sync --locked --no-dev
+# The settings BackupSettings reads, as a Secret rather than literal values in
+# the manifest. RESTORE_CHECK_DATABASE_URL names the Postgres Service in this
+# cluster (a placeholder host below) and must be a superuser: the restore runs
+# CREATE EXTENSION vector and pgvector is not a trusted extension. This is the
+# same Postgres server the live database runs on, so the nightly restore check
+# loads it like any other client would; pick a schedule that is a quiet hour.
+kubectl create secret generic nescio-backup-env \
+  --from-literal=DATABASE_URL=postgresql://nescio:password@postgres.default.svc:5432/nescio_memory \
+  --from-literal=RESTORE_CHECK_DATABASE_URL=postgresql://postgres:password@postgres.default.svc:5432/postgres \
+  --from-literal=BACKUP_RCLONE_REMOTE=secret:nescio \
+  --from-literal=BACKUP_HEARTBEAT_URL=https://hc-ping.com/your-check-uuid
 
-# An S3-compatible store, and a crypt remote over it. `rclone config` asks for
-# both; keep the crypt passwords somewhere other than this VPS. Without them the
-# backups cannot be read by anyone, you included.
-sudo install -d -m 0755 /etc/nescio
-sudo rclone --config /etc/nescio/rclone.conf config
-sudo chown nescio-backup: /etc/nescio/rclone.conf && sudo chmod 0400 /etc/nescio/rclone.conf
+# An S3-compatible store, and a crypt remote over it, same as before. `rclone
+# config` asks for both; keep the crypt passwords somewhere other than this
+# cluster. Without them the backups cannot be read by anyone, you included.
+rclone --config ./rclone.conf config
+kubectl create secret generic nescio-backup-rclone --from-file=rclone.conf=./rclone.conf
+rm ./rclone.conf
 
-sudo install -m 0600 /dev/null /etc/nescio/backup.env
-sudoedit /etc/nescio/backup.env
-```
+# Point the manifest's image at what Devtron built, then apply it.
+kubectl apply -f deploy/kubernetes/nescio-backup-cronjob.yaml
 
-```bash
-# /etc/nescio/backup.env
-DATABASE_URL=postgresql://nescio:password@127.0.0.1:5432/nescio_memory
-RESTORE_CHECK_DATABASE_URL=postgresql://nescio:password@127.0.0.1:5432/postgres
-BACKUP_RCLONE_REMOTE=secret:nescio
-BACKUP_HEARTBEAT_URL=https://hc-ping.com/your-check-uuid
-RCLONE_CONFIG=/etc/nescio/rclone.conf
-```
-
-```bash
-sudo cp deploy/systemd/nescio-backup.service deploy/systemd/nescio-backup.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now nescio-backup.timer
-sudo systemctl start nescio-backup.service   # one run now, to see it work
-journalctl -u nescio-backup.service -o cat
+# One run now, to see it work.
+kubectl create job --from=cronjob/nescio-backup nescio-backup-first
+kubectl logs job/nescio-backup-first
 ```
 
 A good run ends like this, with your own numbers:
@@ -1078,15 +1068,16 @@ restore measured dump=nescio-20261104T182659Z.dump size_bytes=94297717 clients=3
 restore verified heartbeat=sent
 ```
 
-`TimeoutStartSec=6h` in the unit bounds a whole run. Raise it if the measured time gets close.
+`activeDeadlineSeconds` in the manifest bounds a whole run. Raise it if the measured time gets close.
 
 ### Runbook
 
-**Back up now, or check the newest backup by hand.** Both read `/etc/nescio/backup.env` through the
-unit; to run them directly, export its contents first.
+**Back up now, or check the newest backup by hand.** `kubectl create job --from=cronjob/...` (above)
+runs both steps with the CronJob's own Secret-backed environment; to run either script directly against
+the same database, export the Secret's values into your shell first.
 
 ```bash
-sudo systemctl start nescio-backup.service       # backup, restore check, heartbeat
+kubectl create job --from=cronjob/nescio-backup nescio-backup-manual   # backup, restore check, heartbeat
 uv run python -m scripts.backup                  # exit 0 uploaded, 1 failed, 2 invalid settings
 uv run python -m scripts.restore_check           # exit 0 verified, 1 failed, 2 refused
 ```
@@ -1095,7 +1086,11 @@ uv run python -m scripts.restore_check           # exit 0 verified, 1 failed, 2 
 The restoring role must be able to create the `vector` extension.
 
 ```bash
-export RCLONE_CONFIG=/etc/nescio/rclone.conf PGPASSWORD=password
+# RCLONE_CONFIG here is a local copy of the rclone config, not the in-cluster
+# Secret: this restore runs on your machine, against Postgres reached through
+# a port-forward.
+export RCLONE_CONFIG=./rclone.conf PGPASSWORD=password
+kubectl port-forward svc/postgres 5432:5432 &
 SERVER=postgresql://nescio@127.0.0.1:5432
 
 # 1. Choose a backup; names sort by time. Listing through the crypt remote decrypts them.
@@ -1129,11 +1124,12 @@ Then point `DATABASE_URL` at `nescio_recovered` and restart the API, or stop it 
 databases. `GET /ready` must report the database `ok`; if the checkout is newer than the backup, run
 `alembic upgrade head` first. Delete the local dump afterwards: it is your notes, unencrypted.
 
-**When the alert fires** (`journalctl -u nescio-backup.service -o cat`):
+**When the alert fires** (the job's logs: `kubectl logs job/<name>`, or `kubectl logs -l job-name=<name>`
+for a job whose pod has already been reaped):
 
-| The journal says | Meaning |
+| The job's logs say | Meaning |
 | --- | --- |
-| nothing recent | the timer or the VPS is down: `systemctl list-timers nescio-backup.timer` |
+| nothing recent | the CronJob or the cluster is down: `kubectl get cronjob,jobs` |
 | `pg_dump failed with exit code N` | repeat `pg_dump -Fc --file=/tmp/x.dump "$DATABASE_URL"` by hand to see why. A client older than the server is refused |
 | `rclone … failed with exit code N` | repeat with `rclone lsf secret:nescio -v`. Any non-zero exit fails the run, the "some files not transferred" codes included |
 | `pg_restore failed with exit code N` | repeat the restore step above to see why. The dump is suspect until it passes |
@@ -1141,15 +1137,17 @@ databases. `GET /ready` must report the database `ok`; if the checkout is newer 
 | `HNSW index … is missing` or `is not valid` | the restore did not reproduce the index. Check the restore server's `maintenance_work_mem` and disk |
 | `top hit` | **25 or more of the 100 passages checked could not find their own note, so the index or the embeddings did not survive.** This is not HNSW's ordinary misses, which stay well below that (see [What the search check can and cannot catch](#what-the-search-check-can-and-cannot-catch)). Treat the backup as bad and take a new one now; run the check again only to confirm |
 | `database error InternalError_ (sqlstate XX000)` from the search, or another database error after the index checks | the index file on the restore server's disk is corrupt: an unreadable index passes the catalog check and fails when the search reads it, and the Postgres log on the restore server says `hnsw index is not valid`. Check the restore server's disk |
-| `the heartbeat did not land` | the backup verified, but the ping failed three times. The run counts as failed, and you get the alert. Check the VPS's egress and the URL |
+| `the heartbeat did not land` | the backup verified, but the ping failed three times. The run counts as failed, and you get the alert. Check the cluster's egress and the URL |
+| pod `Evicted`, reason mentions the ephemeral storage limit | the dumps outgrew the spool `emptyDir`'s `sizeLimit`. Raise it in the manifest to comfortably fit two dumps (the spool copy and the fetched copy) at your current database size |
 
 ### Measured restore time
 
-From real runs of the unit on 2026-11-04, under systemd, through a real crypt remote over an S3
-protocol store. **This is seeded data on one developer machine, not an estimate for production.** The
-vectors are synthetic and 1024-wide, and all the containers shared a 24-core, 31 GB Docker VM with
-PostgreSQL's defaults (`maintenance_work_mem` 64 MB, `max_parallel_maintenance_workers` 2). Take your
-own number from your own journal, where every run reports `pg_restore_s` and `elapsed_s`.
+From real runs on 2026-11-04, under the earlier systemd setup this CronJob replaces, on one developer
+machine, through a real crypt remote over an S3 protocol store. **These numbers were not measured under
+the CronJob; they are seeded data from a single machine, not an estimate for production.** The vectors
+are synthetic and 1024-wide, and all the containers shared a 24-core, 31 GB Docker VM with PostgreSQL's
+defaults (`maintenance_work_mem` 64 MB, `max_parallel_maintenance_workers` 2). Take your own number from
+your own job's logs, where every run reports `pg_restore_s` and `elapsed_s`.
 
 | Passages | Notes | Database | Dump | `pg_restore` | Restore check (fetch, restore, verify) | Whole unit |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -1204,7 +1202,7 @@ a month, and on 7.8% at 300,000.
 Two other states. With the index dropped, the catalog check fails it by name, and it must, because
 with no index both arms answer exactly and missed 0 of 100 in 12 of 12 runs. With the index file
 zeroed on disk, the catalog still says valid and the first search fails, with `hnsw index is not valid`
-in the restore server's Postgres log and `database error` in the journal; 6 of 6 runs failed.
+in the restore server's Postgres log and `database error` in the job's logs; 6 of 6 runs failed.
 
 **What it does not catch.**
 
@@ -1216,7 +1214,7 @@ in the restore server's Postgres log and `database error` in the journal; 6 of 6
   per night when 13% of passages miss. The miss rate rose from 3.4% to 7.8% between 100,000 and 300,000
   passages, so if it keeps rising that way, 13% is on the order of 1,000,000 passages, which was not
   measured.
-- So watch the `index_misses` figure in the journal's `restore search_probes=` line. Repeatedly near
+- So watch the `index_misses` figure in the job's logs, in the `restore search_probes=` line. Repeatedly near
   25 means the threshold needs revisiting, or the index needs better build parameters, before it pages.
 
 **Cost.** One check took a median of 2.1 s at 100,000 passages and 3.2 s at 300,000 on an otherwise
@@ -1225,15 +1223,6 @@ The slowest single search statement across all the healthy runs was under 1 s, o
 concurrent restores, against the 5 s statement timeout. The check does not compare a probe with every
 stored vector of its client to prove it unique: the earlier single-probe query did, and it did not
 finish in 60 s at 100,000 passages once the table had statistics.
-
-### Replacing the timer with a Kubernetes CronJob
-
-Not built; this is what moves when the service leaves the VPS. A CronJob running the same two commands
-in order replaces the unit, with `concurrencyPolicy: Forbid` for what `Type=oneshot` gives, and
-`activeDeadlineSeconds` for `TimeoutStartSec`. It needs an image with `pg_dump`, `pg_restore` and
-`rclone`, because the app image deliberately has neither, and an `emptyDir` sized for one dump as
-the spool, since a pod's spool does not survive and the remote then holds the only copies. The
-heartbeat and the scratch database's rules do not change.
 
 ## Development
 
