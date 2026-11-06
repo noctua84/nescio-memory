@@ -132,8 +132,10 @@ def test_prune_remote_deletes_one_file_at_a_time_and_never_syncs():
 def test_prune_remote_refuses_a_listing_without_the_new_backup():
     old = _names(MONDAY - timedelta(days=1), MONDAY - timedelta(days=2))
     rclone = FakeRclone({name: b"x" for name in old})
+    remote = RcloneRemote(rclone, REMOTE)
+    not_listed = _names(MONDAY)
 
     with pytest.raises(BackupError, match="refusing to prune"):
-        prune_remote(RcloneRemote(rclone, REMOTE), _names(MONDAY), daily=1, weekly=0)
+        prune_remote(remote, not_listed, daily=1, weekly=0)
 
     assert sorted(rclone.files) == sorted(old)

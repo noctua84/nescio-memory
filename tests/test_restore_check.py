@@ -342,9 +342,10 @@ def test_a_role_that_cannot_create_the_extension_is_named_as_the_cause(pg_contai
         connection.execute(text(f"CREATE ROLE {role} LOGIN CREATEDB PASSWORD 'x'"))
     url = pg_container.get_connection_url().replace("test:test@", f"{role}:x@")
     engine = make_engine(url)
+    manifest = _manifest("0.1.0")
     try:
         with pytest.raises(VerificationError, match="must be a superuser"):
-            assert_server_can_restore(engine, _manifest("0.1.0"))
+            assert_server_can_restore(engine, manifest)
     finally:
         engine.dispose()
         with admin.connect() as connection:
@@ -354,9 +355,10 @@ def test_a_role_that_cannot_create_the_extension_is_named_as_the_cause(pg_contai
 
 def test_a_server_with_an_older_pgvector_is_named_as_the_cause(pg_container):
     engine = make_engine(pg_container.get_connection_url())
+    manifest = _manifest("99.0.0")
     try:
         with pytest.raises(VerificationError, match="older than"):
-            assert_server_can_restore(engine, _manifest("99.0.0"))
+            assert_server_can_restore(engine, manifest)
     finally:
         engine.dispose()
 
@@ -375,10 +377,9 @@ def test_the_ping_gives_up_without_naming_the_url():
         attempts.append(request)
         raise httpx.ConnectError(f"cannot reach {request.url}")
 
+    transport = httpx.MockTransport(refuse)
     with pytest.raises(HeartbeatError) as caught:
-        ping_heartbeat(
-            HEARTBEAT_URL, transport=httpx.MockTransport(refuse), sleep=lambda seconds: None
-        )
+        ping_heartbeat(HEARTBEAT_URL, transport=transport, sleep=lambda seconds: None)
     assert len(attempts) == 3
     assert HEARTBEAT_URL not in str(caught.value)
     assert "ConnectError" in str(caught.value)
@@ -395,10 +396,11 @@ def test_the_ping_never_retries_past_its_time_bound():
         now[0] += 30.0
         return httpx.Response(500)
 
+    transport = httpx.MockTransport(slow)
     with pytest.raises(HeartbeatError):
         ping_heartbeat(
             HEARTBEAT_URL,
-            transport=httpx.MockTransport(slow),
+            transport=transport,
             sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
             clock=lambda: now[0],
         )

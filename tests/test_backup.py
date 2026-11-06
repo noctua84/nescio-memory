@@ -129,8 +129,9 @@ def test_a_write_during_the_dump_cannot_make_the_manifest_disagree(
 
 def test_a_remote_that_is_not_crypt_is_refused_before_the_dump(settings, pg_tools):
     rclone = FakeRclone(remote_type="s3")
+    runner = ToolRouter(rclone, pg_tools)
     with pytest.raises(BackupError, match="must be an rclone crypt remote"):
-        backup.run_backup(settings, runner=ToolRouter(rclone, pg_tools), now=NOW)
+        backup.run_backup(settings, runner=runner, now=NOW)
     assert rclone.commands() == ["listremotes"]
     assert list(settings.backup_spool_dir.iterdir()) == []
 

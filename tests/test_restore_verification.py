@@ -95,8 +95,9 @@ def test_verification_fails_on_a_count_mismatch(restored):
 
 def test_verification_fails_on_a_revision_mismatch(restored):
     db, manifest = restored
+    wrong_revision = manifest.model_copy(update={"alembic_revision": "nope"})
     with pytest.raises(VerificationError, match="alembic revision"):
-        verify_restored_database(db, manifest.model_copy(update={"alembic_revision": "nope"}))
+        verify_restored_database(db, wrong_revision)
 
 
 def test_verification_fails_when_the_hnsw_index_is_missing(restored):
