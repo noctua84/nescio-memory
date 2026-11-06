@@ -198,10 +198,10 @@ model, so `/ready` reports `degraded` until that finishes. The committed contrac
   ```
 
   and set `EMBEDDING_BACKEND=local`; read [Embedding backends](#embedding-backends) first, since
-  that backend has a different embedding width. Only the default image is published.
-- **Published image.** Each GitHub release pushes `ghcr.io/noctua84/nescio-memory` tagged `X.Y.Z`,
-  `X.Y` and `latest`. Pull requests build the image and smoke-test the stack in CI
-  ([`docker.yml`](.github/workflows/docker.yml)).
+  that backend has a different embedding width. CI only builds the default image.
+- **Image builds.** Pull requests build the image and smoke-test the stack in CI
+  ([`docker.yml`](.github/workflows/docker.yml)). This repository does not publish an image;
+  publishing is handled outside it by Devtron.
 
 The container runs as an unprivileged user (uid 10001) and listens on port 8080 inside, regardless
 of `HOST` and `PORT` in `.env` (see [Configuration](#configuration)).
