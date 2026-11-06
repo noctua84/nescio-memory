@@ -58,7 +58,11 @@ FROM python:3.12-slim-trixie@sha256:b18b261e1b4974b4f321451ad5251ded85abb22c2b8b
 # directory: this image runs one job and exits. HOME is set below to a writable
 # path, for a read-only root filesystem. It is named "nescio", not "backup",
 # because Debian's base system already owns "backup" at a different uid/gid.
-RUN apt-get update  && apt-get install --no-install-recommends -y postgresql-client-17 rclone  && rm -rf /var/lib/apt/lists/*  && groupadd --system --gid 10001 nescio  && useradd --system --uid 10001 --gid nescio --no-create-home --shell /usr/sbin/nologin nescio
+RUN apt-get update \
+ && apt-get install --no-install-recommends -y postgresql-client-17 rclone \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 nescio \
+ && useradd --system --uid 10001 --gid nescio --no-create-home --shell /usr/sbin/nologin nescio
 
 WORKDIR /app
 
